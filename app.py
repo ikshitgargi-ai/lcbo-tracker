@@ -42,7 +42,12 @@ def init_db():
             contacts TEXT DEFAULT '',
             priority TEXT DEFAULT 'Standard',
             status TEXT DEFAULT '',
-            rep TEXT DEFAULT ''
+            rep TEXT DEFAULT '',
+            manager_name TEXT DEFAULT '',
+            asst_manager_name TEXT DEFAULT '',
+            manager_phone TEXT DEFAULT '',
+            store_email TEXT DEFAULT '',
+            producer TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS reps (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,8 +57,11 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             store_id INTEGER NOT NULL,
             rep_id INTEGER NOT NULL,
-            activity_type TEXT NOT NULL CHECK(activity_type IN ('tasting','site_visit','listing','email','call')),
+            activity_type TEXT NOT NULL CHECK(activity_type IN ('tasting','site_visit','listing','email','call','follow_up')),
+            producer TEXT DEFAULT '',
+            venue_type TEXT DEFAULT '',
             notes TEXT DEFAULT '',
+            follow_up_date TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (store_id) REFERENCES stores(id),
             FOREIGN KEY (rep_id) REFERENCES reps(id)
@@ -62,6 +70,18 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_activities_rep ON activities(rep_id);
         CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(activity_type);
     ''')
+    # Add new columns if upgrading from old schema
+    for col, default in [('manager_name',''), ('asst_manager_name',''), ('manager_phone',''),
+                         ('store_email',''), ('producer','')]:
+        try:
+            db.execute(f"ALTER TABLE stores ADD COLUMN {col} TEXT DEFAULT '{default}'")
+        except Exception:
+            pass
+    for col in ['producer', 'venue_type', 'follow_up_date']:
+        try:
+            db.execute(f"ALTER TABLE activities ADD COLUMN {col} TEXT DEFAULT ''")
+        except Exception:
+            pass
     db.commit()
     db.close()
 
@@ -72,7 +92,6 @@ def seed_data():
         db.close()
         return
 
-    import openpyxl
     xlsx_path = os.path.join(BASE_DIR, 'data', 'All LCBO stores.xlsx')
     if not os.path.exists(xlsx_path):
         xlsx_path = '/Users/ikshitsharma/Downloads/All LCBO stores.xlsx'
@@ -88,7 +107,6 @@ def seed_data():
         postal = str(row.get('Postal', '')) if pd.notna(row.get('Postal')) else ''
         contacts = str(row.get('Contacts', '')) if pd.notna(row.get('Contacts')) else ''
         emails = str(row.get('Emails', '')) if pd.notna(row.get('Emails')) else ''
-        # Clean up comma-only emails
         if emails and all(c == ',' for c in emails):
             emails = ''
         priority = str(row.get('Priority', 'Standard')) if pd.notna(row.get('Priority')) else 'Standard'
@@ -120,18 +138,22 @@ def api_stores():
     db = get_db()
     search = request.args.get('search', '').strip()
     city = request.args.get('city', '').strip()
+    producer = request.args.get('producer', '').strip()
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 50))
 
     query = "SELECT * FROM stores WHERE 1=1"
     params = []
     if search:
-        query += " AND (CAST(store_number AS TEXT) LIKE ? OR account LIKE ? OR address LIKE ? OR city LIKE ?)"
+        query += " AND (CAST(store_number AS TEXT) LIKE ? OR account LIKE ? OR address LIKE ? OR city LIKE ? OR manager_name LIKE ?)"
         s = f"%{search}%"
-        params.extend([s, s, s, s])
+        params.extend([s, s, s, s, s])
     if city:
         query += " AND city LIKE ?"
         params.append(f"%{city}%")
+    if producer:
+        query += " AND producer LIKE ?"
+        params.append(f"%{producer}%")
 
     total = db.execute(query.replace("SELECT *", "SELECT COUNT(*)"), params).fetchone()[0]
     query += " ORDER BY store_number ASC LIMIT ? OFFSET ?"
@@ -157,7 +179,9 @@ def api_store_detail(store_id):
 def api_store_update(store_id):
     db = get_db()
     data = request.json
-    fields = ['account', 'address', 'city', 'postal', 'phone', 'email', 'contacts', 'priority', 'status', 'rep']
+    fields = ['account', 'address', 'city', 'postal', 'phone', 'email', 'contacts',
+              'priority', 'status', 'rep', 'manager_name', 'asst_manager_name',
+              'manager_phone', 'store_email', 'producer']
     sets = []
     params = []
     for f in fields:
@@ -184,14 +208,17 @@ def api_activity_create():
     store_id = data.get('store_id')
     rep_id = data.get('rep_id')
     activity_type = data.get('activity_type')
+    producer = data.get('producer', '')
+    venue_type = data.get('venue_type', '')
     notes = data.get('notes', '')
+    follow_up_date = data.get('follow_up_date', '')
 
     if not all([store_id, rep_id, activity_type]):
         return jsonify({'error': 'Missing required fields'}), 400
 
     cursor = db.execute(
-        "INSERT INTO activities (store_id, rep_id, activity_type, notes) VALUES (?,?,?,?)",
-        (store_id, rep_id, activity_type, notes)
+        "INSERT INTO activities (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date) VALUES (?,?,?,?,?,?,?)",
+        (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date)
     )
     db.commit()
     return jsonify({'id': cursor.lastrowid, 'success': True})
@@ -200,6 +227,7 @@ def api_activity_create():
 def api_activities_for_store(store_id):
     db = get_db()
     activity_type = request.args.get('type', '')
+    producer = request.args.get('producer', '')
     query = """
         SELECT a.*, r.name as rep_name
         FROM activities a JOIN reps r ON a.rep_id=r.id
@@ -209,6 +237,9 @@ def api_activities_for_store(store_id):
     if activity_type:
         query += " AND a.activity_type=?"
         params.append(activity_type)
+    if producer:
+        query += " AND a.producer=?"
+        params.append(producer)
     query += " ORDER BY a.created_at DESC"
     rows = db.execute(query, params).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -230,6 +261,7 @@ def api_dashboard():
     total_stores = db.execute("SELECT COUNT(*) FROM stores").fetchone()[0]
     total_activities = db.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
     by_type = db.execute("SELECT activity_type, COUNT(*) as c FROM activities GROUP BY activity_type").fetchall()
+    by_producer = db.execute("SELECT producer, COUNT(*) as c FROM activities WHERE producer != '' GROUP BY producer").fetchall()
     recent = db.execute("""
         SELECT a.*, s.store_number, s.account, r.name as rep_name
         FROM activities a
@@ -247,6 +279,7 @@ def api_dashboard():
         'total_stores': total_stores,
         'total_activities': total_activities,
         'by_type': {r['activity_type']: r['c'] for r in by_type},
+        'by_producer': {r['producer']: r['c'] for r in by_producer},
         'recent': [dict(r) for r in recent],
         'by_rep': {r['name']: r['count'] for r in by_rep}
     })
@@ -257,15 +290,33 @@ def api_cities():
     rows = db.execute("SELECT DISTINCT city FROM stores WHERE city != '' ORDER BY city").fetchall()
     return jsonify([r['city'] for r in rows])
 
+@app.route('/api/followups')
+def api_followups():
+    db = get_db()
+    rows = db.execute("""
+        SELECT a.*, s.store_number, s.account, s.city, r.name as rep_name
+        FROM activities a
+        JOIN stores s ON a.store_id=s.id
+        JOIN reps r ON a.rep_id=r.id
+        WHERE a.follow_up_date != '' AND a.follow_up_date IS NOT NULL
+        ORDER BY a.follow_up_date ASC
+    """).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+# --- Export endpoints ---
+
 @app.route('/api/export/stores')
 def export_stores_csv():
     db = get_db()
     rows = db.execute("SELECT * FROM stores ORDER BY store_number").fetchall()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Store #', 'Account', 'Address', 'City', 'Postal', 'Phone', 'Email', 'Contacts', 'Priority', 'Status', 'Rep'])
+    writer.writerow(['Store #', 'Account', 'Address', 'City', 'Postal', 'Phone', 'Email', 'Contacts',
+                     'Priority', 'Status', 'Rep', 'Manager', 'Asst Manager', 'Manager Phone', 'Store Email', 'Producer'])
     for r in rows:
-        writer.writerow([r['store_number'], r['account'], r['address'], r['city'], r['postal'], r['phone'], r['email'], r['contacts'], r['priority'], r['status'], r['rep']])
+        writer.writerow([r['store_number'], r['account'], r['address'], r['city'], r['postal'], r['phone'],
+                         r['email'], r['contacts'], r['priority'], r['status'], r['rep'],
+                         r['manager_name'], r['asst_manager_name'], r['manager_phone'], r['store_email'], r['producer']])
     output.seek(0)
     return Response(output.getvalue(), mimetype='text/csv',
                     headers={'Content-Disposition': f'attachment; filename=lcbo_stores_{datetime.now().strftime("%Y%m%d")}.csv'})
@@ -275,7 +326,7 @@ def export_activities_csv():
     db = get_db()
     rows = db.execute("""
         SELECT s.store_number, s.account, s.city, r.name as rep_name,
-               a.activity_type, a.notes, a.created_at
+               a.activity_type, a.producer, a.venue_type, a.notes, a.follow_up_date, a.created_at
         FROM activities a
         JOIN stores s ON a.store_id=s.id
         JOIN reps r ON a.rep_id=r.id
@@ -283,9 +334,10 @@ def export_activities_csv():
     """).fetchall()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Store #', 'Account', 'City', 'Rep', 'Activity Type', 'Notes', 'Date'])
+    writer.writerow(['Store #', 'Account', 'City', 'Rep', 'Activity Type', 'Producer', 'Venue', 'Notes', 'Follow-Up Date', 'Date'])
     for r in rows:
-        writer.writerow([r['store_number'], r['account'], r['city'], r['rep_name'], r['activity_type'], r['notes'], r['created_at']])
+        writer.writerow([r['store_number'], r['account'], r['city'], r['rep_name'],
+                         r['activity_type'], r['producer'], r['venue_type'], r['notes'], r['follow_up_date'], r['created_at']])
     output.seek(0)
     return Response(output.getvalue(), mimetype='text/csv',
                     headers={'Content-Disposition': f'attachment; filename=lcbo_activities_{datetime.now().strftime("%Y%m%d")}.csv'})
@@ -296,6 +348,7 @@ def export_pipeline_csv():
     rows = db.execute("""
         SELECT s.store_number, s.account, s.address, s.city, s.postal,
                s.phone, s.email, s.contacts, s.priority, s.status, s.rep,
+               s.manager_name, s.asst_manager_name, s.manager_phone, s.store_email, s.producer,
                COUNT(a.id) as total_activities,
                SUM(CASE WHEN a.activity_type='tasting' THEN 1 ELSE 0 END) as tastings,
                SUM(CASE WHEN a.activity_type='site_visit' THEN 1 ELSE 0 END) as site_visits,
@@ -311,11 +364,12 @@ def export_pipeline_csv():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['Store #', 'Account', 'Address', 'City', 'Postal', 'Phone', 'Email', 'Contacts',
-                     'Priority', 'Status', 'Rep', 'Total Activities', 'Tastings', 'Site Visits',
-                     'Listings', 'Emails', 'Calls', 'Last Activity'])
+                     'Priority', 'Status', 'Rep', 'Manager', 'Asst Manager', 'Manager Phone', 'Store Email',
+                     'Producer', 'Total Activities', 'Tastings', 'Site Visits', 'Listings', 'Emails', 'Calls', 'Last Activity'])
     for r in rows:
         writer.writerow([r['store_number'], r['account'], r['address'], r['city'], r['postal'],
                          r['phone'], r['email'], r['contacts'], r['priority'], r['status'], r['rep'],
+                         r['manager_name'], r['asst_manager_name'], r['manager_phone'], r['store_email'], r['producer'],
                          r['total_activities'], r['tastings'], r['site_visits'], r['listings'],
                          r['emails'], r['calls'], r['last_activity']])
     output.seek(0)
@@ -324,7 +378,6 @@ def export_pipeline_csv():
 
 @app.route('/api/export/backup')
 def export_backup():
-    """Download the entire SQLite database file"""
     if os.path.exists(DB_PATH):
         return send_file(DB_PATH, as_attachment=True,
                          download_name=f'lcbo_tracker_backup_{datetime.now().strftime("%Y%m%d_%H%M")}.db')

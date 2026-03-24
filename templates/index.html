@@ -12,13 +12,13 @@
 </head>
 <body>
 <div id="app">
-  <!-- Sidebar -->
   <nav id="sidebar">
     <div class="logo">
       <div class="brand-logo">
-        <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
-          <circle cx="18" cy="18" r="17" stroke="#a29bfe" stroke-width="2" fill="rgba(108,92,231,0.1)"/>
-          <text x="18" y="22" text-anchor="middle" fill="#a29bfe" font-size="14" font-weight="bold" font-family="sans-serif">AS</text>
+        <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
+          <rect width="42" height="42" rx="8" fill="#d4a574"/>
+          <text x="21" y="24" text-anchor="middle" fill="#b22222" font-size="16" font-weight="bold" font-family="serif">ANU</text>
+          <text x="21" y="34" text-anchor="middle" fill="#b22222" font-size="6" font-family="sans-serif">SPIRITS</text>
         </svg>
         <div>
           <h2>Anu Spirits</h2>
@@ -36,6 +36,12 @@
       <button class="nav-btn" data-view="log" onclick="showView('log')">
         <span class="icon">&#10010;</span> Log Activity
       </button>
+      <button class="nav-btn" data-view="producers" onclick="showView('producers')">
+        <span class="icon">&#127870;</span> Producers
+      </button>
+      <button class="nav-btn" data-view="followups" onclick="showView('followups')">
+        <span class="icon">&#128197;</span> Follow-Ups
+      </button>
       <button class="nav-btn" data-view="export" onclick="showView('export')">
         <span class="icon">&#8615;</span> Export
       </button>
@@ -46,10 +52,9 @@
     </div>
   </nav>
 
-  <!-- Main Content -->
   <main id="content">
 
-    <!-- Dashboard View -->
+    <!-- Dashboard -->
     <section id="view-dashboard" class="view active">
       <h1>Dashboard</h1>
       <div class="stats-grid" id="statsGrid"></div>
@@ -57,18 +62,18 @@
         <h3>Recent Activity</h3>
         <table class="data-table" id="recentTable">
           <thead>
-            <tr><th>Time</th><th>Rep</th><th>Store</th><th>Type</th><th>Notes</th></tr>
+            <tr><th>Time</th><th>Rep</th><th>Store</th><th>Producer</th><th>Type</th><th>Notes</th></tr>
           </thead>
           <tbody></tbody>
         </table>
       </div>
     </section>
 
-    <!-- Stores View -->
+    <!-- Stores -->
     <section id="view-stores" class="view">
       <h1>All Stores</h1>
       <div class="filters">
-        <input type="text" id="storeSearch" placeholder="Search store #, name, address, city..." oninput="debounceSearch()">
+        <input type="text" id="storeSearch" placeholder="Search store #, name, address, city, manager..." oninput="debounceSearch()">
         <select id="cityFilter" onchange="loadStores()">
           <option value="">All Cities</option>
         </select>
@@ -77,8 +82,8 @@
         <table class="data-table" id="storesTable">
           <thead>
             <tr>
-              <th>Store #</th><th>Account</th><th>Address</th><th>City</th>
-              <th>Phone</th><th>Email</th><th>Status</th><th>Actions</th>
+              <th>Store #</th><th>Account</th><th>City</th><th>Manager</th>
+              <th>Phone</th><th>Status</th><th>Producer</th><th></th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -87,7 +92,7 @@
       </div>
     </section>
 
-    <!-- Log Activity View -->
+    <!-- Log Activity -->
     <section id="view-log" class="view">
       <h1>Log Activity</h1>
       <div class="log-layout">
@@ -101,6 +106,13 @@
             <div id="selectedStoreInfo" class="selected-store-info"></div>
           </div>
           <div class="form-group">
+            <label>Producer</label>
+            <div class="activity-types">
+              <button class="type-btn producer-btn" data-producer="NB Distillers" onclick="selectProducer(this)">NB Distillers</button>
+              <button class="type-btn producer-btn" data-producer="Anu Portfolio" onclick="selectProducer(this)">Anu Portfolio</button>
+            </div>
+          </div>
+          <div class="form-group">
             <label>Activity Type</label>
             <div class="activity-types" id="activityTypes">
               <button class="type-btn" data-type="tasting" onclick="selectType(this)">&#127863; Tasting</button>
@@ -109,6 +121,19 @@
               <button class="type-btn" data-type="email" onclick="selectType(this)">&#9993; Email</button>
               <button class="type-btn" data-type="call" onclick="selectType(this)">&#128222; Call</button>
             </div>
+          </div>
+          <div class="form-group">
+            <label>Venue Type (optional)</label>
+            <div class="activity-types">
+              <button class="type-btn venue-btn" data-venue="LCBO" onclick="selectVenue(this)">LCBO</button>
+              <button class="type-btn venue-btn" data-venue="Restaurant" onclick="selectVenue(this)">Restaurant</button>
+              <button class="type-btn venue-btn" data-venue="Bar" onclick="selectVenue(this)">Bar</button>
+              <button class="type-btn venue-btn" data-venue="Club" onclick="selectVenue(this)">Club</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Follow-Up Date (optional)</label>
+            <input type="date" id="logFollowUpDate">
           </div>
           <div class="form-group">
             <label>Notes</label>
@@ -127,42 +152,77 @@
       </div>
     </section>
 
-    <!-- Export View -->
+    <!-- Producers -->
+    <section id="view-producers" class="view">
+      <h1>Producers</h1>
+      <div class="producer-tabs">
+        <button class="producer-tab active" onclick="switchProducerView('nb', this)">NB Distillers</button>
+        <button class="producer-tab" onclick="switchProducerView('anu', this)">Anu Portfolio</button>
+      </div>
+
+      <div id="producer-nb" class="producer-panel active">
+        <div class="card">
+          <h3>NB Distillers — Activity Summary</h3>
+          <div class="stats-grid" id="nbStats"></div>
+        </div>
+        <div class="card">
+          <h3>Recent NB Distillers Activity</h3>
+          <div id="nbActivities"></div>
+        </div>
+      </div>
+
+      <div id="producer-anu" class="producer-panel">
+        <div class="card">
+          <h3>Anu Portfolio — Activity Summary</h3>
+          <div class="stats-grid" id="anuStats"></div>
+        </div>
+        <div class="card">
+          <h3>Recent Anu Portfolio Activity</h3>
+          <div id="anuActivities"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Follow-Ups -->
+    <section id="view-followups" class="view">
+      <h1>Follow-Up Tracker</h1>
+      <div class="card">
+        <h3>Upcoming & Overdue Follow-Ups</h3>
+        <div id="followupsList">
+          <p class="muted">Loading follow-ups...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Export -->
     <section id="view-export" class="view">
       <h1>Export & Backup</h1>
       <div class="export-grid">
         <div class="card export-card">
           <h3>&#128202; Full Pipeline Report</h3>
-          <p>All 766 stores with activity counts (tastings, visits, listings, emails, calls) and last activity date. <strong>Best for building your sales pipeline.</strong></p>
+          <p>All stores with activity counts, manager info, and producer assignments.</p>
           <a href="/api/export/pipeline" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Pipeline CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#128203; All Activities Log</h3>
-          <p>Every activity ever logged — rep, store, type, notes, date. Full history export.</p>
+          <p>Every activity ever logged — rep, store, producer, type, notes, date.</p>
           <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Activities CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#127979; Store Directory</h3>
-          <p>All store info — numbers, addresses, phones, emails, contacts, status, rep assignments.</p>
+          <p>All store info — managers, contacts, phones, emails, producer assignments.</p>
           <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Stores CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#128190; Full Database Backup</h3>
-          <p>Download the entire SQLite database file. Use this to restore or migrate your data anytime.</p>
+          <p>Download the entire database. Use to restore or migrate data anytime.</p>
           <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download .db Backup</a>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
-        <h3>&#128279; Google Sheets Auto-Sync</h3>
-        <p style="margin-bottom:12px">To automatically sync your pipeline to Google Sheets:</p>
-        <ol style="color:var(--muted);line-height:2;padding-left:20px">
-          <li>Download the <strong>Pipeline CSV</strong> above</li>
-          <li>Upload to Google Drive &rarr; Open with Google Sheets</li>
-          <li>Or use <strong>Google Sheets IMPORTDATA</strong> formula:<br>
-            <code style="background:var(--surface2);padding:4px 8px;border-radius:4px;font-size:13px">=IMPORTDATA("YOUR_APP_URL/api/export/pipeline")</code><br>
-            <span style="font-size:12px">This auto-refreshes every hour with live data from your tracker</span>
-          </li>
-        </ol>
+        <h3>&#128279; Google Sheets Live Sync</h3>
+        <p style="margin-bottom:12px">Paste this formula in Google Sheets cell A1 — auto-refreshes hourly:</p>
+        <code style="background:var(--surface2);padding:8px 12px;border-radius:6px;font-size:13px;display:block;word-break:break-all">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
       </div>
     </section>
 
@@ -176,6 +236,7 @@
         <div class="modal-body">
           <div class="detail-tabs">
             <button class="tab-btn active" onclick="switchTab('info', this)">Info</button>
+            <button class="tab-btn" onclick="switchTab('contacts', this)">Contacts</button>
             <button class="tab-btn" onclick="switchTab('activities', this)">Activities</button>
           </div>
 
@@ -192,11 +253,14 @@
               </div>
               <div class="form-row">
                 <div class="form-group"><label>Postal</label><input type="text" id="editPostal"></div>
-                <div class="form-group"><label>Phone</label><input type="text" id="editPhone"></div>
-              </div>
-              <div class="form-row">
-                <div class="form-group"><label>Email</label><input type="text" id="editEmail"></div>
-                <div class="form-group"><label>Contacts</label><input type="text" id="editContacts"></div>
+                <div class="form-group"><label>Producer</label>
+                  <select id="editProducer">
+                    <option value="">--</option>
+                    <option>NB Distillers</option>
+                    <option>Anu Portfolio</option>
+                    <option>Both</option>
+                  </select>
+                </div>
               </div>
               <div class="form-row">
                 <div class="form-group"><label>Priority</label>
@@ -215,6 +279,26 @@
               <div class="form-group"><label>Assigned Rep</label><input type="text" id="editRep"></div>
               <button type="button" class="btn-primary" onclick="saveStore()">Save Changes</button>
               <span id="saveSuccess" class="success-msg" style="display:none">Saved!</span>
+            </form>
+          </div>
+
+          <div id="tab-contacts" class="tab-content">
+            <form id="contactsForm">
+              <div class="form-row">
+                <div class="form-group"><label>Manager Name</label><input type="text" id="editManagerName"></div>
+                <div class="form-group"><label>Asst. Manager Name</label><input type="text" id="editAsstManager"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Manager Phone</label><input type="tel" id="editManagerPhone"></div>
+                <div class="form-group"><label>Store Email</label><input type="email" id="editStoreEmail"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Store Phone</label><input type="tel" id="editPhone"></div>
+                <div class="form-group"><label>Other Contacts</label><input type="text" id="editContacts"></div>
+              </div>
+              <div class="form-group"><label>General Email (from file)</label><input type="text" id="editEmail"></div>
+              <button type="button" class="btn-primary" onclick="saveStore()">Save Contacts</button>
+              <span id="saveContactSuccess" class="success-msg" style="display:none">Saved!</span>
             </form>
           </div>
 
