@@ -6,8 +6,10 @@ import json
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, g, Response, send_file
 
-app = Flask(__name__)
-DB_DIR = os.environ.get('DB_DIR', os.path.dirname(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),
+            static_folder=os.path.join(BASE_DIR, 'static'))
+DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
 DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
 
 def get_db():
@@ -71,7 +73,7 @@ def seed_data():
         return
 
     import openpyxl
-    xlsx_path = os.path.join(os.path.dirname(__file__), 'data', 'All LCBO stores.xlsx')
+    xlsx_path = os.path.join(BASE_DIR, 'data', 'All LCBO stores.xlsx')
     if not os.path.exists(xlsx_path):
         xlsx_path = '/Users/ikshitsharma/Downloads/All LCBO stores.xlsx'
 
