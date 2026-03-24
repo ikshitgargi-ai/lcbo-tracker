@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+lcbo_tracker.db
+.env
+*.db-journal
+*.db-wal

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: lcbo-tracker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: DB_DIR
+        value: /opt/render/project/src
+    plan: free
+    disk:
+      name: lcbo-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1

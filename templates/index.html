@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#6c5ce7">
+<link rel="manifest" href="/static/manifest.json">
+<title>LCBO Store Tracker</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- Sidebar -->
+  <nav id="sidebar">
+    <div class="logo">
+      <div class="brand-logo">
+        <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
+          <circle cx="18" cy="18" r="17" stroke="#a29bfe" stroke-width="2" fill="rgba(108,92,231,0.1)"/>
+          <text x="18" y="22" text-anchor="middle" fill="#a29bfe" font-size="14" font-weight="bold" font-family="sans-serif">AS</text>
+        </svg>
+        <div>
+          <h2>Anu Spirits</h2>
+          <span class="brand-sub">LCBO Tracker</span>
+        </div>
+      </div>
+    </div>
+    <div class="nav-items">
+      <button class="nav-btn active" data-view="dashboard" onclick="showView('dashboard')">
+        <span class="icon">&#9632;</span> Dashboard
+      </button>
+      <button class="nav-btn" data-view="stores" onclick="showView('stores')">
+        <span class="icon">&#9881;</span> Stores
+      </button>
+      <button class="nav-btn" data-view="log" onclick="showView('log')">
+        <span class="icon">&#10010;</span> Log Activity
+      </button>
+      <button class="nav-btn" data-view="export" onclick="showView('export')">
+        <span class="icon">&#8615;</span> Export
+      </button>
+    </div>
+    <div class="rep-selector">
+      <label>Active Rep</label>
+      <select id="activeRep" onchange="setActiveRep()"></select>
+    </div>
+  </nav>
+
+  <!-- Main Content -->
+  <main id="content">
+
+    <!-- Dashboard View -->
+    <section id="view-dashboard" class="view active">
+      <h1>Dashboard</h1>
+      <div class="stats-grid" id="statsGrid"></div>
+      <div class="card">
+        <h3>Recent Activity</h3>
+        <table class="data-table" id="recentTable">
+          <thead>
+            <tr><th>Time</th><th>Rep</th><th>Store</th><th>Type</th><th>Notes</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Stores View -->
+    <section id="view-stores" class="view">
+      <h1>All Stores</h1>
+      <div class="filters">
+        <input type="text" id="storeSearch" placeholder="Search store #, name, address, city..." oninput="debounceSearch()">
+        <select id="cityFilter" onchange="loadStores()">
+          <option value="">All Cities</option>
+        </select>
+      </div>
+      <div class="card">
+        <table class="data-table" id="storesTable">
+          <thead>
+            <tr>
+              <th>Store #</th><th>Account</th><th>Address</th><th>City</th>
+              <th>Phone</th><th>Email</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="pagination" id="pagination"></div>
+      </div>
+    </section>
+
+    <!-- Log Activity View -->
+    <section id="view-log" class="view">
+      <h1>Log Activity</h1>
+      <div class="log-layout">
+        <div class="card log-form-card">
+          <h3>New Activity</h3>
+          <div class="form-group">
+            <label>Store</label>
+            <input type="text" id="logStoreSearch" placeholder="Type store # or name..." oninput="searchLogStore()">
+            <div id="logStoreResults" class="dropdown-results"></div>
+            <input type="hidden" id="logStoreId">
+            <div id="selectedStoreInfo" class="selected-store-info"></div>
+          </div>
+          <div class="form-group">
+            <label>Activity Type</label>
+            <div class="activity-types" id="activityTypes">
+              <button class="type-btn" data-type="tasting" onclick="selectType(this)">&#127863; Tasting</button>
+              <button class="type-btn" data-type="site_visit" onclick="selectType(this)">&#128205; Site Visit</button>
+              <button class="type-btn" data-type="listing" onclick="selectType(this)">&#128196; Listing</button>
+              <button class="type-btn" data-type="email" onclick="selectType(this)">&#9993; Email</button>
+              <button class="type-btn" data-type="call" onclick="selectType(this)">&#128222; Call</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Notes</label>
+            <textarea id="logNotes" rows="4" placeholder="Details about the interaction..."></textarea>
+          </div>
+          <button class="btn-primary" onclick="submitActivity()">Log Activity</button>
+          <div id="logSuccess" class="success-msg" style="display:none">Activity logged!</div>
+        </div>
+
+        <div class="card log-history-card">
+          <h3>Store Activity History</h3>
+          <div id="storeHistory">
+            <p class="muted">Select a store to view history</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Export View -->
+    <section id="view-export" class="view">
+      <h1>Export & Backup</h1>
+      <div class="export-grid">
+        <div class="card export-card">
+          <h3>&#128202; Full Pipeline Report</h3>
+          <p>All 766 stores with activity counts (tastings, visits, listings, emails, calls) and last activity date. <strong>Best for building your sales pipeline.</strong></p>
+          <a href="/api/export/pipeline" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Pipeline CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#128203; All Activities Log</h3>
+          <p>Every activity ever logged — rep, store, type, notes, date. Full history export.</p>
+          <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Activities CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#127979; Store Directory</h3>
+          <p>All store info — numbers, addresses, phones, emails, contacts, status, rep assignments.</p>
+          <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Stores CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#128190; Full Database Backup</h3>
+          <p>Download the entire SQLite database file. Use this to restore or migrate your data anytime.</p>
+          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download .db Backup</a>
+        </div>
+      </div>
+      <div class="card" style="margin-top:20px">
+        <h3>&#128279; Google Sheets Auto-Sync</h3>
+        <p style="margin-bottom:12px">To automatically sync your pipeline to Google Sheets:</p>
+        <ol style="color:var(--muted);line-height:2;padding-left:20px">
+          <li>Download the <strong>Pipeline CSV</strong> above</li>
+          <li>Upload to Google Drive &rarr; Open with Google Sheets</li>
+          <li>Or use <strong>Google Sheets IMPORTDATA</strong> formula:<br>
+            <code style="background:var(--surface2);padding:4px 8px;border-radius:4px;font-size:13px">=IMPORTDATA("YOUR_APP_URL/api/export/pipeline")</code><br>
+            <span style="font-size:12px">This auto-refreshes every hour with live data from your tracker</span>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Store Detail Modal -->
+    <div id="storeModal" class="modal" style="display:none">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2 id="modalTitle">Store Detail</h2>
+          <button class="close-btn" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="detail-tabs">
+            <button class="tab-btn active" onclick="switchTab('info', this)">Info</button>
+            <button class="tab-btn" onclick="switchTab('activities', this)">Activities</button>
+          </div>
+
+          <div id="tab-info" class="tab-content active">
+            <form id="storeEditForm">
+              <input type="hidden" id="editStoreId">
+              <div class="form-row">
+                <div class="form-group"><label>Account</label><input type="text" id="editAccount"></div>
+                <div class="form-group"><label>Store #</label><input type="text" id="editStoreNum" disabled></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Address</label><input type="text" id="editAddress"></div>
+                <div class="form-group"><label>City</label><input type="text" id="editCity"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Postal</label><input type="text" id="editPostal"></div>
+                <div class="form-group"><label>Phone</label><input type="text" id="editPhone"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Email</label><input type="text" id="editEmail"></div>
+                <div class="form-group"><label>Contacts</label><input type="text" id="editContacts"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Priority</label>
+                  <select id="editPriority">
+                    <option>Standard</option><option>High</option><option>Low</option>
+                  </select>
+                </div>
+                <div class="form-group"><label>Status</label>
+                  <select id="editStatus">
+                    <option value="">--</option>
+                    <option>Not Active</option><option>Pitched</option>
+                    <option>Won</option><option>Lost</option><option>Follow Up</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group"><label>Assigned Rep</label><input type="text" id="editRep"></div>
+              <button type="button" class="btn-primary" onclick="saveStore()">Save Changes</button>
+              <span id="saveSuccess" class="success-msg" style="display:none">Saved!</span>
+            </form>
+          </div>
+
+          <div id="tab-activities" class="tab-content">
+            <div class="activity-filter-row">
+              <button class="filter-pill active" data-filter="" onclick="filterActivities('', this)">All</button>
+              <button class="filter-pill" data-filter="tasting" onclick="filterActivities('tasting', this)">Tasting</button>
+              <button class="filter-pill" data-filter="site_visit" onclick="filterActivities('site_visit', this)">Site Visit</button>
+              <button class="filter-pill" data-filter="listing" onclick="filterActivities('listing', this)">Listing</button>
+              <button class="filter-pill" data-filter="email" onclick="filterActivities('email', this)">Email</button>
+              <button class="filter-pill" data-filter="call" onclick="filterActivities('call', this)">Call</button>
+            </div>
+            <div id="modalActivities"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
