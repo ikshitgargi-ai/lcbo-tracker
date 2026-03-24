@@ -4,3 +4,5 @@ lcbo_tracker.db
 .env
 *.db-journal
 *.db-wal
+lcbo_tracker.db-shm
+lcbo_tracker.db-wal
