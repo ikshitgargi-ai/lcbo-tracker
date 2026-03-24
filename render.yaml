@@ -7,10 +7,4 @@ services:
     envVars:
       - key: FLASK_DEBUG
         value: "false"
-      - key: DB_DIR
-        value: /opt/render/project/src
     plan: free
-    disk:
-      name: lcbo-data
-      mountPath: /opt/render/project/src
-      sizeGB: 1
