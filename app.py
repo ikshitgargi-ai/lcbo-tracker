@@ -9,6 +9,10 @@ from flask import Flask, render_template, request, jsonify, g, Response, send_fi
 
 # Database imports - PostgreSQL for production, SQLite for local dev
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
+# Strip channel_binding param — psycopg2-binary doesn't support it on all platforms
+if DATABASE_URL and 'channel_binding' in DATABASE_URL:
+    import re as _re
+    DATABASE_URL = _re.sub(r'[&?]channel_binding=[^&]*', '', DATABASE_URL)
 USE_POSTGRES = bool(DATABASE_URL)
 
 if USE_POSTGRES:
@@ -263,10 +267,10 @@ def init_db():
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
             except Exception:
-                conn.rollback()
-                conn.autocommit = True
+                pass  # Column already exists, safe to ignore with autocommit=True
         cur.close()
         conn.close()
+        print("[DB] PostgreSQL tables initialized successfully")
     else:
         db = sqlite3.connect(DB_PATH)
         db.execute("PRAGMA foreign_keys=ON")
