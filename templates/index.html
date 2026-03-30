@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#6c5ce7">
+<meta name="theme-color" content="#b22222">
 <link rel="manifest" href="/static/manifest.json">
-<title>LCBO Store Tracker</title>
+<title>Anu Spirits — LCBO Tracker</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -22,211 +22,263 @@
         </svg>
         <div>
           <h2>Anu Spirits</h2>
-          <span class="brand-sub">LCBO Tracker</span>
+          <span class="brand-sub">LCBO Tracker Pro</span>
         </div>
       </div>
     </div>
     <div class="nav-items">
       <button class="nav-btn active" data-view="dashboard" onclick="showView('dashboard')">
-        <span class="icon">&#9632;</span> Dashboard
+        <span class="icon">&#9632;</span><span class="nav-label">Dashboard</span>
       </button>
       <button class="nav-btn" data-view="stores" onclick="showView('stores')">
-        <span class="icon">&#9881;</span> Stores
+        <span class="icon">&#127979;</span><span class="nav-label">Stores</span>
       </button>
       <button class="nav-btn" data-view="log" onclick="showView('log')">
-        <span class="icon">&#10010;</span> Log Activity
+        <span class="icon">&#10010;</span><span class="nav-label">Log</span>
       </button>
-      <button class="nav-btn" data-view="producers" onclick="showView('producers')">
-        <span class="icon">&#127870;</span> Producers
+      <button class="nav-btn" data-view="inventory" onclick="showView('inventory')">
+        <span class="icon">&#128230;</span><span class="nav-label">Inventory</span>
+      </button>
+      <button class="nav-btn" data-view="routes" onclick="showView('routes')">
+        <span class="icon">&#128506;</span><span class="nav-label">Routes</span>
       </button>
       <button class="nav-btn" data-view="followups" onclick="showView('followups')">
-        <span class="icon">&#128197;</span> Follow-Ups
+        <span class="icon">&#128197;</span><span class="nav-label">Follow-Ups</span>
       </button>
       <button class="nav-btn" data-view="export" onclick="showView('export')">
-        <span class="icon">&#8615;</span> Export
+        <span class="icon">&#8615;</span><span class="nav-label">Export</span>
       </button>
     </div>
     <div class="rep-selector">
       <label>Active Rep</label>
       <select id="activeRep" onchange="setActiveRep()"></select>
     </div>
+    <div class="live-clock" id="liveClock"></div>
   </nav>
 
   <main id="content">
 
-    <!-- Dashboard -->
+    <!-- ===== DASHBOARD ===== -->
     <section id="view-dashboard" class="view active">
-      <h1>Dashboard</h1>
+      <div class="view-header">
+        <h1>Dashboard</h1>
+        <div class="live-badge" id="dashLive">LIVE <span class="pulse"></span></div>
+      </div>
       <div class="stats-grid" id="statsGrid"></div>
-      <div class="card">
-        <h3>Recent Activity</h3>
-        <table class="data-table" id="recentTable">
-          <thead>
-            <tr><th>Time</th><th>Rep</th><th>Store</th><th>Producer</th><th>Type</th><th>Notes</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="dashboard-grid">
+        <div class="card">
+          <h3>Recent Activity <span class="card-badge" id="recentCount"></span></h3>
+          <table class="data-table" id="recentTable">
+            <thead><tr><th>Date/Time</th><th>Rep</th><th>Store</th><th>Producer</th><th>Type</th><th>Notes</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Rep Performance</h3>
+          <div id="repStats"></div>
+        </div>
       </div>
     </section>
 
-    <!-- Stores -->
+    <!-- ===== STORES ===== -->
     <section id="view-stores" class="view">
-      <h1>All Stores</h1>
+      <div class="view-header">
+        <h1>All Stores <span class="header-count" id="storeCount"></span></h1>
+      </div>
       <div class="filters">
-        <input type="text" id="storeSearch" placeholder="Search store #, name, address, city, manager..." oninput="debounceSearch()">
-        <select id="cityFilter" onchange="loadStores()">
-          <option value="">All Cities</option>
+        <input type="text" id="storeSearch" placeholder="Search store #, name, city, manager..." oninput="debounceSearch()">
+        <select id="cityFilter" onchange="currentPage=1;loadStores()"><option value="">All Cities</option></select>
+        <select id="producerFilter" onchange="currentPage=1;loadStores()">
+          <option value="">All Producers</option>
+          <option value="NB Distillers">NB Distillers</option>
+          <option value="Anu Portfolio">Anu Portfolio</option>
         </select>
       </div>
       <div class="card">
         <table class="data-table" id="storesTable">
-          <thead>
-            <tr>
-              <th>Store #</th><th>Account</th><th>City</th><th>Manager</th>
-              <th>Phone</th><th>Status</th><th>Producer</th><th></th>
-            </tr>
-          </thead>
+          <thead><tr><th>Store #</th><th>Account</th><th>City</th><th>Manager</th><th>Phone</th><th>Status</th><th>Producer</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
         <div class="pagination" id="pagination"></div>
       </div>
     </section>
 
-    <!-- Log Activity -->
+    <!-- ===== LOG ACTIVITY ===== -->
     <section id="view-log" class="view">
       <h1>Log Activity</h1>
       <div class="log-layout">
         <div class="card log-form-card">
-          <h3>New Activity</h3>
+          <h3>New Activity Entry</h3>
           <div class="form-group">
             <label>Store</label>
-            <input type="text" id="logStoreSearch" placeholder="Type store # or name..." oninput="searchLogStore()">
+            <input type="text" id="logStoreSearch" placeholder="Type store # or name..." oninput="searchLogStore()" autocomplete="off">
             <div id="logStoreResults" class="dropdown-results"></div>
             <input type="hidden" id="logStoreId">
             <div id="selectedStoreInfo" class="selected-store-info"></div>
           </div>
           <div class="form-group">
-            <label>Producer</label>
-            <div class="activity-types">
-              <button class="type-btn producer-btn" data-producer="NB Distillers" onclick="selectProducer(this)">NB Distillers</button>
-              <button class="type-btn producer-btn" data-producer="Anu Portfolio" onclick="selectProducer(this)">Anu Portfolio</button>
+            <label>Producer(s) <span class="hint">select one or more</span></label>
+            <div class="chip-group" id="producerChips">
+              <button class="chip" data-val="NB Distillers" onclick="toggleChip(this,'producer')">NB Distillers</button>
+              <button class="chip" data-val="Anu Portfolio" onclick="toggleChip(this,'producer')">Anu Portfolio</button>
             </div>
           </div>
           <div class="form-group">
             <label>Activity Type</label>
-            <div class="activity-types" id="activityTypes">
-              <button class="type-btn" data-type="tasting" onclick="selectType(this)">&#127863; Tasting</button>
-              <button class="type-btn" data-type="site_visit" onclick="selectType(this)">&#128205; Site Visit</button>
-              <button class="type-btn" data-type="listing" onclick="selectType(this)">&#128196; Listing</button>
-              <button class="type-btn" data-type="email" onclick="selectType(this)">&#9993; Email</button>
-              <button class="type-btn" data-type="call" onclick="selectType(this)">&#128222; Call</button>
+            <div class="chip-group" id="activityChips">
+              <button class="chip" data-val="tasting" onclick="toggleChip(this,'activity')">&#127863; Tasting</button>
+              <button class="chip" data-val="site_visit" onclick="toggleChip(this,'activity')">&#128205; Site Visit</button>
+              <button class="chip" data-val="listing" onclick="toggleChip(this,'activity')">&#128196; Listing</button>
+              <button class="chip" data-val="email" onclick="toggleChip(this,'activity')">&#9993; Email</button>
+              <button class="chip" data-val="call" onclick="toggleChip(this,'activity')">&#128222; Call</button>
+              <button class="chip" data-val="follow_up" onclick="toggleChip(this,'activity')">&#128197; Follow-Up</button>
             </div>
           </div>
           <div class="form-group">
-            <label>Venue Type (optional)</label>
-            <div class="activity-types">
-              <button class="type-btn venue-btn" data-venue="LCBO" onclick="selectVenue(this)">LCBO</button>
-              <button class="type-btn venue-btn" data-venue="Restaurant" onclick="selectVenue(this)">Restaurant</button>
-              <button class="type-btn venue-btn" data-venue="Bar" onclick="selectVenue(this)">Bar</button>
-              <button class="type-btn venue-btn" data-venue="Club" onclick="selectVenue(this)">Club</button>
+            <label>Venue Type <span class="hint">optional</span></label>
+            <div class="chip-group" id="venueChips">
+              <button class="chip" data-val="LCBO" onclick="toggleChip(this,'venue')">LCBO</button>
+              <button class="chip" data-val="Restaurant" onclick="toggleChip(this,'venue')">Restaurant</button>
+              <button class="chip" data-val="Bar" onclick="toggleChip(this,'venue')">Bar</button>
+              <button class="chip" data-val="Club" onclick="toggleChip(this,'venue')">Club</button>
             </div>
           </div>
           <div class="form-group">
-            <label>Follow-Up Date (optional)</label>
+            <label>Follow-Up Date <span class="hint">optional</span></label>
             <input type="date" id="logFollowUpDate">
           </div>
           <div class="form-group">
             <label>Notes</label>
-            <textarea id="logNotes" rows="4" placeholder="Details about the interaction..."></textarea>
+            <textarea id="logNotes" rows="4" placeholder="Conversation details, action items, observations..."></textarea>
           </div>
           <button class="btn-primary" onclick="submitActivity()">Log Activity</button>
-          <div id="logSuccess" class="success-msg" style="display:none">Activity logged!</div>
+          <div id="logSuccess" class="success-msg" style="display:none">Activity logged &amp; saved!</div>
         </div>
-
         <div class="card log-history-card">
-          <h3>Store Activity History</h3>
-          <div id="storeHistory">
-            <p class="muted">Select a store to view history</p>
+          <h3>Account Snapshot</h3>
+          <div id="storeHistory"><p class="muted">Select a store to view its full history and last conversation</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== INVENTORY ===== -->
+    <section id="view-inventory" class="view">
+      <div class="view-header">
+        <h1>LCBO Inventory</h1>
+        <div class="live-badge">LCBO.COM <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Track our products across LCBO stores. Click "Check Stock" to fetch live data from LCBO.com.</p>
+      <div class="inventory-grid" id="inventoryGrid"></div>
+      <div class="card" style="margin-top:20px">
+        <h3>Add Product to Track</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Brand</label>
+            <select id="newProdBrand"><option>NB Distillers</option><option>Anu Portfolio</option></select>
+          </div>
+          <div class="form-group"><label>Product Name</label><input type="text" id="newProdName" placeholder="e.g. Rutland Square Gin"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>LCBO SKU</label><input type="text" id="newProdSku" placeholder="e.g. 46340"></div>
+          <div class="form-group"><label>Category</label>
+            <select id="newProdCat"><option>Spirits</option><option>Wine</option><option>Beer</option></select>
           </div>
         </div>
+        <button class="btn-primary" onclick="addProduct()">Add Product</button>
       </div>
     </section>
 
-    <!-- Producers -->
-    <section id="view-producers" class="view">
-      <h1>Producers</h1>
-      <div class="producer-tabs">
-        <button class="producer-tab active" onclick="switchProducerView('nb', this)">NB Distillers</button>
-        <button class="producer-tab" onclick="switchProducerView('anu', this)">Anu Portfolio</button>
+    <!-- ===== ROUTES ===== -->
+    <section id="view-routes" class="view">
+      <div class="view-header">
+        <h1>Route Planner</h1>
       </div>
-
-      <div id="producer-nb" class="producer-panel active">
-        <div class="card">
-          <h3>NB Distillers — Activity Summary</h3>
-          <div class="stats-grid" id="nbStats"></div>
+      <div class="route-header card">
+        <div class="route-home">
+          <span class="route-pin">&#128205;</span>
+          <div>
+            <strong>Rep Home Base</strong>
+            <div class="muted">181 Dundas St E, Toronto, ON</div>
+          </div>
         </div>
-        <div class="card">
-          <h3>Recent NB Distillers Activity</h3>
-          <div id="nbActivities"></div>
+        <div class="route-filters">
+          <select id="routeCity" onchange="loadRoutes()">
+            <option value="">All Cities</option>
+          </select>
+          <select id="routeMaxKm" onchange="loadRoutes()">
+            <option value="">Any Distance</option>
+            <option value="5">Within 5 km</option>
+            <option value="10">Within 10 km</option>
+            <option value="25">Within 25 km</option>
+            <option value="50">Within 50 km</option>
+            <option value="100">Within 100 km</option>
+          </select>
+          <select id="routeLimit" onchange="loadRoutes()">
+            <option value="20">Top 20</option>
+            <option value="50" selected>Top 50</option>
+            <option value="100">Top 100</option>
+          </select>
         </div>
       </div>
-
-      <div id="producer-anu" class="producer-panel">
-        <div class="card">
-          <h3>Anu Portfolio — Activity Summary</h3>
-          <div class="stats-grid" id="anuStats"></div>
-        </div>
-        <div class="card">
-          <h3>Recent Anu Portfolio Activity</h3>
-          <div id="anuActivities"></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Follow-Ups -->
-    <section id="view-followups" class="view">
-      <h1>Follow-Up Tracker</h1>
+      <div id="routeMapLink" style="margin-bottom:16px"></div>
       <div class="card">
-        <h3>Upcoming & Overdue Follow-Ups</h3>
-        <div id="followupsList">
-          <p class="muted">Loading follow-ups...</p>
-        </div>
+        <h3>Stores by Distance <span class="card-badge" id="routeCount"></span></h3>
+        <table class="data-table" id="routesTable">
+          <thead><tr><th>Dist.</th><th>Store #</th><th>Account</th><th>City</th><th>Last Activity</th><th>Total</th><th>Navigate</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>Cities by Distance</h3>
+        <div id="citiesRoute"></div>
       </div>
     </section>
 
-    <!-- Export -->
+    <!-- ===== FOLLOW-UPS ===== -->
+    <section id="view-followups" class="view">
+      <div class="view-header">
+        <h1>Follow-Up Tracker</h1>
+        <div class="live-badge" id="fuLive">LIVE <span class="pulse"></span></div>
+      </div>
+      <div class="followup-stats" id="followupStats"></div>
+      <div class="card">
+        <div id="followupsList"><p class="muted">Loading follow-ups...</p></div>
+      </div>
+    </section>
+
+    <!-- ===== EXPORT ===== -->
     <section id="view-export" class="view">
-      <h1>Export & Backup</h1>
+      <h1>Export &amp; Data Backup</h1>
+      <div class="alert-info">All data is stored permanently. Every activity, note, and follow-up is logged with timestamps and never deleted. Export regularly for additional backup.</div>
       <div class="export-grid">
         <div class="card export-card">
-          <h3>&#128202; Full Pipeline Report</h3>
-          <p>All stores with activity counts, manager info, and producer assignments.</p>
-          <a href="/api/export/pipeline" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Pipeline CSV</a>
+          <h3>&#128202; Pipeline Report</h3>
+          <p>All stores + activity counts + manager info + producer assignments</p>
+          <a href="/api/export/pipeline" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
-          <h3>&#128203; All Activities Log</h3>
-          <p>Every activity ever logged — rep, store, producer, type, notes, date.</p>
-          <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Activities CSV</a>
+          <h3>&#128203; Activity Log</h3>
+          <p>Every activity ever logged — rep, store, producer, type, notes, date/time</p>
+          <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#127979; Store Directory</h3>
-          <p>All store info — managers, contacts, phones, emails, producer assignments.</p>
-          <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Stores CSV</a>
+          <p>All store info — managers, contacts, phones, emails, producers</p>
+          <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
-          <h3>&#128190; Full Database Backup</h3>
-          <p>Download the entire database. Use to restore or migrate data anytime.</p>
-          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download .db Backup</a>
+          <h3>&#128190; Database Backup</h3>
+          <p>Full SQLite database — contains ALL data ever entered. Keep this safe.</p>
+          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download .db</a>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <h3>&#128279; Google Sheets Live Sync</h3>
-        <p style="margin-bottom:12px">Paste this formula in Google Sheets cell A1 — auto-refreshes hourly:</p>
-        <code style="background:var(--surface2);padding:8px 12px;border-radius:6px;font-size:13px;display:block;word-break:break-all">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
+        <p style="margin-bottom:12px">Paste in Google Sheets cell A1 — auto-refreshes hourly:</p>
+        <code class="code-block">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
       </div>
     </section>
 
-    <!-- Store Detail Modal -->
+    <!-- ===== STORE DETAIL MODAL ===== -->
     <div id="storeModal" class="modal" style="display:none">
       <div class="modal-content">
         <div class="modal-header">
@@ -235,12 +287,19 @@
         </div>
         <div class="modal-body">
           <div class="detail-tabs">
-            <button class="tab-btn active" onclick="switchTab('info', this)">Info</button>
+            <button class="tab-btn active" onclick="switchTab('snapshot', this)">Snapshot</button>
+            <button class="tab-btn" onclick="switchTab('info', this)">Info</button>
             <button class="tab-btn" onclick="switchTab('contacts', this)">Contacts</button>
             <button class="tab-btn" onclick="switchTab('activities', this)">Activities</button>
           </div>
 
-          <div id="tab-info" class="tab-content active">
+          <!-- Snapshot Tab -->
+          <div id="tab-snapshot" class="tab-content active">
+            <div id="snapshotContent"><p class="muted">Loading account snapshot...</p></div>
+          </div>
+
+          <!-- Info Tab -->
+          <div id="tab-info" class="tab-content">
             <form id="storeEditForm">
               <input type="hidden" id="editStoreId">
               <div class="form-row">
@@ -254,39 +313,29 @@
               <div class="form-row">
                 <div class="form-group"><label>Postal</label><input type="text" id="editPostal"></div>
                 <div class="form-group"><label>Producer</label>
-                  <select id="editProducer">
-                    <option value="">--</option>
-                    <option>NB Distillers</option>
-                    <option>Anu Portfolio</option>
-                    <option>Both</option>
-                  </select>
+                  <select id="editProducer"><option value="">--</option><option>NB Distillers</option><option>Anu Portfolio</option><option>Both</option></select>
                 </div>
               </div>
               <div class="form-row">
                 <div class="form-group"><label>Priority</label>
-                  <select id="editPriority">
-                    <option>Standard</option><option>High</option><option>Low</option>
-                  </select>
+                  <select id="editPriority"><option>Standard</option><option>High</option><option>Low</option></select>
                 </div>
                 <div class="form-group"><label>Status</label>
-                  <select id="editStatus">
-                    <option value="">--</option>
-                    <option>Not Active</option><option>Pitched</option>
-                    <option>Won</option><option>Lost</option><option>Follow Up</option>
-                  </select>
+                  <select id="editStatus"><option value="">--</option><option>Not Active</option><option>Pitched</option><option>Won</option><option>Lost</option><option>Follow Up</option></select>
                 </div>
               </div>
               <div class="form-group"><label>Assigned Rep</label><input type="text" id="editRep"></div>
               <button type="button" class="btn-primary" onclick="saveStore()">Save Changes</button>
-              <span id="saveSuccess" class="success-msg" style="display:none">Saved!</span>
+              <span class="success-msg" style="display:none">Saved!</span>
             </form>
           </div>
 
+          <!-- Contacts Tab -->
           <div id="tab-contacts" class="tab-content">
             <form id="contactsForm">
               <div class="form-row">
                 <div class="form-group"><label>Manager Name</label><input type="text" id="editManagerName"></div>
-                <div class="form-group"><label>Asst. Manager Name</label><input type="text" id="editAsstManager"></div>
+                <div class="form-group"><label>Asst. Manager</label><input type="text" id="editAsstManager"></div>
               </div>
               <div class="form-row">
                 <div class="form-group"><label>Manager Phone</label><input type="tel" id="editManagerPhone"></div>
@@ -296,20 +345,21 @@
                 <div class="form-group"><label>Store Phone</label><input type="tel" id="editPhone"></div>
                 <div class="form-group"><label>Other Contacts</label><input type="text" id="editContacts"></div>
               </div>
-              <div class="form-group"><label>General Email (from file)</label><input type="text" id="editEmail"></div>
+              <div class="form-group"><label>General Email</label><input type="text" id="editEmail"></div>
               <button type="button" class="btn-primary" onclick="saveStore()">Save Contacts</button>
-              <span id="saveContactSuccess" class="success-msg" style="display:none">Saved!</span>
+              <span class="success-msg" style="display:none">Saved!</span>
             </form>
           </div>
 
+          <!-- Activities Tab -->
           <div id="tab-activities" class="tab-content">
             <div class="activity-filter-row">
-              <button class="filter-pill active" data-filter="" onclick="filterActivities('', this)">All</button>
-              <button class="filter-pill" data-filter="tasting" onclick="filterActivities('tasting', this)">Tasting</button>
-              <button class="filter-pill" data-filter="site_visit" onclick="filterActivities('site_visit', this)">Site Visit</button>
-              <button class="filter-pill" data-filter="listing" onclick="filterActivities('listing', this)">Listing</button>
-              <button class="filter-pill" data-filter="email" onclick="filterActivities('email', this)">Email</button>
-              <button class="filter-pill" data-filter="call" onclick="filterActivities('call', this)">Call</button>
+              <button class="filter-pill active" onclick="filterActivities('', this)">All</button>
+              <button class="filter-pill" onclick="filterActivities('tasting', this)">Tasting</button>
+              <button class="filter-pill" onclick="filterActivities('site_visit', this)">Site Visit</button>
+              <button class="filter-pill" onclick="filterActivities('listing', this)">Listing</button>
+              <button class="filter-pill" onclick="filterActivities('email', this)">Email</button>
+              <button class="filter-pill" onclick="filterActivities('call', this)">Call</button>
             </div>
             <div id="modalActivities"></div>
           </div>

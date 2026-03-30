@@ -7,4 +7,6 @@ services:
     envVars:
       - key: FLASK_DEBUG
         value: "false"
+      - key: DATABASE_URL
+        sync: false
     plan: free
