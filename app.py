@@ -26,9 +26,28 @@ try:
 except ImportError:
     http_requests = None
 
+from decimal import Decimal as _Decimal
+from flask.json.provider import DefaultJSONProvider
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class PgJSONProvider(DefaultJSONProvider):
+    """Handle PostgreSQL types (Decimal, datetime) in JSON responses"""
+    def default(self, o):
+        if isinstance(o, _Decimal):
+            return float(o)
+        if isinstance(o, datetime):
+            return o.isoformat()
+        if hasattr(o, 'isoformat'):
+            return o.isoformat()
+        return super().default(o)
+
+
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),
             static_folder=os.path.join(BASE_DIR, 'static'))
+app.json_provider_class = PgJSONProvider
+app.json = PgJSONProvider(app)
 
 DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
 DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
