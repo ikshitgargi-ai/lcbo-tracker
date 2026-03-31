@@ -557,15 +557,23 @@ async function loadRoutes() {
   const cities = await cityRes.json();
   const citySel = document.getElementById('routeCity');
   if (citySel.options.length <= 1) {
-    citySel.innerHTML = '<option value="">All Cities</option>' + cities.map(c => `<option value="${c.city}">${c.city} (${c.store_count} stores, ${c.distance_km}km)</option>`).join('');
+    citySel.innerHTML = '<option value="">All Cities</option>' + cities.map(c => `<option value="${c.city}">${c.city} (${c.store_count}, ${c.distance_km}km, ${c.coverage}%)</option>`).join('');
   }
 
   const city = document.getElementById('routeCity').value;
   const maxKm = document.getElementById('routeMaxKm').value;
   const limit = document.getElementById('routeLimit').value;
+  const sort = document.getElementById('routeSort').value;
+  const district = document.getElementById('routeDistrict').value;
 
-  const res = await fetch(`/api/routes?city=${encodeURIComponent(city)}&max_km=${maxKm}&limit=${limit}`);
+  const res = await fetch(`/api/routes?city=${encodeURIComponent(city)}&max_km=${maxKm}&limit=${limit}&sort=${sort}&district=${encodeURIComponent(district)}`);
   const data = await res.json();
+
+  // Populate district dropdown once
+  const distSel = document.getElementById('routeDistrict');
+  if (distSel.options.length <= 1 && data.districts) {
+    distSel.innerHTML = '<option value="">All Districts</option>' + data.districts.map(d => `<option value="${d}">${d}</option>`).join('');
+  }
 
   const countEl = document.getElementById('routeCount');
   if (countEl) countEl.textContent = data.total;
@@ -573,32 +581,60 @@ async function loadRoutes() {
   // Route map link
   const linkDiv = document.getElementById('routeMapLink');
   if (data.route_url && data.stores.length) {
-    linkDiv.innerHTML = `<a href="${data.route_url}" target="_blank" class="btn-primary" style="display:inline-block;text-decoration:none">&#128506; Open Route in Google Maps (Top ${Math.min(9, data.stores.length)} stores)</a>`;
+    linkDiv.innerHTML = `<a href="${data.route_url}" target="_blank" class="btn-primary" style="display:inline-block;text-decoration:none;margin-right:8px">&#128506; Open Route in Google Maps (Top ${Math.min(9, data.stores.length)} stores)</a>`;
   }
 
-  // Store table
+  // District summary cards
+  const distDiv = document.getElementById('districtSummary');
+  if (data.district_summary && data.district_summary.length > 1) {
+    distDiv.innerHTML = '<div class="city-route-grid">' + data.district_summary.map(ds =>
+      `<div class="city-route-card district-card" onclick="document.getElementById('routeCity').value='${escAttr(ds.city)}';loadRoutes()">
+        <div class="crc-name">${esc(ds.city)}</div>
+        <div class="crc-dist">${ds.avg_dist} km avg</div>
+        <div class="crc-count">${ds.count} target stores</div>
+      </div>`
+    ).join('') + '</div>';
+  } else {
+    distDiv.innerHTML = '';
+  }
+
+  // Store table with address and days since visit
   const tbody = document.querySelector('#routesTable tbody');
-  tbody.innerHTML = data.stores.map(s => `
-    <tr onclick="openStoreModal(${s.id})" style="cursor:pointer">
+  tbody.innerHTML = data.stores.map(s => {
+    const daysBadge = s.days_since_visit !== null
+      ? (s.days_since_visit > 30 ? '<span class="days-badge overdue">' + s.days_since_visit + 'd ago</span>'
+        : s.days_since_visit > 14 ? '<span class="days-badge warning">' + s.days_since_visit + 'd ago</span>'
+        : '<span class="days-badge recent">' + s.days_since_visit + 'd ago</span>')
+      : '<span class="days-badge never">Never</span>';
+    const addr = s.address ? truncate(s.address, 30) : '';
+    return `<tr onclick="openStoreModal(${s.id})" style="cursor:pointer" class="${!s.last_activity ? 'row-unvisited' : ''}">
       <td><strong>${s.distance_km} km</strong></td>
       <td>#${s.store_number}</td>
-      <td>${esc(truncate(s.account, 25))}</td>
+      <td>${esc(truncate(s.account, 22))}</td>
+      <td class="addr-cell">${esc(addr)}</td>
       <td>${esc(s.city)}</td>
-      <td>${s.last_activity ? `<span class="type-badge ${s.last_activity.activity_type}">${formatType(s.last_activity.activity_type)}</span> ${formatDateShort(s.last_activity.created_at)}` : '<span class="muted">Never</span>'}</td>
+      <td>${daysBadge}</td>
       <td>${s.activity_count}</td>
-      <td><a href="https://www.google.com/maps/dir/43.6558,-79.3628/${s.lat},${s.lng}" target="_blank" class="btn-sm" onclick="event.stopPropagation()">&#128506; Go</a></td>
-    </tr>
-  `).join('');
+      <td><a href="https://www.google.com/maps/dir/43.6558,-79.3628/${encodeURIComponent(s.full_address || s.lat+','+s.lng)}" target="_blank" class="btn-sm" onclick="event.stopPropagation()">&#128506; Go</a></td>
+    </tr>`;
+  }).join('');
 
-  // Cities distance list
+  // Cities distance list with coverage bars
   const citiesDiv = document.getElementById('citiesRoute');
-  citiesDiv.innerHTML = '<div class="city-route-grid">' + cities.slice(0, 30).map(c =>
+  citiesDiv.innerHTML = '<div class="city-route-grid">' + cities.slice(0, 40).map(c =>
     `<div class="city-route-card" onclick="document.getElementById('routeCity').value='${escAttr(c.city)}';loadRoutes()">
       <div class="crc-name">${esc(c.city)}</div>
       <div class="crc-dist">${c.distance_km} km</div>
       <div class="crc-count">${c.store_count} stores</div>
+      <div class="coverage-bar"><div class="coverage-fill" style="width:${c.coverage}%;background:${c.coverage > 50 ? '#16a34a' : c.coverage > 20 ? '#f59e0b' : '#ef4444'}"></div></div>
+      <div class="crc-cov">${c.coverage}% covered</div>
     </div>`
   ).join('') + '</div>';
+}
+
+function onDistrictChange() {
+  document.getElementById('routeCity').value = '';
+  loadRoutes();
 }
 
 // === FOLLOW-UPS ===

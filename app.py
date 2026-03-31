@@ -821,12 +821,35 @@ def api_routes():
     city = request.args.get('city', '').strip()
     max_distance = request.args.get('max_km', '').strip()
     limit = int(request.args.get('limit', 50))
+    sort_by = request.args.get('sort', 'distance')  # distance, priority, activity
+    district = request.args.get('district', '').strip()  # GTA, Eastern, Northern, etc.
+
+    # District regions mapping
+    DISTRICTS = {
+        'GTA': ['Toronto', 'Scarborough', 'Etobicoke', 'North York', 'East York', 'York',
+                'Mississauga', 'Brampton', 'Vaughan', 'Markham', 'Richmond Hill', 'Thornhill',
+                'Pickering', 'Ajax', 'Whitby', 'Oshawa', 'Oakville', 'Burlington', 'Milton',
+                'Newmarket', 'Aurora', 'Stouffville', 'Keswick', 'Innisfil'],
+        'Golden Horseshoe': ['Hamilton', 'St. Catharines', 'Niagara Falls', 'Welland', 'Grimsby',
+                            'Stoney Creek', 'Ancaster', 'Dundas', 'Burlington', 'Oakville', 'Brantford'],
+        'Southwestern': ['London', 'Windsor', 'Kitchener', 'Waterloo', 'Cambridge', 'Guelph',
+                        'Woodstock', 'Stratford', 'Chatham', 'Sarnia'],
+        'Eastern': ['Ottawa', 'Kingston', 'Belleville', 'Cornwall', 'Peterborough', 'Cobourg',
+                   'Port Hope', 'Bowmanville', 'Lindsay', 'Kawartha Lakes'],
+        'Northern': ['Sudbury', 'Thunder Bay', 'Sault Ste. Marie', 'North Bay', 'Timmins',
+                    'Barrie', 'Orillia', 'Collingwood', 'Midland', 'Penetanguishene',
+                    'Gravenhurst', 'Bracebridge', 'Huntsville', 'Parry Sound'],
+    }
 
     query = "SELECT * FROM stores WHERE lat != 0 AND lng != 0"
     params = []
     if city:
         query += " AND city LIKE ?"
         params.append(f"%{city}%")
+    elif district and district in DISTRICTS:
+        placeholders = ','.join(['?' for _ in DISTRICTS[district]])
+        query += f" AND city IN ({placeholders})"
+        params.extend(DISTRICTS[district])
 
     stores = db_fetchall(query, params)
     results = []
@@ -851,16 +874,53 @@ def api_routes():
             s['last_activity'] = None
         act_count = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE store_id=?", [s['id']])
         s['activity_count'] = act_count['c'] if isinstance(act_count, dict) else act_count[0]
+
+        # Priority score: lower = higher priority (needs visit)
+        days_since = 999
+        if s['last_activity'] and s['last_activity'].get('created_at'):
+            try:
+                last_dt = datetime.fromisoformat(s['last_activity']['created_at'].replace('Z', '+00:00'))
+                days_since = (datetime.now() - last_dt.replace(tzinfo=None)).days
+            except Exception:
+                pass
+        priority_score = s['distance_km'] * 0.3 - days_since * 0.5 - (10 - min(s['activity_count'], 10)) * 2
+        s['priority_score'] = round(priority_score, 1)
+        s['days_since_visit'] = days_since if days_since < 999 else None
+        s['full_address'] = f"{s.get('address', '')}, {s.get('city', '')}, ON {s.get('postal', '')}".strip(', ')
         results.append(s)
 
-    results.sort(key=lambda x: x['distance_km'])
+    if sort_by == 'priority':
+        results.sort(key=lambda x: x['priority_score'])
+    elif sort_by == 'activity':
+        results.sort(key=lambda x: -(x.get('days_since_visit') or 999))
+    else:
+        results.sort(key=lambda x: x['distance_km'])
     results = results[:limit]
 
+    # Build Google Maps multi-stop route URL using real addresses
     route_url = f"https://www.google.com/maps/dir/{REP_HOME['lat']},{REP_HOME['lng']}"
     for s in results[:9]:
-        route_url += f"/{s['lat']},{s['lng']}"
+        addr = s['full_address'].replace(' ', '+')
+        route_url += f"/{addr}" if addr.strip(', ') else f"/{s['lat']},{s['lng']}"
 
-    return jsonify({'stores': results, 'rep_home': REP_HOME, 'route_url': route_url, 'total': len(results)})
+    # Group by city for district summary
+    city_groups = {}
+    for s in results:
+        c = s.get('city', 'Unknown')
+        if c not in city_groups:
+            city_groups[c] = {'city': c, 'count': 0, 'avg_dist': 0, 'stores': []}
+        city_groups[c]['count'] += 1
+        city_groups[c]['avg_dist'] += s['distance_km']
+        city_groups[c]['stores'].append(s['id'])
+    for cg in city_groups.values():
+        cg['avg_dist'] = round(cg['avg_dist'] / cg['count'], 1)
+    district_summary = sorted(city_groups.values(), key=lambda x: x['avg_dist'])
+
+    return jsonify({
+        'stores': results, 'rep_home': REP_HOME, 'route_url': route_url,
+        'total': len(results), 'districts': list(DISTRICTS.keys()),
+        'district_summary': district_summary
+    })
 
 
 @app.route('/api/routes/cities')
@@ -870,13 +930,88 @@ def api_route_cities():
         FROM stores WHERE city != '' AND lat != 0
         GROUP BY city ORDER BY city
     """)
+    # Get activity counts per city
+    act_rows = db_fetchall("""
+        SELECT s.city, COUNT(a.id) as act_count
+        FROM stores s LEFT JOIN activities a ON s.id=a.store_id
+        WHERE s.city != '' GROUP BY s.city
+    """)
+    city_acts = {dict(r)['city']: dict(r)['act_count'] for r in act_rows}
+
     results = []
     for r in rows:
         r = dict(r)
         dist = haversine(REP_HOME['lat'], REP_HOME['lng'], r['avg_lat'], r['avg_lng'])
-        results.append({'city': r['city'], 'store_count': r['store_count'], 'distance_km': round(dist, 1), 'lat': r['avg_lat'], 'lng': r['avg_lng']})
+        results.append({
+            'city': r['city'], 'store_count': r['store_count'],
+            'distance_km': round(dist, 1), 'lat': r['avg_lat'], 'lng': r['avg_lng'],
+            'activity_count': city_acts.get(r['city'], 0),
+            'coverage': round(city_acts.get(r['city'], 0) / max(r['store_count'], 1) * 100)
+        })
     results.sort(key=lambda x: x['distance_km'])
     return jsonify(results)
+
+
+@app.route('/api/routes/district/<district_name>')
+def api_route_district(district_name):
+    """Get optimized route for an entire district with city-by-city breakdown"""
+    DISTRICTS = {
+        'GTA': ['Toronto', 'Scarborough', 'Etobicoke', 'North York', 'East York', 'York',
+                'Mississauga', 'Brampton', 'Vaughan', 'Markham', 'Richmond Hill', 'Thornhill',
+                'Pickering', 'Ajax', 'Whitby', 'Oshawa', 'Oakville', 'Burlington', 'Milton',
+                'Newmarket', 'Aurora', 'Stouffville', 'Keswick', 'Innisfil'],
+        'Golden Horseshoe': ['Hamilton', 'St. Catharines', 'Niagara Falls', 'Welland', 'Grimsby',
+                            'Stoney Creek', 'Ancaster', 'Dundas', 'Burlington', 'Oakville', 'Brantford'],
+        'Southwestern': ['London', 'Windsor', 'Kitchener', 'Waterloo', 'Cambridge', 'Guelph',
+                        'Woodstock', 'Stratford', 'Chatham', 'Sarnia'],
+        'Eastern': ['Ottawa', 'Kingston', 'Belleville', 'Cornwall', 'Peterborough', 'Cobourg',
+                   'Port Hope', 'Bowmanville', 'Lindsay', 'Kawartha Lakes'],
+        'Northern': ['Sudbury', 'Thunder Bay', 'Sault Ste. Marie', 'North Bay', 'Timmins',
+                    'Barrie', 'Orillia', 'Collingwood', 'Midland', 'Penetanguishene',
+                    'Gravenhurst', 'Bracebridge', 'Huntsville', 'Parry Sound'],
+    }
+    if district_name not in DISTRICTS:
+        return jsonify({'error': 'Unknown district'}), 404
+
+    cities = DISTRICTS[district_name]
+    placeholders = ','.join(['?' for _ in cities])
+    stores = db_fetchall(f"SELECT * FROM stores WHERE city IN ({placeholders}) AND lat != 0", cities)
+
+    city_breakdown = {}
+    for s in stores:
+        s = dict(s)
+        c = s['city']
+        if c not in city_breakdown:
+            dist = haversine(REP_HOME['lat'], REP_HOME['lng'], s['lat'], s['lng'])
+            city_breakdown[c] = {'city': c, 'distance_km': round(dist, 1), 'total_stores': 0, 'visited': 0, 'stores': []}
+        city_breakdown[c]['total_stores'] += 1
+        act_count = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE store_id=?", [s['id']])
+        cnt = act_count['c'] if isinstance(act_count, dict) else act_count[0]
+        if cnt > 0:
+            city_breakdown[c]['visited'] += 1
+        city_breakdown[c]['stores'].append({
+            'id': s['id'], 'store_number': s['store_number'], 'account': s['account'],
+            'address': s['address'], 'activity_count': cnt
+        })
+
+    breakdown = sorted(city_breakdown.values(), key=lambda x: x['distance_km'])
+    for cb in breakdown:
+        cb['coverage'] = round(cb['visited'] / max(cb['total_stores'], 1) * 100)
+        # Generate Google Maps route for this city (top 9 unvisited stores)
+        unvisited = [st for st in cb['stores'] if st['activity_count'] == 0][:9]
+        if unvisited:
+            route = f"https://www.google.com/maps/dir/{REP_HOME['lat']},{REP_HOME['lng']}"
+            for st in unvisited:
+                addr = (st.get('address', '') or '').replace(' ', '+')
+                route += f"/{addr}" if addr else ''
+            cb['route_url'] = route
+
+    return jsonify({
+        'district': district_name, 'cities': [c for c in cities if c in city_breakdown],
+        'total_stores': sum(cb['total_stores'] for cb in breakdown),
+        'total_visited': sum(cb['visited'] for cb in breakdown),
+        'breakdown': breakdown
+    })
 
 
 # === EXPORT ===

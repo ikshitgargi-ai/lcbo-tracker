@@ -201,6 +201,9 @@
           </div>
         </div>
         <div class="route-filters">
+          <select id="routeDistrict" onchange="onDistrictChange()">
+            <option value="">All Districts</option>
+          </select>
           <select id="routeCity" onchange="loadRoutes()">
             <option value="">All Cities</option>
           </select>
@@ -211,24 +214,32 @@
             <option value="25">Within 25 km</option>
             <option value="50">Within 50 km</option>
             <option value="100">Within 100 km</option>
+            <option value="200">Within 200 km</option>
+          </select>
+          <select id="routeSort" onchange="loadRoutes()">
+            <option value="distance">Sort: Nearest</option>
+            <option value="priority">Sort: Priority (needs visit)</option>
+            <option value="activity">Sort: Least Recent</option>
           </select>
           <select id="routeLimit" onchange="loadRoutes()">
             <option value="20">Top 20</option>
             <option value="50" selected>Top 50</option>
             <option value="100">Top 100</option>
+            <option value="200">Top 200</option>
           </select>
         </div>
       </div>
       <div id="routeMapLink" style="margin-bottom:16px"></div>
+      <div id="districtSummary" style="margin-bottom:16px"></div>
       <div class="card">
-        <h3>Stores by Distance <span class="card-badge" id="routeCount"></span></h3>
+        <h3>Target Stores <span class="card-badge" id="routeCount"></span></h3>
         <table class="data-table" id="routesTable">
-          <thead><tr><th>Dist.</th><th>Store #</th><th>Account</th><th>City</th><th>Last Activity</th><th>Total</th><th>Navigate</th></tr></thead>
+          <thead><tr><th>Dist.</th><th>Store #</th><th>Account</th><th>Address</th><th>City</th><th>Last Visit</th><th>Visits</th><th>Navigate</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
       <div class="card">
-        <h3>Cities by Distance</h3>
+        <h3>Districts & Cities Coverage</h3>
         <div id="citiesRoute"></div>
       </div>
     </section>

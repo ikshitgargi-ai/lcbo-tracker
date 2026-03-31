@@ -225,11 +225,22 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 20px; letter-spacing: -0.
 .route-filters { display: flex; gap: 8px; flex-wrap: wrap; }
 .route-filters select { padding: 7px 10px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; font-size: 12px; }
 .city-route-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
-.city-route-card { background: var(--surface2); border-radius: 8px; padding: 10px; cursor: pointer; transition: all 0.2s; text-align: center; }
-.city-route-card:hover { border: 1px solid var(--anu-red); }
+.city-route-card { background: var(--surface2); border-radius: 8px; padding: 10px; cursor: pointer; transition: all 0.2s; text-align: center; border: 1px solid var(--border); }
+.city-route-card:hover { border-color: var(--anu-red); transform: translateY(-2px); }
+.district-card { border-left: 3px solid var(--orange); }
 .crc-name { font-weight: 600; font-size: 13px; }
 .crc-dist { font-size: 12px; color: var(--orange); }
 .crc-count { font-size: 11px; color: var(--muted); }
+.crc-cov { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.coverage-bar { width: 100%; height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.coverage-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+.days-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+.days-badge.overdue { background: rgba(239,68,68,0.15); color: #ef4444; }
+.days-badge.warning { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.days-badge.recent { background: rgba(22,163,74,0.15); color: #16a34a; }
+.days-badge.never { background: rgba(139,143,163,0.1); color: var(--muted); }
+.row-unvisited { background: rgba(239,68,68,0.03); }
+.addr-cell { font-size: 11px; color: var(--muted); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* === Follow-Ups === */
 .followup-stats { display: flex; gap: 10px; margin-bottom: 16px; }
