@@ -886,7 +886,11 @@ def api_routes():
         priority_score = s['distance_km'] * 0.3 - days_since * 0.5 - (10 - min(s['activity_count'], 10)) * 2
         s['priority_score'] = round(priority_score, 1)
         s['days_since_visit'] = days_since if days_since < 999 else None
-        s['full_address'] = f"{s.get('address', '')}, {s.get('city', '')}, ON {s.get('postal', '')}".strip(', ')
+        s['full_address'] = f"{s.get('address', '') or ''}, {s.get('city', '') or ''}, ON {s.get('postal', '') or ''}".strip(', ')
+        # Serialize any datetime values for JSON
+        for k, v in s.items():
+            if isinstance(v, datetime):
+                s[k] = v.isoformat()
         results.append(s)
 
     if sort_by == 'priority':
@@ -941,12 +945,14 @@ def api_route_cities():
     results = []
     for r in rows:
         r = dict(r)
-        dist = haversine(REP_HOME['lat'], REP_HOME['lng'], r['avg_lat'], r['avg_lng'])
+        avg_lat = float(r['avg_lat'] or 0)
+        avg_lng = float(r['avg_lng'] or 0)
+        dist = haversine(REP_HOME['lat'], REP_HOME['lng'], avg_lat, avg_lng)
         results.append({
-            'city': r['city'], 'store_count': r['store_count'],
-            'distance_km': round(dist, 1), 'lat': r['avg_lat'], 'lng': r['avg_lng'],
-            'activity_count': city_acts.get(r['city'], 0),
-            'coverage': round(city_acts.get(r['city'], 0) / max(r['store_count'], 1) * 100)
+            'city': r['city'], 'store_count': int(r['store_count']),
+            'distance_km': round(dist, 1), 'lat': avg_lat, 'lng': avg_lng,
+            'activity_count': int(city_acts.get(r['city'], 0)),
+            'coverage': round(int(city_acts.get(r['city'], 0)) / max(int(r['store_count']), 1) * 100)
         })
     results.sort(key=lambda x: x['distance_km'])
     return jsonify(results)
