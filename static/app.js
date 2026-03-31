@@ -42,6 +42,7 @@ function showView(view) {
   if (view === 'log') {}
   if (view === 'inventory') loadInventory();
   if (view === 'routes') loadRoutes();
+  if (view === 'opportunities') { loadOpportunities(); loadDailyPlan(); }
   if (view === 'followups') loadFollowups();
 }
 
@@ -637,9 +638,136 @@ function onDistrictChange() {
   loadRoutes();
 }
 
+// Check if stores need geocoding (many share same coords = city-center defaults)
+function checkGeocode(stores) {
+  const coordMap = {};
+  for (const s of stores) {
+    const key = `${(s.lat||0).toFixed(3)},${(s.lng||0).toFixed(3)}`;
+    coordMap[key] = (coordMap[key] || 0) + 1;
+  }
+  const duplicates = Object.values(coordMap).filter(v => v > 1).reduce((a, b) => a + b, 0);
+  const bar = document.getElementById('geocodeBar');
+  if (bar) bar.style.display = duplicates > 5 ? '' : 'none';
+}
+
+async function geocodeStores() {
+  const btn = document.getElementById('geocodeBtn');
+  const status = document.getElementById('geocodeStatus');
+  btn.disabled = true;
+  btn.textContent = 'Geocoding...';
+  status.textContent = 'This takes ~1 sec per store (rate limit). Please wait...';
+  try {
+    const res = await fetch('/api/geocode', { method: 'POST' });
+    const data = await res.json();
+    status.textContent = data.message;
+    if (data.remaining > 0) {
+      btn.textContent = `Continue (${data.remaining} left)`;
+      btn.disabled = false;
+    } else {
+      btn.textContent = 'Done!';
+      loadRoutes();
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = 'Retry';
+  }
+}
+
+// === OPPORTUNITIES ===
+async function loadOpportunities() {
+  const res = await fetch('/api/opportunities/nb-distillers');
+  const data = await res.json();
+  const s = data.summary;
+
+  document.getElementById('oppStats').innerHTML = `
+    <div class="opp-stat-grid">
+      <div class="stat-card red"><div class="label">No NB Products</div><div class="value">${s.zero_nb}</div></div>
+      <div class="stat-card orange"><div class="label">Only 1 Product</div><div class="value">${s.one_nb}</div></div>
+      <div class="stat-card green"><div class="label">Both Stocked</div><div class="value">${s.both_nb}</div></div>
+      <div class="stat-card"><div class="label">Total Stores</div><div class="value">${s.total_stores}</div></div>
+    </div>`;
+
+  function oppTable(stores, emptyMsg) {
+    if (!stores.length) return `<p class="muted">${emptyMsg}</p>`;
+    return `<table class="data-table"><thead><tr><th>Store #</th><th>Account</th><th>City</th><th>NB Products</th><th>Inventory</th><th>Visits</th><th>Navigate</th></tr></thead><tbody>` +
+      stores.slice(0, 200).map(s => `<tr onclick="openStoreModal(${s.id})" style="cursor:pointer" class="${s.nb_products_stocked === 0 ? 'row-unvisited' : ''}">
+        <td>#${s.store_number}</td>
+        <td>${esc(truncate(s.account, 22))}</td>
+        <td>${esc(s.city)}</td>
+        <td><strong>${s.nb_products_stocked}</strong> / 2</td>
+        <td>${s.total_nb_inventory} units</td>
+        <td>${s.activity_count}</td>
+        <td><a href="https://www.google.com/maps/dir/43.6558,-79.3628/${encodeURIComponent(s.full_address)}" target="_blank" class="btn-sm" onclick="event.stopPropagation()">&#128506;</a></td>
+      </tr>`).join('') + '</tbody></table>';
+  }
+
+  document.getElementById('oppZero').innerHTML = oppTable(data.zero_stock, 'All stores have NB products!');
+  document.getElementById('oppOne').innerHTML = oppTable(data.one_product, 'No stores with only 1 product');
+  document.getElementById('oppFull').innerHTML = oppTable(data.fully_stocked, 'No fully stocked stores yet');
+}
+
+function showOppTab(tab, btn) {
+  document.querySelectorAll('.opp-tab-content').forEach(t => t.style.display = 'none');
+  document.querySelectorAll('.opp-tabs .tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const map = { zero: 'oppZero', one: 'oppOne', full: 'oppFull' };
+  document.getElementById(map[tab]).style.display = '';
+}
+
+async function loadDailyPlan() {
+  const district = document.getElementById('planDistrict').value;
+  const storesPerDay = document.getElementById('planStoresPerDay').value;
+  const grid = document.getElementById('dailyPlanGrid');
+  grid.innerHTML = '<p class="muted">Building optimized route plan...</p>';
+
+  const res = await fetch(`/api/routes/daily-plan?district=${encodeURIComponent(district)}&stores_per_day=${storesPerDay}`);
+  const data = await res.json();
+
+  if (!data.plans || !data.plans.length) {
+    grid.innerHTML = '<p class="muted">No stores found in this district.</p>';
+    return;
+  }
+
+  grid.innerHTML = data.plans.map(plan => `
+    <div class="daily-plan-card">
+      <div class="dp-header">
+        <div>
+          <strong>${plan.day}</strong>
+          <span class="muted" style="margin-left:8px">${plan.date}</span>
+        </div>
+        <div>
+          <span class="card-badge">${plan.store_count} stores</span>
+          <span class="muted" style="margin-left:6px">${plan.cities.join(', ')}</span>
+        </div>
+      </div>
+      <div class="dp-stores">
+        ${plan.stores.map((s, i) => `<div class="dp-store" onclick="openStoreModal(${s.id})" style="cursor:pointer">
+          <span class="dp-num">${i + 1}</span>
+          <div class="dp-info">
+            <strong>LCBO #${s.store_number}</strong> — ${esc(truncate(s.account, 20))}
+            <div class="muted" style="font-size:11px">${esc(s.address || '')}, ${esc(s.city || '')}</div>
+          </div>
+          <div class="dp-meta">
+            ${s.days_since_visit !== null ? `<span class="days-badge ${s.days_since_visit > 30 ? 'overdue' : s.days_since_visit > 14 ? 'warning' : 'recent'}">${s.days_since_visit}d</span>` : '<span class="days-badge never">New</span>'}
+          </div>
+        </div>`).join('')}
+      </div>
+      <a href="${plan.route_url}" target="_blank" class="btn-primary dp-route-btn">&#128506; Open ${plan.day} Route in Google Maps</a>
+    </div>
+  `).join('');
+
+  grid.innerHTML += `<div class="muted" style="margin-top:12px;font-size:12px">Planned ${data.total_stores_planned} of ${data.total_stores_in_district} stores in ${data.district}</div>`;
+}
+
 // === FOLLOW-UPS ===
-async function loadFollowups() {
-  const res = await fetch('/api/followups');
+async function loadFollowups(status, btn) {
+  if (!status) status = 'pending';
+  if (btn) {
+    document.querySelectorAll('.fu-filter-bar .tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  const res = await fetch(`/api/followups?status=${status}`);
   const followups = await res.json();
   const div = document.getElementById('followupsList');
   const today = new Date().toISOString().split('T')[0];
@@ -679,15 +807,38 @@ async function loadFollowups() {
 }
 
 function followupCardHTML(f, overdue) {
-  return `<div class="followup-card ${overdue ? 'followup-overdue' : ''}" onclick="openStoreModal(${f.store_id})" style="cursor:pointer">
+  const isCompleted = f.status === 'completed';
+  const fuId = f.id;
+  return `<div class="followup-card ${overdue ? 'followup-overdue' : ''} ${isCompleted ? 'followup-completed' : ''}">
     <div class="fu-top">
-      <span class="fu-store">LCBO #${f.store_number} — ${esc(f.account)}</span>
-      <span class="fu-date">${f.follow_up_date}${overdue ? ' (OVERDUE)' : ''}</span>
+      <span class="fu-store" onclick="openStoreModal(${f.store_id})" style="cursor:pointer">LCBO #${f.store_number} — ${esc(f.account)}</span>
+      <span class="fu-date">${f.follow_up_date}${overdue ? ' (OVERDUE)' : ''}${isCompleted ? ' ✓ DONE' : ''}</span>
     </div>
-    <div class="fu-meta">${esc(f.rep_name)} · <span class="type-badge ${f.activity_type}">${formatType(f.activity_type)}</span> ${producerTags(f.producer)} ${f.venue_type ? `<span class="venue-tag">${esc(f.venue_type)}</span>` : ''}</div>
+    <div class="fu-meta">${esc(f.rep_name || '')} · <span class="type-badge ${f.activity_type || f.followup_type || ''}">${formatType(f.activity_type || f.followup_type || '')}</span> ${producerTags(f.producer)} ${f.venue_type ? `<span class="venue-tag">${esc(f.venue_type)}</span>` : ''}</div>
     ${f.notes ? `<div class="fu-notes">${esc(truncate(f.notes, 120))}</div>` : ''}
     ${f.city ? `<div class="fu-city">${esc(f.city)}${f.address ? ' — ' + esc(f.address) : ''}</div>` : ''}
+    ${!isCompleted ? `<div class="fu-actions">
+      <button class="btn-sm btn-complete" onclick="event.stopPropagation();completeFollowup(${fuId})">✓ Complete</button>
+      <button class="btn-sm btn-reschedule" onclick="event.stopPropagation();rescheduleFollowup(${fuId})">&#128197; Reschedule</button>
+      <a href="https://www.google.com/maps/dir/43.6558,-79.3628/${encodeURIComponent((f.address||'')+', '+(f.city||'')+', ON')}" target="_blank" class="btn-sm" onclick="event.stopPropagation()">&#128506; Navigate</a>
+    </div>` : `<div class="fu-completed-at muted" style="font-size:11px">Completed: ${f.completed_at || ''}</div>`}
   </div>`;
+}
+
+async function completeFollowup(id) {
+  await fetch(`/api/followups/${id}/complete`, { method: 'POST' });
+  loadFollowups('pending');
+}
+
+async function rescheduleFollowup(id) {
+  const newDate = prompt('Enter new follow-up date (YYYY-MM-DD):');
+  if (!newDate || !/^\d{4}-\d{2}-\d{2}$/.test(newDate)) return;
+  await fetch(`/api/followups/${id}/reschedule`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ due_date: newDate })
+  });
+  loadFollowups('pending');
 }
 
 // === HELPERS ===

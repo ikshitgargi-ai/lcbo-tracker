@@ -263,6 +263,20 @@ def init_db():
                 checked_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS followups (
+                id SERIAL PRIMARY KEY,
+                store_id INTEGER NOT NULL REFERENCES stores(id),
+                rep_id INTEGER NOT NULL REFERENCES reps(id),
+                activity_id INTEGER REFERENCES activities(id),
+                followup_type TEXT DEFAULT '',
+                due_date DATE NOT NULL,
+                status TEXT DEFAULT 'pending',
+                notes TEXT DEFAULT '',
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
         # Create indexes
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_activities_store ON activities(store_id)",
@@ -271,6 +285,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_inventory_product ON inventory_cache(product_id)",
             "CREATE INDEX IF NOT EXISTS idx_stores_city ON stores(city)",
+            "CREATE INDEX IF NOT EXISTS idx_followups_store ON followups(store_id)",
+            "CREATE INDEX IF NOT EXISTS idx_followups_status ON followups(status)",
+            "CREATE INDEX IF NOT EXISTS idx_followups_due ON followups(due_date)",
         ]:
             cur.execute(idx)
         # Add columns if upgrading
@@ -337,6 +354,24 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(created_at);
             CREATE INDEX IF NOT EXISTS idx_inventory_product ON inventory_cache(product_id);
             CREATE INDEX IF NOT EXISTS idx_stores_city ON stores(city);
+            CREATE TABLE IF NOT EXISTS followups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL,
+                rep_id INTEGER NOT NULL,
+                activity_id INTEGER,
+                followup_type TEXT DEFAULT '',
+                due_date TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                notes TEXT DEFAULT '',
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (store_id) REFERENCES stores(id),
+                FOREIGN KEY (rep_id) REFERENCES reps(id),
+                FOREIGN KEY (activity_id) REFERENCES activities(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_followups_store ON followups(store_id);
+            CREATE INDEX IF NOT EXISTS idx_followups_status ON followups(status);
+            CREATE INDEX IF NOT EXISTS idx_followups_due ON followups(due_date);
         ''')
         migrate_cols = [
             ('stores', 'manager_name', "TEXT DEFAULT ''"), ('stores', 'asst_manager_name', "TEXT DEFAULT ''"),
@@ -605,6 +640,21 @@ def api_activity_create():
         last = db_fetchone("SELECT last_insert_rowid() as id")
         new_id = last['id'] if isinstance(last, dict) else last[0]
 
+    # Create persistent follow-up record if date set
+    if follow_up_date:
+        followup_type = data.get('followup_type', activity_type)
+        if USE_POSTGRES:
+            db_fetchone(
+                "INSERT INTO followups (store_id, rep_id, activity_id, followup_type, due_date, notes) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                (store_id, rep_id, new_id, followup_type, follow_up_date, notes)
+            )
+        else:
+            db_execute(
+                "INSERT INTO followups (store_id, rep_id, activity_id, followup_type, due_date, notes) VALUES (?,?,?,?,?,?)",
+                (store_id, rep_id, new_id, followup_type, follow_up_date, notes)
+            )
+        db_commit()
+
     act = db_fetchone("""
         SELECT a.*, r.name as rep_name, s.store_number, s.account
         FROM activities a JOIN reps r ON a.rep_id=r.id JOIN stores s ON a.store_id=s.id
@@ -612,7 +662,6 @@ def api_activity_create():
     """, [new_id])
 
     result = dict(act) if act else {}
-    # Convert datetime to string for JSON
     for k, v in result.items():
         if isinstance(v, datetime):
             result[k] = v.isoformat()
@@ -685,7 +734,10 @@ def api_dashboard():
     week_activities = week_activities['c'] if isinstance(week_activities, dict) else week_activities[0]
 
     today = datetime.now().strftime('%Y-%m-%d')
-    overdue = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE follow_up_date != '' AND follow_up_date < ? AND follow_up_date IS NOT NULL", [today])
+    try:
+        overdue = db_fetchone("SELECT COUNT(*) as c FROM followups WHERE status='pending' AND due_date < ?", [today])
+    except Exception:
+        overdue = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE follow_up_date != '' AND follow_up_date < ? AND follow_up_date IS NOT NULL", [today])
     overdue = overdue['c'] if isinstance(overdue, dict) else overdue[0]
 
     # Serialize datetimes
@@ -716,20 +768,104 @@ def api_cities():
 
 @app.route('/api/followups')
 def api_followups():
-    rows = db_fetchall("""
-        SELECT a.*, s.store_number, s.account, s.city, s.address, r.name as rep_name
-        FROM activities a JOIN stores s ON a.store_id=s.id JOIN reps r ON a.rep_id=r.id
-        WHERE a.follow_up_date != '' AND a.follow_up_date IS NOT NULL
-        ORDER BY a.follow_up_date ASC
-    """)
-    result = []
-    for r in rows:
-        d = dict(r)
-        for k, v in d.items():
-            if isinstance(v, datetime):
-                d[k] = v.isoformat()
-        result.append(d)
-    return jsonify(result)
+    status_filter = request.args.get('status', '')  # pending, completed, all
+    # Try new followups table first, fall back to activities
+    try:
+        query = """
+            SELECT f.*, s.store_number, s.account, s.city, s.address, r.name as rep_name,
+                   a.activity_type, a.producer, a.venue_type, a.notes as activity_notes
+            FROM followups f
+            JOIN stores s ON f.store_id=s.id
+            JOIN reps r ON f.rep_id=r.id
+            LEFT JOIN activities a ON f.activity_id=a.id
+        """
+        params = []
+        if status_filter == 'completed':
+            query += " WHERE f.status = 'completed'"
+        elif status_filter != 'all':
+            query += " WHERE f.status = 'pending'"
+        query += " ORDER BY f.due_date ASC"
+        rows = db_fetchall(query, params)
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Map to frontend-expected fields
+            d['follow_up_date'] = str(d.get('due_date', ''))
+            if not d.get('notes') and d.get('activity_notes'):
+                d['notes'] = d['activity_notes']
+            for k, v in d.items():
+                if isinstance(v, datetime):
+                    d[k] = v.isoformat()
+                elif hasattr(v, 'isoformat'):
+                    d[k] = v.isoformat()
+            result.append(d)
+        # If followups table is empty, migrate from activities
+        if not result:
+            old_rows = db_fetchall("""
+                SELECT a.*, s.store_number, s.account, s.city, s.address, r.name as rep_name
+                FROM activities a JOIN stores s ON a.store_id=s.id JOIN reps r ON a.rep_id=r.id
+                WHERE a.follow_up_date != '' AND a.follow_up_date IS NOT NULL
+                ORDER BY a.follow_up_date ASC
+            """)
+            for r in old_rows:
+                d = dict(r)
+                # Migrate to followups table
+                try:
+                    if USE_POSTGRES:
+                        db_fetchone(
+                            "INSERT INTO followups (store_id, rep_id, activity_id, followup_type, due_date, notes) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                            (d['store_id'], d['rep_id'], d['id'], d['activity_type'], d['follow_up_date'], d.get('notes', ''))
+                        )
+                    else:
+                        db_execute(
+                            "INSERT INTO followups (store_id, rep_id, activity_id, followup_type, due_date, notes) VALUES (?,?,?,?,?,?)",
+                            (d['store_id'], d['rep_id'], d['id'], d['activity_type'], d['follow_up_date'], d.get('notes', ''))
+                        )
+                except Exception:
+                    pass
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat()
+                result.append(d)
+            if result:
+                db_commit()
+        return jsonify(result)
+    except Exception:
+        # Fallback to old activities-based followups
+        rows = db_fetchall("""
+            SELECT a.*, s.store_number, s.account, s.city, s.address, r.name as rep_name
+            FROM activities a JOIN stores s ON a.store_id=s.id JOIN reps r ON a.rep_id=r.id
+            WHERE a.follow_up_date != '' AND a.follow_up_date IS NOT NULL
+            ORDER BY a.follow_up_date ASC
+        """)
+        result = []
+        for r in rows:
+            d = dict(r)
+            for k, v in d.items():
+                if isinstance(v, datetime):
+                    d[k] = v.isoformat()
+            result.append(d)
+        return jsonify(result)
+
+
+@app.route('/api/followups/<int:followup_id>/complete', methods=['POST'])
+def api_followup_complete(followup_id):
+    """Mark a follow-up as completed — data is NEVER deleted, only status changes"""
+    db_execute("UPDATE followups SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=?", [followup_id])
+    db_commit()
+    return jsonify({'success': True, 'message': 'Follow-up marked as completed'})
+
+
+@app.route('/api/followups/<int:followup_id>/reschedule', methods=['POST'])
+def api_followup_reschedule(followup_id):
+    """Reschedule a follow-up — never delete, only update date"""
+    data = request.json
+    new_date = data.get('due_date')
+    if not new_date:
+        return jsonify({'error': 'due_date required'}), 400
+    db_execute("UPDATE followups SET due_date=?, status='pending' WHERE id=?", [new_date, followup_id])
+    db_commit()
+    return jsonify({'success': True, 'message': f'Follow-up rescheduled to {new_date}'})
 
 
 # === PRODUCTS & INVENTORY ===
@@ -1152,6 +1288,247 @@ def export_backup():
     output = json.dumps(backup, indent=2, default=str)
     return Response(output, mimetype='application/json',
                     headers={'Content-Disposition': f'attachment; filename=lcbo_tracker_backup_{datetime.now().strftime("%Y%m%d_%H%M")}.json'})
+
+
+@app.route('/api/geocode', methods=['POST'])
+def api_geocode_stores():
+    """Geocode stores using Nominatim (OpenStreetMap) - batch process"""
+    if not http_requests:
+        return jsonify({'error': 'requests library not available'}), 500
+    batch_size = int(request.args.get('batch', 50))
+    # Find stores still using city-center coords (multiple stores share same lat/lng)
+    rows = db_fetchall("""
+        SELECT id, address, city, postal, lat, lng FROM stores
+        WHERE address != '' AND city != ''
+        ORDER BY id
+    """)
+    # Group by lat/lng to find stores sharing coordinates
+    coord_groups = {}
+    for r in rows:
+        r = dict(r)
+        key = (round(float(r['lat'] or 0), 4), round(float(r['lng'] or 0), 4))
+        if key not in coord_groups:
+            coord_groups[key] = []
+        coord_groups[key].append(r)
+    # Only geocode stores that share coords with 2+ other stores (city-center defaults)
+    needs_geocoding = []
+    for key, group in coord_groups.items():
+        if len(group) > 1:
+            needs_geocoding.extend(group)
+    needs_geocoding = needs_geocoding[:batch_size]
+    if not needs_geocoding:
+        return jsonify({'message': 'All stores already have unique coordinates', 'geocoded': 0})
+    geocoded = 0
+    errors = 0
+    for store in needs_geocoding:
+        addr = f"{store['address']}, {store['city']}, ON {store['postal']}, Canada"
+        try:
+            resp = http_requests.get(
+                'https://nominatim.openstreetmap.org/search',
+                params={'q': addr, 'format': 'json', 'limit': 1},
+                headers={'User-Agent': 'LCBOTracker/1.0 (anu-spirits-crm)'},
+                timeout=10
+            )
+            if resp.status_code == 200 and resp.json():
+                result = resp.json()[0]
+                new_lat = float(result['lat'])
+                new_lng = float(result['lon'])
+                db_execute("UPDATE stores SET lat=?, lng=? WHERE id=?", [new_lat, new_lng, store['id']])
+                geocoded += 1
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+        import time as _time
+        _time.sleep(1.1)  # Nominatim rate limit: 1 req/sec
+    db_commit()
+    remaining = len([s for g in coord_groups.values() if len(g) > 1 for s in g]) - batch_size
+    return jsonify({
+        'geocoded': geocoded, 'errors': errors,
+        'remaining': max(0, remaining),
+        'message': f'Geocoded {geocoded} stores. {max(0, remaining)} remaining. Run again to continue.'
+    })
+
+
+@app.route('/api/opportunities/nb-distillers')
+def api_nb_opportunities():
+    """Show stores with 0 or 1 NB Distillers products stocked — key sales opportunities"""
+    # Get inventory cache for NB products (Red Admiral 20187, Chak De 22246)
+    nb_products = db_fetchall("SELECT id, name, lcbo_sku FROM products WHERE brand='NB Distillers'")
+    nb_product_ids = [p['id'] for p in nb_products]
+
+    # Get stores with their NB Distillers stock counts
+    stores = db_fetchall("""
+        SELECT s.id, s.store_number, s.account, s.city, s.address, s.postal,
+               s.manager_name, s.phone, s.priority, s.lat, s.lng,
+               COUNT(DISTINCT ic.product_id) as nb_products_stocked,
+               COALESCE(SUM(ic.quantity), 0) as total_nb_inventory,
+               COUNT(a.id) as activity_count,
+               MAX(a.created_at) as last_visit
+        FROM stores s
+        LEFT JOIN inventory_cache ic ON s.store_number = CAST(ic.store_number AS INTEGER)
+            AND ic.product_id IN (SELECT id FROM products WHERE brand='NB Distillers')
+            AND ic.quantity > 0
+        LEFT JOIN activities a ON s.id = a.store_id
+        GROUP BY s.id
+        ORDER BY nb_products_stocked ASC, s.city, s.store_number
+    """)
+
+    zero_stock = []
+    one_product = []
+    fully_stocked = []
+    for s in stores:
+        s = dict(s)
+        stocked = int(s.get('nb_products_stocked') or 0)
+        s['nb_products_stocked'] = stocked
+        s['total_nb_inventory'] = int(s.get('total_nb_inventory') or 0)
+        s['activity_count'] = int(s.get('activity_count') or 0)
+        last = s.pop('last_visit', None)
+        s['last_visit'] = last.isoformat() if isinstance(last, datetime) else str(last) if last else None
+        s['full_address'] = f"{s.get('address', '')}, {s.get('city', '')}, ON {s.get('postal', '')}".strip(', ')
+        if stocked == 0:
+            zero_stock.append(s)
+        elif stocked == 1:
+            one_product.append(s)
+        else:
+            fully_stocked.append(s)
+
+    return jsonify({
+        'zero_stock': zero_stock,
+        'one_product': one_product,
+        'fully_stocked': fully_stocked,
+        'summary': {
+            'total_stores': len(stores),
+            'zero_nb': len(zero_stock),
+            'one_nb': len(one_product),
+            'both_nb': len(fully_stocked),
+            'nb_products': [dict(p) for p in nb_products]
+        }
+    })
+
+
+@app.route('/api/routes/daily-plan')
+def api_daily_plan():
+    """Generate optimized daily route plan for a rep — 8-10 stores per day"""
+    rep_id = request.args.get('rep_id', '1')
+    district = request.args.get('district', 'GTA')
+    days = int(request.args.get('days', 5))  # Mon-Fri
+    stores_per_day = int(request.args.get('stores_per_day', 8))
+
+    DISTRICTS = {
+        'GTA': ['Toronto', 'Scarborough', 'Etobicoke', 'North York', 'East York', 'York',
+                'Mississauga', 'Brampton', 'Vaughan', 'Markham', 'Richmond Hill', 'Thornhill',
+                'Pickering', 'Ajax', 'Whitby', 'Oshawa', 'Oakville', 'Burlington', 'Milton',
+                'Newmarket', 'Aurora', 'Stouffville', 'Keswick', 'Innisfil'],
+        'Golden Horseshoe': ['Hamilton', 'St. Catharines', 'Niagara Falls', 'Welland', 'Grimsby',
+                            'Stoney Creek', 'Ancaster', 'Dundas', 'Burlington', 'Oakville', 'Brantford'],
+        'Southwestern': ['London', 'Windsor', 'Kitchener', 'Waterloo', 'Cambridge', 'Guelph',
+                        'Woodstock', 'Stratford', 'Chatham', 'Sarnia'],
+        'Eastern': ['Ottawa', 'Kingston', 'Belleville', 'Cornwall', 'Peterborough', 'Cobourg',
+                   'Port Hope', 'Bowmanville', 'Lindsay', 'Kawartha Lakes'],
+        'Northern': ['Sudbury', 'Thunder Bay', 'Sault Ste. Marie', 'North Bay', 'Timmins',
+                    'Barrie', 'Orillia', 'Collingwood', 'Midland', 'Penetanguishene',
+                    'Gravenhurst', 'Bracebridge', 'Huntsville', 'Parry Sound'],
+    }
+
+    cities = DISTRICTS.get(district, DISTRICTS['GTA'])
+    placeholders = ','.join(['?' for _ in cities])
+
+    # Get unvisited/priority stores in district
+    stores = db_fetchall(f"""
+        SELECT s.*, COUNT(a.id) as activity_count,
+               MAX(a.created_at) as last_activity_date
+        FROM stores s LEFT JOIN activities a ON s.id=a.store_id
+        WHERE s.city IN ({placeholders})
+        GROUP BY s.id
+        ORDER BY COUNT(a.id) ASC, s.city
+    """, cities)
+
+    store_list = []
+    for s in stores:
+        s = dict(s)
+        s['activity_count'] = int(s.get('activity_count') or 0)
+        last = s.pop('last_activity_date', None)
+        days_since = 999
+        if last:
+            try:
+                if isinstance(last, datetime):
+                    days_since = (datetime.now() - last.replace(tzinfo=None)).days
+                else:
+                    days_since = (datetime.now() - datetime.fromisoformat(str(last).replace('Z', '+00:00')).replace(tzinfo=None)).days
+            except Exception:
+                pass
+        s['days_since_visit'] = days_since if days_since < 999 else None
+        s['full_address'] = f"{s.get('address', '')}, {s.get('city', '')}, ON {s.get('postal', '')}".strip(', ')
+        s['lat'] = float(s.get('lat') or 0)
+        s['lng'] = float(s.get('lng') or 0)
+        store_list.append(s)
+
+    # Sort by priority: unvisited first, then longest since visit
+    store_list.sort(key=lambda x: (x['activity_count'], -(x['days_since_visit'] or 999)))
+
+    # Group into daily plans by city proximity
+    daily_plans = []
+    assigned = set()
+    today = datetime.now()
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+
+    for day_idx in range(days):
+        day_stores = []
+        # Pick a seed city that has unassigned stores
+        seed_store = None
+        for s in store_list:
+            if s['id'] not in assigned:
+                seed_store = s
+                break
+        if not seed_store:
+            break
+
+        day_stores.append(seed_store)
+        assigned.add(seed_store['id'])
+        seed_city = seed_store.get('city', '')
+
+        # Fill rest of day with nearby stores (same city first, then nearby)
+        for s in store_list:
+            if len(day_stores) >= stores_per_day:
+                break
+            if s['id'] in assigned:
+                continue
+            # Same city or within 15km
+            if s.get('city') == seed_city:
+                day_stores.append(s)
+                assigned.add(s['id'])
+            elif seed_store['lat'] and s.get('lat'):
+                dist = haversine(seed_store['lat'], seed_store['lng'], s['lat'], s['lng'])
+                if dist < 15:
+                    day_stores.append(s)
+                    assigned.add(s['id'])
+
+        # Build Google Maps route for the day
+        route_url = f"https://www.google.com/maps/dir/{REP_HOME['lat']},{REP_HOME['lng']}"
+        for s in day_stores[:9]:
+            addr = s['full_address'].replace(' ', '+')
+            route_url += f"/{addr}" if addr.strip(', ') else f"/{s['lat']},{s['lng']}"
+
+        plan_date = today + timedelta(days=(day_idx - today.weekday()) % 7 + (7 if day_idx >= 5 else 0))
+        if day_idx < 5:
+            plan_date = today + timedelta(days=day_idx)
+
+        daily_plans.append({
+            'day': day_names[day_idx % 5],
+            'date': plan_date.strftime('%Y-%m-%d'),
+            'stores': day_stores,
+            'store_count': len(day_stores),
+            'cities': list(set(s.get('city', '') for s in day_stores)),
+            'route_url': route_url
+        })
+
+    return jsonify({
+        'plans': daily_plans,
+        'district': district,
+        'total_stores_planned': len(assigned),
+        'total_stores_in_district': len(store_list)
+    })
 
 
 @app.route('/api/analytics/opportunity')

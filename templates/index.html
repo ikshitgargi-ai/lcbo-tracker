@@ -42,6 +42,9 @@
       <button class="nav-btn" data-view="routes" onclick="showView('routes')">
         <span class="icon">&#128506;</span><span class="nav-label">Routes</span>
       </button>
+      <button class="nav-btn" data-view="opportunities" onclick="showView('opportunities')">
+        <span class="icon">&#127919;</span><span class="nav-label">Opportunities</span>
+      </button>
       <button class="nav-btn" data-view="followups" onclick="showView('followups')">
         <span class="icon">&#128197;</span><span class="nav-label">Follow-Ups</span>
       </button>
@@ -230,6 +233,13 @@
         </div>
       </div>
       <div id="routeMapLink" style="margin-bottom:16px"></div>
+      <div id="geocodeBar" style="margin-bottom:12px; display:none" class="card">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap">
+          <span class="muted" style="font-size:13px">Stores are using city-center coordinates. Geocode for accurate distances.</span>
+          <button onclick="geocodeStores()" id="geocodeBtn" class="btn-primary" style="font-size:12px; padding:6px 14px">Geocode Addresses</button>
+          <span id="geocodeStatus" class="muted" style="font-size:12px"></span>
+        </div>
+      </div>
       <div id="districtSummary" style="margin-bottom:16px"></div>
       <div class="card">
         <h3>Target Stores <span class="card-badge" id="routeCount"></span></h3>
@@ -244,6 +254,46 @@
       </div>
     </section>
 
+    <!-- ===== OPPORTUNITIES ===== -->
+    <section id="view-opportunities" class="view">
+      <div class="view-header">
+        <h1>NB Distillers Opportunities</h1>
+        <div class="live-badge">TARGETS <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Stores with 0 or 1 NB Distillers products stocked. Priority targets for Red Admiral Vodka &amp; Chak De Whisky.</p>
+      <div class="opp-stats" id="oppStats"></div>
+      <div class="card">
+        <div class="opp-tabs">
+          <button class="tab-btn active" onclick="showOppTab('zero', this)">No NB Products</button>
+          <button class="tab-btn" onclick="showOppTab('one', this)">Only 1 Product</button>
+          <button class="tab-btn" onclick="showOppTab('full', this)">Both Stocked</button>
+        </div>
+        <div id="oppZero" class="opp-tab-content active"></div>
+        <div id="oppOne" class="opp-tab-content" style="display:none"></div>
+        <div id="oppFull" class="opp-tab-content" style="display:none"></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3>Daily Route Plan</h3>
+        <p class="muted" style="margin-bottom:12px">Optimized daily store visits for the week. 8 stores per day, grouped by city proximity.</p>
+        <div class="daily-plan-filters">
+          <select id="planDistrict" onchange="loadDailyPlan()">
+            <option value="GTA">GTA</option>
+            <option value="Golden Horseshoe">Golden Horseshoe</option>
+            <option value="Southwestern">Southwestern</option>
+            <option value="Eastern">Eastern</option>
+            <option value="Northern">Northern</option>
+          </select>
+          <select id="planStoresPerDay" onchange="loadDailyPlan()">
+            <option value="6">6 stores/day</option>
+            <option value="8" selected>8 stores/day</option>
+            <option value="10">10 stores/day</option>
+            <option value="12">12 stores/day</option>
+          </select>
+        </div>
+        <div id="dailyPlanGrid"></div>
+      </div>
+    </section>
+
     <!-- ===== FOLLOW-UPS ===== -->
     <section id="view-followups" class="view">
       <div class="view-header">
@@ -251,6 +301,11 @@
         <div class="live-badge" id="fuLive">LIVE <span class="pulse"></span></div>
       </div>
       <div class="followup-stats" id="followupStats"></div>
+      <div class="fu-filter-bar">
+        <button class="tab-btn active" onclick="loadFollowups('pending', this)">Pending</button>
+        <button class="tab-btn" onclick="loadFollowups('completed', this)">Completed</button>
+        <button class="tab-btn" onclick="loadFollowups('all', this)">All</button>
+      </div>
       <div class="card">
         <div id="followupsList"><p class="muted">Loading follow-ups...</p></div>
       </div>
@@ -277,9 +332,9 @@
           <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
-          <h3>&#128190; Database Backup</h3>
-          <p>Full SQLite database — contains ALL data ever entered. Keep this safe.</p>
-          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download .db</a>
+          <h3>&#128190; Full Backup</h3>
+          <p>All data ever entered — activities, follow-ups, stores, inventory. Data is permanently stored in PostgreSQL cloud database and NEVER deleted.</p>
+          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Backup</a>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
