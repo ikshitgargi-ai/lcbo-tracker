@@ -127,10 +127,7 @@ def db_execute(query, params=None):
     db = get_db()
     if USE_POSTGRES:
         query = query.replace('?', '%s')
-        # Fix SQLite-specific functions
         query = query.replace('CURRENT_TIMESTAMP', 'NOW()')
-    cur = db.execute(query, params or []) if not USE_POSTGRES else db.cursor().execute(query, params or ()) if False else None
-    if USE_POSTGRES:
         cur = db.cursor()
         cur.execute(query, params or ())
         return cur

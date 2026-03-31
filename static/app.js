@@ -9,10 +9,17 @@ let selectedActivities = [];
 let selectedVenue = '';
 
 // === INIT ===
+let autoRefreshInterval = null;
+
 document.addEventListener('DOMContentLoaded', async () => {
   await loadReps();
   showView('dashboard');
   startLiveClock();
+  // Auto-refresh dashboard every 30 seconds for live data sync
+  autoRefreshInterval = setInterval(() => {
+    const activeView = document.querySelector('.view.active');
+    if (activeView && activeView.id === 'view-dashboard') loadDashboard();
+  }, 30000);
 });
 
 // === LIVE CLOCK ===
@@ -107,6 +114,10 @@ async function loadDashboard() {
       <td class="notes-cell">${esc(truncate(a.notes, 40))}</td>
     </tr>
   `).join('');
+
+  // Update sync indicator
+  const liveEl = document.getElementById('dashLive');
+  if (liveEl) liveEl.title = 'Last synced: ' + new Date().toLocaleTimeString();
 }
 
 // === STORES ===
@@ -584,6 +595,7 @@ async function loadRoutes() {
   if (data.route_url && data.stores.length) {
     linkDiv.innerHTML = `<a href="${data.route_url}" target="_blank" class="btn-primary" style="display:inline-block;text-decoration:none;margin-right:8px">&#128506; Open Route in Google Maps (Top ${Math.min(9, data.stores.length)} stores)</a>`;
   }
+  checkGeocode(data.stores);
 
   // District summary cards
   const distDiv = document.getElementById('districtSummary');
