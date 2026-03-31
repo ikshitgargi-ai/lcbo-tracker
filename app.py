@@ -860,56 +860,62 @@ def api_routes():
                     'Gravenhurst', 'Bracebridge', 'Huntsville', 'Parry Sound'],
     }
 
-    query = "SELECT * FROM stores WHERE lat != 0 AND lng != 0"
+    # Single optimized query with activity counts and last activity
+    query = """SELECT s.*, COUNT(a.id) as activity_count,
+               MAX(a.created_at) as last_activity_date,
+               (SELECT a2.activity_type FROM activities a2 WHERE a2.store_id=s.id ORDER BY a2.created_at DESC LIMIT 1) as last_activity_type
+               FROM stores s LEFT JOIN activities a ON s.id=a.store_id
+               WHERE s.lat != 0 AND s.lng != 0"""
     params = []
     if city:
-        query += " AND city LIKE ?"
+        query += " AND s.city LIKE ?"
         params.append(f"%{city}%")
     elif district and district in DISTRICTS:
         placeholders = ','.join(['?' for _ in DISTRICTS[district]])
-        query += f" AND city IN ({placeholders})"
+        query += f" AND s.city IN ({placeholders})"
         params.extend(DISTRICTS[district])
+
+    if USE_POSTGRES:
+        query += " GROUP BY s.id"
+    else:
+        query += " GROUP BY s.id"
 
     stores = db_fetchall(query, params)
     results = []
     for s in stores:
         s = dict(s)
-        dist = haversine(REP_HOME['lat'], REP_HOME['lng'], s['lat'], s['lng'])
+        dist = haversine(REP_HOME['lat'], REP_HOME['lng'], float(s['lat'] or 0), float(s['lng'] or 0))
         if max_distance and dist > float(max_distance):
             continue
         s['distance_km'] = round(dist, 1)
-        last_act = db_fetchone("""
-            SELECT a.activity_type, a.created_at, a.notes, r.name as rep_name
-            FROM activities a JOIN reps r ON a.rep_id=r.id
-            WHERE a.store_id=? ORDER BY a.created_at DESC LIMIT 1
-        """, [s['id']])
-        if last_act:
-            la = dict(last_act)
-            for k, v in la.items():
-                if isinstance(v, datetime):
-                    la[k] = v.isoformat()
-            s['last_activity'] = la
+        s['activity_count'] = int(s.get('activity_count') or 0)
+
+        last_date = s.pop('last_activity_date', None)
+        last_type = s.pop('last_activity_type', None)
+        if last_date:
+            if isinstance(last_date, datetime):
+                last_date_str = last_date.isoformat()
+            else:
+                last_date_str = str(last_date)
+            s['last_activity'] = {'activity_type': last_type, 'created_at': last_date_str}
         else:
             s['last_activity'] = None
-        act_count = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE store_id=?", [s['id']])
-        s['activity_count'] = act_count['c'] if isinstance(act_count, dict) else act_count[0]
 
         # Priority score: lower = higher priority (needs visit)
         days_since = 999
-        if s['last_activity'] and s['last_activity'].get('created_at'):
+        if last_date:
             try:
-                last_dt = datetime.fromisoformat(s['last_activity']['created_at'].replace('Z', '+00:00'))
-                days_since = (datetime.now() - last_dt.replace(tzinfo=None)).days
+                if isinstance(last_date, datetime):
+                    days_since = (datetime.now() - last_date.replace(tzinfo=None)).days
+                else:
+                    last_dt = datetime.fromisoformat(str(last_date).replace('Z', '+00:00'))
+                    days_since = (datetime.now() - last_dt.replace(tzinfo=None)).days
             except Exception:
                 pass
         priority_score = s['distance_km'] * 0.3 - days_since * 0.5 - (10 - min(s['activity_count'], 10)) * 2
         s['priority_score'] = round(priority_score, 1)
         s['days_since_visit'] = days_since if days_since < 999 else None
         s['full_address'] = f"{s.get('address', '') or ''}, {s.get('city', '') or ''}, ON {s.get('postal', '') or ''}".strip(', ')
-        # Serialize any datetime values for JSON
-        for k, v in s.items():
-            if isinstance(v, datetime):
-                s[k] = v.isoformat()
         results.append(s)
 
     if sort_by == 'priority':
