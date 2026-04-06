@@ -215,7 +215,8 @@ def init_db():
                 store_email TEXT DEFAULT '',
                 producer TEXT DEFAULT '',
                 lat REAL DEFAULT 0,
-                lng REAL DEFAULT 0
+                lng REAL DEFAULT 0,
+                first_seen TIMESTAMP DEFAULT NULL
             )
         ''')
         cur.execute('''
@@ -292,7 +293,7 @@ def init_db():
             ('stores', 'manager_name', 'TEXT DEFAULT \'\''), ('stores', 'asst_manager_name', 'TEXT DEFAULT \'\''),
             ('stores', 'manager_phone', 'TEXT DEFAULT \'\''), ('stores', 'store_email', 'TEXT DEFAULT \'\''),
             ('stores', 'producer', 'TEXT DEFAULT \'\''), ('stores', 'lat', 'REAL DEFAULT 0'),
-            ('stores', 'lng', 'REAL DEFAULT 0'),
+            ('stores', 'lng', 'REAL DEFAULT 0'), ('stores', 'first_seen', 'TIMESTAMP DEFAULT NULL'),
             ('activities', 'producer', 'TEXT DEFAULT \'\''), ('activities', 'venue_type', 'TEXT DEFAULT \'\''),
             ('activities', 'follow_up_date', 'TEXT DEFAULT \'\''),
         ]
@@ -316,7 +317,8 @@ def init_db():
                 priority TEXT DEFAULT 'Standard', status TEXT DEFAULT '', rep TEXT DEFAULT '',
                 manager_name TEXT DEFAULT '', asst_manager_name TEXT DEFAULT '',
                 manager_phone TEXT DEFAULT '', store_email TEXT DEFAULT '',
-                producer TEXT DEFAULT '', lat REAL DEFAULT 0, lng REAL DEFAULT 0
+                producer TEXT DEFAULT '', lat REAL DEFAULT 0, lng REAL DEFAULT 0,
+                first_seen TIMESTAMP DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS reps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL
@@ -374,7 +376,7 @@ def init_db():
             ('stores', 'manager_name', "TEXT DEFAULT ''"), ('stores', 'asst_manager_name', "TEXT DEFAULT ''"),
             ('stores', 'manager_phone', "TEXT DEFAULT ''"), ('stores', 'store_email', "TEXT DEFAULT ''"),
             ('stores', 'producer', "TEXT DEFAULT ''"), ('stores', 'lat', "REAL DEFAULT 0"),
-            ('stores', 'lng', "REAL DEFAULT 0"),
+            ('stores', 'lng', "REAL DEFAULT 0"), ('stores', 'first_seen', "TIMESTAMP DEFAULT NULL"),
             ('activities', 'producer', "TEXT DEFAULT ''"), ('activities', 'venue_type', "TEXT DEFAULT ''"),
             ('activities', 'follow_up_date', "TEXT DEFAULT ''"),
         ]
@@ -737,6 +739,25 @@ def api_dashboard():
         overdue = db_fetchone("SELECT COUNT(*) as c FROM activities WHERE follow_up_date != '' AND follow_up_date < ? AND follow_up_date IS NOT NULL", [today])
     overdue = overdue['c'] if isinstance(overdue, dict) else overdue[0]
 
+    # New stores discovered in last 30 days via sync
+    try:
+        since_30 = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        new_stores = db_fetchone("SELECT COUNT(*) as c FROM stores WHERE first_seen >= ?", [since_30])
+        new_stores = new_stores['c'] if isinstance(new_stores, dict) else new_stores[0]
+    except Exception:
+        new_stores = 0
+
+    # Last sync time
+    try:
+        last_synced = db_fetchone("SELECT MAX(first_seen) as t FROM stores WHERE first_seen IS NOT NULL")
+        last_synced = last_synced['t'] if isinstance(last_synced, dict) else last_synced[0]
+        if isinstance(last_synced, datetime):
+            last_synced = last_synced.isoformat()
+        else:
+            last_synced = str(last_synced) if last_synced else None
+    except Exception:
+        last_synced = None
+
     # Serialize datetimes
     recent_list = []
     for r in recent:
@@ -749,7 +770,8 @@ def api_dashboard():
     return jsonify({
         'total_stores': total_stores, 'total_activities': total_activities,
         'active_stores': active_stores, 'week_activities': week_activities,
-        'overdue_followups': overdue,
+        'overdue_followups': overdue, 'new_stores_30d': new_stores,
+        'last_synced': last_synced,
         'by_type': {r['activity_type']: r['c'] for r in by_type},
         'by_producer': {r['producer']: r['c'] for r in by_producer},
         'recent': recent_list,
@@ -910,11 +932,175 @@ def api_product_create():
         return jsonify({'id': last['id'] if isinstance(last, dict) else last[0], 'success': True})
 
 
+def _parse_occ_stores(data):
+    """Parse SAP Commerce Cloud OCC API response for store inventory"""
+    stores = []
+    store_list = (data.get('stores') or data.get('pointOfServices') or
+                  data.get('storeInventory') or data.get('results') or [])
+    if isinstance(store_list, dict):
+        store_list = store_list.get('entry', [])
+    for s in store_list:
+        qty = 0
+        for stock_key in ['stockInfo', 'stock', 'stockLevel']:
+            stock = s.get(stock_key)
+            if isinstance(stock, dict):
+                qty = int(stock.get('stockLevel', 0) or 0)
+                break
+            elif isinstance(stock, (int, float)):
+                qty = int(stock)
+                break
+        addr = s.get('address') or {}
+        city = addr.get('town') or addr.get('city') or ''
+        store_num = re.sub(r'^[A-Za-z_-]+', '', str(s.get('name', '')).strip()).strip()
+        stores.append({
+            'store_name': s.get('displayName') or s.get('description') or f'Store #{store_num}',
+            'store_number': store_num,
+            'city': city,
+            'quantity': qty
+        })
+    return [s for s in stores if s['quantity'] > 0]
+
+
+def _parse_inventory_html(html):
+    """Try multiple patterns to extract store inventory from LCBO HTML page"""
+    stores = []
+
+    # Pattern 1: var storeData = [...] (legacy format)
+    m = re.search(r'var\s+storeData\s*=\s*(\[.*?\]);', html, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            for s in data:
+                stores.append({'store_name': s.get('name', ''), 'store_number': str(s.get('store_id', '')),
+                               'city': s.get('city', ''), 'quantity': int(s.get('quantity', 0) or 0)})
+            if stores:
+                return stores
+        except Exception:
+            pass
+
+    # Pattern 2: JSON array with store/inventory keys in script tags
+    for m in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+        script = m.group(1)
+        if not any(k in script for k in ('"stores"', 'storeInventory', 'storeList', 'availableStore')):
+            continue
+        for pat in [r'"stores"\s*:\s*(\[.*?\])', r'"storeList"\s*:\s*(\[.*?\])',
+                    r'"storeInventory"\s*:\s*(\[.*?\])', r'"availableStores"\s*:\s*(\[.*?\])']:
+            m2 = re.search(pat, script, re.DOTALL)
+            if m2:
+                try:
+                    data = json.loads(m2.group(1))
+                    for s in data:
+                        stores.append({
+                            'store_name': s.get('name') or s.get('storeName') or s.get('displayName', ''),
+                            'store_number': str(s.get('id') or s.get('storeId') or s.get('store_id') or ''),
+                            'city': s.get('city') or (s.get('address') or {}).get('city', ''),
+                            'quantity': int(s.get('quantity') or s.get('stockLevel') or 0)
+                        })
+                    if stores:
+                        return stores
+                except Exception:
+                    pass
+
+    # Pattern 3: window.__NEXT_DATA__ (Next.js SSR)
+    m = re.search(r'window\.__NEXT_DATA__\s*=\s*(\{.*\})', html)
+    if m:
+        try:
+            def _find_stores(obj, depth=0):
+                if depth > 8:
+                    return []
+                if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                    if any(k in obj[0] for k in ('storeId', 'store_id', 'quantity', 'stockLevel')):
+                        return obj
+                if isinstance(obj, dict):
+                    for key in ('stores', 'storeList', 'storeInventory', 'availableStores'):
+                        if key in obj:
+                            r = _find_stores(obj[key], depth + 1)
+                            if r:
+                                return r
+                    for v in obj.values():
+                        r = _find_stores(v, depth + 1)
+                        if r:
+                            return r
+                return []
+            found = _find_stores(json.loads(m.group(1)))
+            for s in found:
+                stores.append({'store_name': s.get('name') or s.get('storeName', ''),
+                               'store_number': str(s.get('storeId') or s.get('store_id') or ''),
+                               'city': s.get('city', ''),
+                               'quantity': int(s.get('quantity') or s.get('stockLevel') or 0)})
+            if stores:
+                return stores
+        except Exception:
+            pass
+
+    # Pattern 4: HTML class-based fallback
+    store_blocks = re.findall(r'class="store-name[^"]*"[^>]*>([^<]+)<', html)
+    qty_blocks = re.findall(r'class="store-stock[^"]*"[^>]*>([^<]+)<', html)
+    for i, name in enumerate(store_blocks):
+        qty = int(re.sub(r'[^0-9]', '', qty_blocks[i].strip() if i < len(qty_blocks) else '') or '0')
+        stores.append({'store_name': name.strip(), 'city': '', 'quantity': qty, 'store_number': ''})
+
+    return stores
+
+
+def fetch_lcbo_inventory_live(sku):
+    """
+    Try multiple methods to fetch live LCBO store inventory.
+    Returns (stores_list, source_string, error_or_None)
+    """
+    if not http_requests:
+        return [], 'unavailable', 'requests module not installed'
+
+    base_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-CA,en;q=0.9',
+        'Referer': 'https://www.lcbo.com/',
+    }
+
+    # Method 1: SAP Commerce Cloud OCC REST API (current LCBO backend as of 2023+)
+    occ_paths = [
+        f'/lcboocc/v2/lcbo/stores?productCode={sku}&pageSize=200&fields=FULL',
+        f'/lcboocc/v2/lcbo/products/{sku}/stock?pageSize=200&fields=DEFAULT',
+        f'/api/2.0/products/{sku}/stores?per_page=200',
+    ]
+    for path in occ_paths:
+        try:
+            resp = http_requests.get(f'https://www.lcbo.com{path}',
+                                     headers={**base_headers, 'Accept': 'application/json'}, timeout=15)
+            if resp.status_code == 200 and 'json' in resp.headers.get('Content-Type', ''):
+                stores = _parse_occ_stores(resp.json())
+                if stores:
+                    return stores, 'lcbo_api', None
+        except Exception:
+            pass
+
+    # Method 2: Store inventory page (multiple HTML/JSON patterns)
+    try:
+        resp = http_requests.get(f'https://www.lcbo.com/en/storeinventory/?sku={sku}',
+                                 headers={**base_headers, 'Accept': 'text/html,*/*'}, timeout=20)
+        if resp.status_code == 200:
+            stores = _parse_inventory_html(resp.text)
+            if stores:
+                return stores, 'lcbo_inventory_page', None
+    except Exception:
+        pass
+
+    # Method 3: Product detail page embedded JSON
+    try:
+        resp = http_requests.get(f'https://www.lcbo.com/en/p/product-{sku}',
+                                 headers={**base_headers, 'Accept': 'text/html,*/*'}, timeout=20)
+        if resp.status_code == 200:
+            stores = _parse_inventory_html(resp.text)
+            if stores:
+                return stores, 'lcbo_product_page', None
+    except Exception:
+        pass
+
+    return [], 'failed', 'All live check methods failed — LCBO.com may be unavailable or layout changed'
+
+
 @app.route('/api/inventory/check/<sku>')
 def api_inventory_check(sku):
-    if not http_requests:
-        return jsonify({'error': 'requests not available', 'stores': []})
-
     product = db_fetchone("SELECT * FROM products WHERE lcbo_sku=?", [sku])
     if not product:
         return jsonify({'error': 'Product not found', 'stores': []})
@@ -923,47 +1109,25 @@ def api_inventory_check(sku):
         if isinstance(v, datetime):
             product[k] = v.isoformat()
 
-    try:
-        resp = http_requests.get(
-            f'https://www.lcbo.com/en/storeinventory/?sku={sku}',
-            headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', 'Accept': '*/*'},
-            timeout=15
-        )
-        stores = []
-        if resp.status_code == 200:
-            text = resp.text
-            json_match = re.search(r'var\s+storeData\s*=\s*(\[.*?\]);', text, re.DOTALL)
-            if json_match:
-                try:
-                    store_data = json.loads(json_match.group(1))
-                    for sd in store_data:
-                        stores.append({'store_name': sd.get('name', ''), 'store_number': str(sd.get('store_id', '')),
-                                       'city': sd.get('city', ''), 'quantity': sd.get('quantity', 0)})
-                except Exception:
-                    pass
-            if not stores:
-                store_blocks = re.findall(r'class="store-name[^"]*"[^>]*>([^<]+)<', text)
-                qty_blocks = re.findall(r'class="store-stock[^"]*"[^>]*>([^<]+)<', text)
-                for i, name in enumerate(store_blocks):
-                    qty = qty_blocks[i].strip() if i < len(qty_blocks) else '0'
-                    q = 0
-                    try:
-                        q = int(re.sub(r'[^0-9]', '', qty))
-                    except Exception:
-                        pass
-                    stores.append({'store_name': name.strip(), 'city': '', 'quantity': q, 'store_number': ''})
-            if stores:
-                db_execute("DELETE FROM inventory_cache WHERE product_id=?", [product['id']])
-                for s in stores:
-                    db_execute(
-                        "INSERT INTO inventory_cache (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
-                        [product['id'], s.get('store_number', 0), s['store_name'], s.get('city', ''), s['quantity']]
-                    )
-                db_commit()
-        return jsonify({'product': product, 'stores': stores, 'checked_at': datetime.now().isoformat(), 'source': 'lcbo.com'})
-    except Exception as e:
-        cached = db_fetchall("SELECT * FROM inventory_cache WHERE product_id=? ORDER BY store_city", [product['id']])
-        return jsonify({'product': product, 'stores': [dict(c) for c in cached], 'checked_at': None, 'source': 'cache', 'error': str(e)})
+    stores, source, err = fetch_lcbo_inventory_live(sku)
+
+    if stores:
+        db_execute("DELETE FROM inventory_cache WHERE product_id=?", [product['id']])
+        for s in stores:
+            db_execute(
+                "INSERT INTO inventory_cache (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
+                [product['id'], s.get('store_number', 0), s.get('store_name', ''), s.get('city', ''), s.get('quantity', 0)]
+            )
+        db_commit()
+        return jsonify({'product': product, 'stores': stores, 'checked_at': datetime.now().isoformat(),
+                        'source': source, 'store_count': len(stores)})
+
+    # Fall back to cache
+    cached = db_fetchall("SELECT * FROM inventory_cache WHERE product_id=? ORDER BY store_city", [product['id']])
+    cached_list = [dict(c) for c in cached]
+    return jsonify({'product': product, 'stores': cached_list, 'checked_at': None,
+                    'source': 'cache', 'error': err or 'Live check failed',
+                    'store_count': len(cached_list)})
 
 
 # === ROUTE PLANNING ===
@@ -1526,6 +1690,154 @@ def api_daily_plan():
         'total_stores_planned': len(assigned),
         'total_stores_in_district': len(store_list)
     })
+
+
+@app.route('/api/stores/sync', methods=['POST'])
+def api_sync_stores():
+    """Sync LCBO store list from Ontario Open Data (data.ontario.ca) to catch new openings."""
+    if not http_requests:
+        return jsonify({'error': 'requests module not available', 'new': 0, 'updated': 0})
+    try:
+        # Discover LCBO store locations dataset on Ontario Open Data (CKAN API)
+        pkg_resp = http_requests.get(
+            'https://data.ontario.ca/api/3/action/package_show',
+            params={'id': 'lcbo-store-locations'},
+            timeout=30
+        )
+        if pkg_resp.status_code != 200:
+            return jsonify({'error': f'Ontario Open Data unreachable (HTTP {pkg_resp.status_code})', 'new': 0})
+        pkg_data = pkg_resp.json()
+        if not pkg_data.get('success'):
+            return jsonify({'error': 'LCBO dataset not found on data.ontario.ca', 'new': 0})
+
+        resources = pkg_data['result'].get('resources', [])
+        resource_id = None
+        csv_url = None
+        for r in resources:
+            if r.get('datastore_active'):
+                resource_id = r['id']
+                break
+            if not csv_url and r.get('format', '').upper() == 'CSV':
+                csv_url = r.get('url')
+
+        new_count = 0
+        updated_count = 0
+
+        if resource_id:
+            # Fetch via CKAN datastore API
+            offset = 0
+            limit = 1000
+            total = None
+            while True:
+                resp = http_requests.get(
+                    'https://data.ontario.ca/api/3/action/datastore_search',
+                    params={'resource_id': resource_id, 'limit': limit, 'offset': offset},
+                    timeout=30
+                )
+                if resp.status_code != 200:
+                    break
+                result = resp.json().get('result', {})
+                records = result.get('records', [])
+                if total is None:
+                    total = result.get('total', 0)
+                if not records:
+                    break
+                for record in records:
+                    n, u = _upsert_store_record(record)
+                    new_count += n
+                    updated_count += u
+                db_commit()
+                offset += len(records)
+                if total and offset >= total:
+                    break
+        elif csv_url:
+            # Download CSV directly
+            import io as _io
+            import csv as _csv
+            r = http_requests.get(csv_url, timeout=60)
+            if r.status_code == 200:
+                reader = _csv.DictReader(_io.StringIO(r.text))
+                for row in reader:
+                    n, u = _upsert_store_record(row)
+                    new_count += n
+                    updated_count += u
+                db_commit()
+        else:
+            return jsonify({'error': 'No accessible data resource found in LCBO dataset', 'new': 0})
+
+        return jsonify({
+            'success': True,
+            'new_stores': new_count,
+            'existing_stores': updated_count,
+            'message': f'Sync complete: {new_count} new stores added, {updated_count} existing verified'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'new': 0, 'updated': 0})
+
+
+def _upsert_store_record(record):
+    """Insert or no-op a store record from Ontario Open Data. Returns (new_count, updated_count)."""
+    store_num = None
+    for k in ('Store #', 'STORE_NO', 'Store Number', 'License #', 'store_number'):
+        val = record.get(k)
+        if val:
+            try:
+                store_num = int(str(val).strip().replace(',', ''))
+                break
+            except Exception:
+                pass
+    if not store_num or store_num <= 0:
+        return 0, 0
+
+    account = (record.get('Store Name') or record.get('Account') or record.get('NAME') or f'LCBO #{store_num}')
+    address = (record.get('Address') or record.get('Street Address') or record.get('ADDRESS') or '')
+    city = (record.get('City') or record.get('CITY') or '')
+    postal = (record.get('Postal Code') or record.get('Postal') or record.get('POSTAL_CODE') or '')
+    phone = (record.get('Phone') or record.get('PHONE') or '')
+    lat, lng = CITY_COORDS.get(city, (0, 0))
+
+    existing = db_fetchone("SELECT id FROM stores WHERE store_number=?", [store_num])
+    if existing:
+        return 0, 1
+    if USE_POSTGRES:
+        db_execute(
+            "INSERT INTO stores (store_number, account, address, city, postal, phone, lat, lng, first_seen) VALUES (?,?,?,?,?,?,?,?,NOW()) ON CONFLICT (store_number) DO NOTHING",
+            [store_num, account, address, city, postal, phone, lat, lng]
+        )
+    else:
+        db_execute(
+            "INSERT OR IGNORE INTO stores (store_number, account, address, city, postal, phone, lat, lng, first_seen) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+            [store_num, account, address, city, postal, phone, lat, lng]
+        )
+    return 1, 0
+
+
+@app.route('/api/stores/new')
+def api_new_stores():
+    """Return stores added via sync (have a first_seen date), newest first."""
+    days = int(request.args.get('days', 90))
+    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    if USE_POSTGRES:
+        rows = db_fetchall("""
+            SELECT s.*, COUNT(a.id) as activity_count
+            FROM stores s LEFT JOIN activities a ON s.id=a.store_id
+            WHERE s.first_seen >= %s::date
+            GROUP BY s.id ORDER BY s.first_seen DESC LIMIT 100
+        """, [since])
+    else:
+        rows = db_fetchall("""
+            SELECT s.*, COUNT(a.id) as activity_count
+            FROM stores s LEFT JOIN activities a ON s.id=a.store_id
+            WHERE s.first_seen >= ?
+            GROUP BY s.id ORDER BY s.first_seen DESC LIMIT 100
+        """, [since])
+    result = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get('first_seen'), datetime):
+            d['first_seen'] = d['first_seen'].isoformat()
+        result.append(d)
+    return jsonify(result)
 
 
 @app.route('/api/analytics/opportunity')

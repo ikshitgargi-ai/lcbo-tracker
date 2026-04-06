@@ -51,6 +51,7 @@ function showView(view) {
   if (view === 'routes') loadRoutes();
   if (view === 'opportunities') { loadOpportunities(); loadDailyPlan(); }
   if (view === 'followups') loadFollowups();
+  if (view === 'newstores') loadNewStores();
 }
 
 // === REPS ===
@@ -74,6 +75,10 @@ async function loadDashboard() {
   const prods = d.by_producer || {};
   const reps = d.by_rep || {};
 
+  const newStores = d.new_stores_30d || 0;
+  const newBadge = document.getElementById('newStoresBadge');
+  if (newBadge) { newBadge.textContent = newStores; newBadge.style.display = newStores > 0 ? 'inline-flex' : 'none'; }
+
   document.getElementById('statsGrid').innerHTML = `
     <div class="stat-card accent"><div class="label">Total Stores</div><div class="value">${d.total_stores}</div></div>
     <div class="stat-card green"><div class="label">Activities Logged</div><div class="value">${d.total_activities}</div></div>
@@ -82,7 +87,11 @@ async function loadDashboard() {
     <div class="stat-card" style="border-left:3px solid #e17055"><div class="label">NB Distillers</div><div class="value" style="color:#e17055">${prods['NB Distillers'] || 0}</div></div>
     <div class="stat-card" style="border-left:3px solid #00cec9"><div class="label">Anu Portfolio</div><div class="value" style="color:#00cec9">${prods['Anu Portfolio'] || 0}</div></div>
     <div class="stat-card red"><div class="label">Overdue Follow-Ups</div><div class="value">${d.overdue_followups || 0}</div></div>
-    <div class="stat-card" style="border-left:3px solid var(--accent)"><div class="label">Untouched Stores</div><div class="value" style="color:var(--accent-light)">${d.total_stores - (d.active_stores || 0)}</div></div>
+    <div class="stat-card ${newStores > 0 ? 'green' : ''}" style="border-left:3px solid #6c5ce7;cursor:${newStores > 0 ? 'pointer' : 'default'}" onclick="${newStores > 0 ? "showView('newstores')" : ''}">
+      <div class="label">New Stores (30d)${newStores > 0 ? ' &#10022;' : ''}</div>
+      <div class="value" style="color:#6c5ce7">${newStores}</div>
+      ${d.last_synced ? `<div class="stat-sub">Last synced ${formatDate(d.last_synced)}</div>` : '<div class="stat-sub">Not yet synced</div>'}
+    </div>
   `;
 
   // Rep stats
@@ -512,35 +521,111 @@ async function loadInventory() {
 async function checkInventory(sku, btn) {
   btn.textContent = 'Checking...';
   btn.disabled = true;
+  const alert = document.getElementById('invSyncAlert');
+  if (alert) { alert.style.display = 'none'; }
   try {
     const res = await fetch(`/api/inventory/check/${sku}`);
     const data = await res.json();
     const div = document.getElementById('inv-stores-' + sku);
 
     if (data.stores && data.stores.length) {
-      div.innerHTML = `<h4 style="margin:8px 0">Available at ${data.stores.length} stores:</h4>` +
-        data.stores.slice(0, 20).map(s => `
+      const sourceLabel = data.source === 'cache' ? ' <span style="color:#f39c12;font-size:11px">(cached)</span>' : ' <span style="color:#00b894;font-size:11px">(live)</span>';
+      div.innerHTML = `<h4 style="margin:8px 0">Available at ${data.stores.length} stores${sourceLabel}:</h4>` +
+        `<div class="inv-store-grid">` +
+        data.stores.sort((a,b) => b.quantity - a.quantity).map(s => `
           <div class="inv-store-row">
-            <span>${esc(s.store_name || 'Store #' + s.store_number)}</span>
-            <span>${esc(s.city || '')}</span>
-            <span class="inv-qty">${s.quantity} units</span>
+            <span class="inv-store-name">${esc(s.store_name || 'Store #' + s.store_number)}</span>
+            <span class="inv-store-city">${esc(s.city || '')}</span>
+            <span class="inv-qty">${s.quantity}</span>
           </div>
         `).join('') +
-        (data.stores.length > 20 ? `<div class="muted">+${data.stores.length - 20} more stores</div>` : '');
+        `</div>` +
+        (data.stores.length > 0 ? `<div class="inv-total-units">Total: ${data.stores.reduce((t,s)=>t+s.quantity,0)} units across ${data.stores.length} stores</div>` : '');
       div.style.display = 'block';
+      if (data.source === 'cache' && data.error) {
+        if (alert) { alert.textContent = `Live check unavailable: ${data.error}. Showing last cached data.`; alert.style.display = 'block'; }
+      }
     } else {
-      div.innerHTML = '<p class="muted">No inventory data found. Check LCBO.com directly.</p>';
+      const errMsg = data.error ? ` <span class="muted" style="font-size:11px">${esc(data.error)}</span>` : '';
+      div.innerHTML = `<p class="muted">No inventory found at any store.${errMsg}</p>
+        <p class="muted" style="font-size:11px">This product may not be listed at LCBO yet, or the live check couldn't reach LCBO.com.</p>`;
       div.style.display = 'block';
     }
-    if (data.source === 'cache') {
-      div.innerHTML += '<div class="muted" style="font-size:11px;margin-top:4px">Showing cached data (live check failed)</div>';
+    if (data.checked_at) {
+      div.innerHTML += `<div class="inv-checked">Checked: ${formatDate(data.checked_at)} · Source: ${data.source}</div>`;
     }
   } catch (e) {
     console.error('Inventory check failed:', e);
   }
   btn.textContent = 'Check Stock';
   btn.disabled = false;
-  loadInventory(); // Refresh stats
+  loadInventory();
+}
+
+// === STORE SYNC (Ontario Open Data) ===
+async function syncStores(fromNewStores) {
+  const btn = document.getElementById('syncBtn');
+  const statusEl = document.getElementById(fromNewStores ? 'newSyncStatus' : 'syncStatus');
+  if (btn) { btn.textContent = '&#8635; Syncing...'; btn.disabled = true; }
+  if (statusEl) statusEl.textContent = 'Connecting to Ontario Open Data...';
+
+  try {
+    const res = await fetch('/api/stores/sync', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      if (statusEl) statusEl.textContent = 'Error: ' + data.error;
+    } else {
+      if (statusEl) statusEl.textContent = `Done — ${data.new_stores} new, ${data.existing_stores} verified`;
+      if (data.new_stores > 0) {
+        const badge = document.getElementById('newStoresBadge');
+        if (badge) { badge.textContent = data.new_stores; badge.style.display = 'inline-flex'; }
+        loadNewStores();
+      }
+      if (!fromNewStores) loadStores();
+    }
+  } catch(e) {
+    if (statusEl) statusEl.textContent = 'Sync failed — check network';
+  }
+  if (btn) { btn.innerHTML = '&#8635; Sync from LCBO.ca'; btn.disabled = false; }
+}
+
+// === NEW STORES ===
+async function loadNewStores() {
+  const days = document.getElementById('newStoresDays')?.value || 90;
+  const res = await fetch(`/api/stores/new?days=${days}`);
+  const stores = await res.json();
+  const badge = document.getElementById('newStoreCount');
+  if (badge) badge.textContent = stores.length;
+
+  // Update nav badge
+  const navBadge = document.getElementById('newStoresBadge');
+  if (navBadge) { navBadge.textContent = stores.length; navBadge.style.display = stores.length > 0 ? 'inline-flex' : 'none'; }
+
+  const list = document.getElementById('newStoresList');
+  if (!list) return;
+
+  if (!stores.length) {
+    list.innerHTML = `<div class="no-new-stores">
+      <p class="muted">No new stores found in the last ${days} days.</p>
+      <p class="muted" style="margin-top:8px">Click <strong>Sync Now</strong> to check Ontario Open Data for new LCBO openings. New stores added to the LCBO network will appear here.</p>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = `<table class="data-table">
+    <thead><tr><th>Store #</th><th>Name</th><th>Address</th><th>City</th><th>Discovered</th><th>Activities</th><th></th></tr></thead>
+    <tbody>
+    ${stores.map(s => `<tr>
+      <td><strong>${s.store_number}</strong></td>
+      <td>${esc(s.account || '')}</td>
+      <td>${esc(s.address || '')}</td>
+      <td>${esc(s.city || '')}</td>
+      <td><span class="new-store-badge">NEW</span> ${formatDate(s.first_seen)}</td>
+      <td>${s.activity_count || 0}</td>
+      <td><button class="btn-sm" onclick="openStoreModal(${s.id})">View</button></td>
+    </tr>`).join('')}
+    </tbody>
+  </table>`;
 }
 
 async function addProduct() {

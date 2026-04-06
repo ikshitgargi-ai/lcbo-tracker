@@ -48,6 +48,9 @@
       <button class="nav-btn" data-view="followups" onclick="showView('followups')">
         <span class="icon">&#128197;</span><span class="nav-label">Follow-Ups</span>
       </button>
+      <button class="nav-btn" data-view="newstores" onclick="showView('newstores')">
+        <span class="icon">&#10022;</span><span class="nav-label">New Stores <span id="newStoresBadge" class="nav-badge" style="display:none"></span></span>
+      </button>
       <button class="nav-btn" data-view="export" onclick="showView('export')">
         <span class="icon">&#8615;</span><span class="nav-label">Export</span>
       </button>
@@ -87,6 +90,10 @@
     <section id="view-stores" class="view">
       <div class="view-header">
         <h1>All Stores <span class="header-count" id="storeCount"></span></h1>
+        <div style="display:flex;gap:10px;align-items:center">
+          <span id="syncStatus" class="muted" style="font-size:12px"></span>
+          <button class="btn-sm btn-sync" id="syncBtn" onclick="syncStores()">&#8635; Sync from LCBO.ca</button>
+        </div>
       </div>
       <div class="filters">
         <input type="text" id="storeSearch" placeholder="Search store #, name, city, manager..." oninput="debounceSearch()">
@@ -170,7 +177,8 @@
         <h1>LCBO Inventory</h1>
         <div class="live-badge">LCBO.COM <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">Track our products across LCBO stores. Click "Check Stock" to fetch live data from LCBO.com.</p>
+      <p class="view-desc">Track our products across LCBO stores. Click <strong>Check Stock</strong> to fetch live availability from LCBO.com. Data is cached when live check succeeds.</p>
+      <div id="invSyncAlert" class="alert-info" style="display:none"></div>
       <div class="inventory-grid" id="inventoryGrid"></div>
       <div class="card" style="margin-top:20px">
         <h3>Add Product to Track</h3>
@@ -308,6 +316,33 @@
       </div>
       <div class="card">
         <div id="followupsList"><p class="muted">Loading follow-ups...</p></div>
+      </div>
+    </section>
+
+    <!-- ===== NEW STORES ===== -->
+    <section id="view-newstores" class="view">
+      <div class="view-header">
+        <h1>New Store Listings</h1>
+        <div class="live-badge">LCBO SYNC <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Stores newly added to the LCBO network, detected by syncing with Ontario Open Data. These are your fresh sales opportunities.</p>
+      <div class="new-stores-controls card" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px">
+        <div>
+          <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">Show stores added in last:</label>
+          <select id="newStoresDays" onchange="loadNewStores()" style="padding:6px 12px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text);border-radius:6px">
+            <option value="30">30 days</option>
+            <option value="60">60 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">6 months</option>
+            <option value="365">1 year</option>
+          </select>
+        </div>
+        <button class="btn-primary" onclick="syncStores(true)" style="margin-top:18px">&#8635; Sync Now from LCBO.ca</button>
+        <div id="newSyncStatus" class="muted" style="font-size:12px;margin-top:18px"></div>
+      </div>
+      <div class="card">
+        <h3>New LCBO Stores <span class="card-badge" id="newStoreCount"></span></h3>
+        <div id="newStoresList"><p class="muted">Click "Sync Now" to check for new LCBO store openings from Ontario Open Data.</p></div>
       </div>
     </section>
 

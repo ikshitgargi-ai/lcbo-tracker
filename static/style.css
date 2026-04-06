@@ -362,3 +362,20 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 20px; letter-spacing: -0.
 .btn-reschedule:hover { background: rgba(253,203,110,0.3); }
 .followup-completed { opacity: 0.6; border-left-color: var(--green); }
 .fu-completed-at { margin-top: 4px; }
+
+/* === Sync & New Stores === */
+.btn-sync { background: rgba(108,92,231,0.15); color: var(--accent-light); border: 1px solid rgba(108,92,231,0.3); transition: background 0.2s; }
+.btn-sync:hover { background: rgba(108,92,231,0.3); }
+.nav-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; background: var(--anu-red); color: #fff; border-radius: 9px; font-size: 10px; font-weight: 700; padding: 0 4px; margin-left: 2px; vertical-align: middle; }
+.new-store-badge { display: inline-block; background: rgba(0,184,148,0.2); color: var(--green); border: 1px solid rgba(0,184,148,0.4); border-radius: 4px; padding: 1px 6px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }
+.stat-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+/* === Inventory improvements === */
+.inv-store-grid { max-height: 260px; overflow-y: auto; margin-top: 8px; }
+.inv-store-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 5px; transition: background 0.15s; font-size: 12px; }
+.inv-store-row:hover { background: var(--surface2); }
+.inv-store-name { flex: 2; font-size: 12px; }
+.inv-store-city { flex: 1; color: var(--muted); font-size: 11px; }
+.inv-qty { font-weight: 700; color: var(--green); min-width: 40px; text-align: right; font-size: 12px; }
+.inv-total-units { font-size: 11px; color: var(--muted); margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); }
+.no-new-stores { padding: 24px; text-align: center; }
