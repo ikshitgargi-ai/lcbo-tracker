@@ -5277,6 +5277,487 @@ def api_crm_dashboard():
     })
 
 
+# ======================================================================================
+# ============================== SPRINT 2 BACKEND ======================================
+#
+# Endpoints supporting commercial-grade UX features:
+#   - /api/crm/sku-trend/<sku> — daily store_count + on_hand for time-series chart
+#   - /api/crm/store-trend/<store_number> — daily history for one store
+#   - /api/crm/wow-deltas — WoW / MoM / YoY comparison KPIs
+#   - /api/crm/nearby — stores within radius of (lat,lng), sorted by distance
+#                       (with opportunity score for the rep)
+#   - /api/ai/ask — Claude-powered natural-language assistant (NL → SQL → answer)
+# ======================================================================================
+
+
+@app.route('/api/crm/sku-trend/<sku>', methods=['GET'])
+def api_crm_sku_trend(sku):
+    """Daily aggregates for a SKU over the last N days (default 90).
+
+    Returns one row per snapshot_date with:
+      store_count (where status='L'), delisting_count, total_on_hand, avg_on_hand
+    """
+    days = int(request.args.get('days', 90))
+    sku_norm = sku.zfill(7)
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    q = f"""
+        SELECT snapshot_date,
+               SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed_count,
+               SUM(CASE WHEN status='D' THEN 1 ELSE 0 END) AS delisting_count,
+               SUM(CASE WHEN status='F' THEN 1 ELSE 0 END) AS fully_delisted_count,
+               COALESCE(SUM(on_hand), 0) AS total_on_hand,
+               COUNT(*) AS row_count
+        FROM sod_inventory
+        WHERE sku = {ph} AND snapshot_date >= {ph}
+        GROUP BY snapshot_date
+        ORDER BY snapshot_date
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, (sku_norm, since))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, (sku_norm, since)).fetchall()
+
+    series = [
+        {
+            'date': str(r[0]),
+            'listed': int(r[1] or 0),
+            'delisting': int(r[2] or 0),
+            'fully_delisted': int(r[3] or 0),
+            'total_on_hand': int(r[4] or 0),
+            'avg_on_hand': round(float(r[4] or 0) / max(int(r[5] or 1), 1), 1),
+        }
+        for r in rows
+    ]
+    brand, name = SOD_TRACKED_SKUS.get(sku_norm, ('', ''))
+    return jsonify({
+        'sku': sku_norm,
+        'brand': brand,
+        'product_name': name,
+        'days': days,
+        'since': since,
+        'series': series,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/store-trend/<int:store_number>', methods=['GET'])
+def api_crm_store_trend(store_number):
+    """Daily snapshot for one store across all tracked SKUs."""
+    days = int(request.args.get('days', 90))
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    if not tracked:
+        return jsonify({'store_number': store_number, 'series': []})
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(tracked))
+    q = f"""
+        SELECT snapshot_date, sku, status, on_hand
+        FROM sod_inventory
+        WHERE store_number = {ph} AND sku IN ({phs}) AND snapshot_date >= {ph}
+        ORDER BY snapshot_date, sku
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, [store_number] + tracked + [since])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, [store_number] + tracked + [since]).fetchall()
+    out = []
+    for r in rows:
+        brand, name = SOD_TRACKED_SKUS.get(r[1], ('', ''))
+        out.append({
+            'date': str(r[0]),
+            'sku': r[1],
+            'brand': brand,
+            'product_name': name,
+            'status': r[2],
+            'on_hand': int(r[3] or 0),
+        })
+    return jsonify({
+        'store_number': store_number,
+        'days': days,
+        'since': since,
+        'series': out,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/wow-deltas', methods=['GET'])
+def api_crm_wow_deltas():
+    """Per-tracked-SKU comparison: latest vs 7d ago vs 30d ago vs 365d ago.
+
+    Useful for dashboard delta badges. Each metric is the # of stores at status='L'
+    plus the total on_hand at that snapshot.
+    """
+    today = _toronto_today()
+    targets = {
+        'today': today.isoformat(),
+        'wow': (today - timedelta(days=7)).isoformat(),
+        'mom': (today - timedelta(days=30)).isoformat(),
+        'yoy': (today - timedelta(days=365)).isoformat(),
+    }
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    if not tracked:
+        return jsonify({})
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    def closest_snapshot(target_date_str):
+        """Return the latest snapshot_date <= target_date_str, or None."""
+        q = f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE snapshot_date <= {ph}"
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(q, (target_date_str,))
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(q, (target_date_str,)).fetchone()
+        return str(r[0]) if r and r[0] else None
+
+    snapshots = {k: closest_snapshot(v) for k, v in targets.items()}
+
+    def metrics_at(snap_date):
+        if not snap_date:
+            return {}
+        phs = ','.join([ph] * len(tracked))
+        q = f"""
+            SELECT sku,
+                   SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed,
+                   COALESCE(SUM(on_hand), 0) AS oh
+            FROM sod_inventory
+            WHERE snapshot_date = {ph} AND sku IN ({phs})
+            GROUP BY sku
+        """
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(q, [snap_date] + tracked)
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = db.execute(q, [snap_date] + tracked).fetchall()
+        return {r[0]: {'listed': int(r[1] or 0), 'on_hand': int(r[2] or 0)} for r in rows}
+
+    by_window = {k: metrics_at(v) for k, v in snapshots.items()}
+
+    def delta(now, then):
+        if then == 0:
+            return {'abs': now, 'pct': None}
+        return {'abs': now - then, 'pct': round(100 * (now - then) / then, 1)}
+
+    out = []
+    for sku in tracked:
+        brand, pname = SOD_TRACKED_SKUS[sku]
+        latest = by_window['today'].get(sku, {'listed': 0, 'on_hand': 0})
+        wow = by_window['wow'].get(sku, {'listed': 0, 'on_hand': 0})
+        mom = by_window['mom'].get(sku, {'listed': 0, 'on_hand': 0})
+        yoy = by_window['yoy'].get(sku, {'listed': 0, 'on_hand': 0})
+        out.append({
+            'sku': sku, 'brand': brand, 'product_name': pname,
+            'now': latest,
+            'wow': {'listed_delta': delta(latest['listed'], wow['listed']),
+                    'on_hand_delta': delta(latest['on_hand'], wow['on_hand']),
+                    'baseline_snapshot': snapshots['wow']},
+            'mom': {'listed_delta': delta(latest['listed'], mom['listed']),
+                    'on_hand_delta': delta(latest['on_hand'], mom['on_hand']),
+                    'baseline_snapshot': snapshots['mom']},
+            'yoy': {'listed_delta': delta(latest['listed'], yoy['listed']),
+                    'on_hand_delta': delta(latest['on_hand'], yoy['on_hand']),
+                    'baseline_snapshot': snapshots['yoy']},
+        })
+    return jsonify({
+        'snapshots': snapshots,
+        'tracked': out,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/nearby', methods=['GET'])
+def api_crm_nearby():
+    """Stores near a given lat/lng, sorted by distance.
+
+    Query params:
+      lat, lng (required, floats)
+      radius_km (default 15)
+      limit (default 25)
+      sku (optional) — filters to stores carrying this tracked SKU; result includes
+        on_hand and status; non-listed stores get an opportunity_score for pitches
+    """
+    try:
+        lat = float(request.args.get('lat', 0))
+        lng = float(request.args.get('lng', 0))
+    except ValueError:
+        return jsonify({'error': 'lat/lng must be floats'}), 400
+    if lat == 0 or lng == 0:
+        return jsonify({'error': 'lat/lng required and must be non-zero'}), 400
+    radius_km = float(request.args.get('radius_km', 15))
+    limit = int(request.args.get('limit', 25))
+    sku = request.args.get('sku', '').strip()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    # Pull all stores with valid coords; haversine in Python is fine at 766 rows.
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+                   s.priority, s.rep, s.lat, s.lng, s.territory_id,
+                   COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+            FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE s.lat <> 0 AND s.lng <> 0
+        """)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute("""
+            SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+                   s.priority, s.rep, s.lat, s.lng, s.territory_id,
+                   COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+            FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE s.lat <> 0 AND s.lng <> 0
+        """).fetchall()
+
+    # Lookup status for SKU (if requested)
+    sku_status = {}
+    if sku:
+        sku_norm = sku.zfill(7)
+        # Find latest snapshot for this SKU
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s", (sku_norm,)
+            )
+            latest = cur.fetchone()[0]
+            if latest:
+                cur.execute(
+                    "SELECT store_number, status, on_hand FROM sod_inventory "
+                    "WHERE sku = %s AND snapshot_date = %s",
+                    (sku_norm, latest),
+                )
+                sku_status = {r[0]: {'status': r[1], 'on_hand': r[2] or 0} for r in cur.fetchall()}
+            cur.close()
+        else:
+            latest = db.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = ?", (sku_norm,)
+            ).fetchone()[0]
+            if latest:
+                sku_status = {r[0]: {'status': r[1], 'on_hand': r[2] or 0} for r in db.execute(
+                    "SELECT store_number, status, on_hand FROM sod_inventory "
+                    "WHERE sku = ? AND snapshot_date = ?",
+                    (sku_norm, latest),
+                ).fetchall()}
+
+    out = []
+    for r in rows:
+        d = haversine(lat, lng, float(r[8] or 0), float(r[9] or 0))
+        if d > radius_km:
+            continue
+        item = {
+            'id': r[0], 'store_number': r[1], 'account': r[2],
+            'address': r[3], 'city': r[4], 'postal': r[5],
+            'priority': r[6], 'rep': r[7],
+            'lat': r[8], 'lng': r[9],
+            'territory_id': r[10], 'territory_code': r[11],
+            'territory_name': r[12], 'territory_color': r[13],
+            'distance_km': round(d, 2),
+        }
+        if sku:
+            stat = sku_status.get(item['store_number'])
+            if stat:
+                item['sku_status'] = stat['status']
+                item['sku_on_hand'] = stat['on_hand']
+                # Pitch score: prioritize stores where SKU is delisting or low stock
+                if stat['status'] in ('D', 'F'):
+                    item['opportunity_score'] = 60
+                elif stat['on_hand'] <= 1:
+                    item['opportunity_score'] = 50
+                elif stat['on_hand'] <= 3:
+                    item['opportunity_score'] = 25
+                else:
+                    item['opportunity_score'] = 5
+            else:
+                item['sku_status'] = None
+                item['sku_on_hand'] = 0
+                item['opportunity_score'] = 35  # NOT listed = listing opportunity
+        out.append(item)
+
+    out.sort(key=lambda x: x['distance_km'])
+    return jsonify({
+        'origin': {'lat': lat, 'lng': lng},
+        'radius_km': radius_km,
+        'sku': sku.zfill(7) if sku else None,
+        'results': out[:limit],
+        'total_within_radius': len(out),
+    })
+
+
+# ------- AI assistant: Claude-powered NL → SQL/data → narrative -------
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+AI_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')
+
+
+@app.route('/api/ai/ask', methods=['POST'])
+def api_ai_ask():
+    """Claude-powered natural-language query over CRM data.
+
+    Strategy: we ship Claude a SCHEMA + sample data and the user's question; Claude
+    generates a single read-only SQL query (SELECT only); we run it; we ship the
+    result back to Claude for natural-language summarization. Returns:
+      { question, sql, rows, answer, model }
+
+    Safety:
+      - Only SELECT queries allowed (regex-checked + we run on a separate connection
+        with autocommit+timeout)
+      - Only whitelisted tables exposed in the schema prompt
+      - Hard row limit of 1000
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY env var not set'}), 503
+    body = request.get_json(silent=True) or {}
+    question = (body.get('question') or '').strip()
+    if not question or len(question) > 500:
+        return jsonify({'error': 'question must be 1-500 chars'}), 400
+
+    schema = """
+    Tables (PostgreSQL, all read-only):
+
+    sod_inventory(sku TEXT, store_number INT, snapshot_date DATE,
+                  status TEXT 'L'=Listed/'D'=Delisting/'F'=Fully Delisted,
+                  on_hand INT, product_name TEXT)
+    sod_products(sku TEXT PK, product_name TEXT, current_status TEXT,
+                 store_count INT, total_on_hand INT, is_tracked BOOL,
+                 brand TEXT, category TEXT, category_group TEXT)
+    sod_listing_changes(sku TEXT, store_number INT, change_date DATE,
+                        old_status TEXT, new_status TEXT,
+                        change_type TEXT 'NEW_LISTING'/'DELISTED'/'RELISTED'/'STATUS_FLIP'/'BASELINE')
+    stores(id INT, store_number INT UNIQUE, account TEXT, address TEXT, city TEXT,
+           postal TEXT, rep TEXT, priority TEXT,
+           lat REAL, lng REAL, territory_id INT)
+    territories(id INT PK, code TEXT, name TEXT, region TEXT, color TEXT)
+    horeca_accounts(id INT, name TEXT, account_type TEXT,
+                    city TEXT, status TEXT, priority TEXT, territory_id INT)
+    sales_goals(id INT, scope TEXT, scope_key TEXT, period_start DATE,
+                period_end DATE, target_units INT, target_listings INT)
+
+    Tracked SKUs (Anu portfolio): """ + ', '.join(
+        f"'{s}' ({b} {n})" for s, (b, n) in SOD_TRACKED_SKUS.items()
+    ) + """
+
+    Latest snapshot date is in `(SELECT MAX(snapshot_date) FROM sod_inventory)`.
+    """
+
+    system_prompt = (
+        "You are a SQL analyst for the Anu Spirits LCBO CRM. The user asks a question; "
+        "you respond with EXACTLY one read-only SQL SELECT statement that answers it. "
+        "Use Postgres syntax. Do NOT use INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE. "
+        "Keep the result <= 50 rows (use LIMIT). Output ONLY the SQL — no commentary, "
+        "no markdown, no code fences. The schema is:\n\n" + schema
+    )
+
+    # Step 1: generate SQL
+    try:
+        r = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': AI_MODEL,
+                'max_tokens': 1024,
+                'system': system_prompt,
+                'messages': [{'role': 'user', 'content': question}],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        sql = r.json()['content'][0]['text'].strip()
+        # Strip code-fence if Claude added one
+        if sql.startswith('```'):
+            sql = re.sub(r'^```\w*\n?', '', sql)
+            sql = re.sub(r'\n?```$', '', sql).strip()
+    except Exception as e:
+        return jsonify({'error': f'AI generation failed: {e}'}), 502
+
+    # Safety: SELECT-only
+    sql_lower = sql.lower().lstrip()
+    if not sql_lower.startswith('select') and not sql_lower.startswith('with'):
+        return jsonify({'error': 'AI returned non-SELECT', 'sql': sql}), 422
+    forbidden = ['insert ', 'update ', 'delete ', 'drop ', 'alter ', 'truncate ', 'create ', 'grant ', 'revoke ', '; ', ';\n']
+    if any(f in sql_lower for f in forbidden):
+        return jsonify({'error': 'AI returned dangerous SQL', 'sql': sql}), 422
+
+    # Run on a fresh autocommit connection so we can't poison the request transaction.
+    rows: list = []
+    cols: list = []
+    try:
+        if USE_POSTGRES:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute('SET statement_timeout = 5000')
+                cur.execute(sql)
+                rows = cur.fetchmany(1000)
+                cols = [d[0] for d in cur.description] if cur.description else []
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.execute(sql)
+            rows = cur.fetchmany(1000)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            conn.close()
+        rows_dict = [
+            {cols[i]: _json_safe(v) for i, v in enumerate(row)} for row in rows
+        ]
+    except Exception as e:
+        return jsonify({'error': f'SQL execution failed: {e}', 'sql': sql}), 422
+
+    # Step 2: ask Claude to summarize
+    try:
+        summary_msg = (
+            f"User asked: {question}\n\n"
+            f"SQL run: {sql}\n\n"
+            f"Result ({len(rows_dict)} rows): {json.dumps(rows_dict[:30], default=str)}\n\n"
+            f"Write a 2-3 sentence answer in plain English. Quote specific numbers. "
+            f"Don't recommend actions unless asked."
+        )
+        r2 = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': AI_MODEL,
+                'max_tokens': 512,
+                'messages': [{'role': 'user', 'content': summary_msg}],
+            },
+            timeout=30,
+        )
+        r2.raise_for_status()
+        answer = r2.json()['content'][0]['text'].strip()
+    except Exception as e:
+        answer = f"(AI summarization failed: {e})"
+
+    return jsonify({
+        'question': question,
+        'sql': sql,
+        'rows': rows_dict,
+        'columns': cols,
+        'row_count': len(rows_dict),
+        'answer': answer,
+        'model': AI_MODEL,
+    })
+
+
 # ------- Optional daily lcbo.com scrape (dual-source ingest) -------
 _lcbo_scheduler = None
 
