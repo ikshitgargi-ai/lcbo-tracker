@@ -55,6 +55,13 @@ function showView(view) {
   if (view === 'reorder') { loadTrackedProductOptions(); loadReorderReport(); }
   if (view === 'sod') { loadSodStatus(); loadSodProducts(); loadSodListingChanges(); }
   if (view === 'reports') { loadReport('daily'); }
+  if (view === 'crm') { loadCrmDashboard(); }
+  if (view === 'map') { initMap(); }
+  if (view === 'oosrisk') { loadCrmFilterOptions(); loadOos(); }
+  if (view === 'opps') { loadCrmFilterOptions(); loadOpportunitiesFull(); }
+  if (view === 'goals') { loadGoals(); }
+  if (view === 'horeca') { loadCrmFilterOptions(); loadHoreca(); }
+  if (view === 'territories') { loadTerritories(); }
 }
 
 // === LIVE INVENTORY / GAP / REORDER ===
@@ -1326,4 +1333,454 @@ async function loadRepReport(btn) {
   } catch (e) {
     container.innerHTML = `<p class="muted">Failed to load rep report: ${esc(e.message)}</p>`;
   }
+}
+
+
+// ====================================================================
+// ============================ CRM VIEWS =============================
+// ====================================================================
+
+let _crmFilterOptionsLoaded = false;
+let _crmTerritoriesCache = null;
+let _crmTrackedSkusCache = null;
+
+async function loadCrmFilterOptions() {
+  // Only need to do this once per page load
+  if (_crmFilterOptionsLoaded) return;
+  try {
+    const [terrRes, skuRes] = await Promise.all([
+      fetch('/api/crm/territories'),
+      fetch('/api/sod/products?tracked=1'),
+    ]);
+    _crmTerritoriesCache = await terrRes.json();
+    const skuList = await skuRes.json();
+    _crmTrackedSkusCache = (skuList.products || skuList || []).map(p => ({
+      sku: p.sku,
+      label: `${p.brand || ''} ${p.product_name || p.name || ''} (${p.sku})`.trim(),
+    }));
+
+    const terrOpts = '<option value="">All territories</option>' +
+      _crmTerritoriesCache.map(t => `<option value="${t.id}">${esc(t.name)} (${t.store_count})</option>`).join('');
+    ['oosTerr','mapTerritory','oppsTerr','oppsFullTerr','hFilterTerr'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.innerHTML = terrOpts;
+    });
+    const skuOpts = _crmTrackedSkusCache.map(s => `<option value="${s.sku}">${esc(s.label)}</option>`).join('');
+    const skuOptsAll = '<option value="">All tracked SKUs</option>' + skuOpts;
+    ['oosSku','oppsSku','oppsFullSku','mapSku'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = (id === 'oppsFullSku' || id === 'oppsSku') ? skuOpts : skuOptsAll;
+    });
+    _crmFilterOptionsLoaded = true;
+  } catch(e) { console.warn('loadCrmFilterOptions', e); }
+}
+
+// ====== CRM Dashboard ======
+async function loadCrmDashboard() {
+  await loadCrmFilterOptions();
+  try {
+    const [dashRes, digestRes] = await Promise.all([
+      fetch('/api/crm/dashboard'),
+      fetch('/api/crm/listing-digest?days=14'),
+    ]);
+    const d = await dashRes.json();
+    const dig = await digestRes.json();
+    document.getElementById('kpiSnapshot').textContent = d.latest_snapshot || '—';
+    document.getElementById('kpiOos').textContent = d.oos_brink_count;
+    document.getElementById('kpiNewListings').textContent =
+      (d.digest_last_7_days?.NEW_LISTING || 0) + (d.digest_last_7_days?.RELISTED || 0);
+    document.getElementById('kpiDelistings').textContent =
+      (d.digest_last_7_days?.DELISTED || 0);
+
+    // Tracked rollup table
+    const tt = document.getElementById('crmTrackedTable');
+    const _statusLabel = (s) => ({L:'Listed', D:'Delisting', F:'Delisted'})[s] || s;
+    tt.innerHTML = `<table class="data-table"><thead><tr>
+        <th>SKU</th><th>Brand</th><th>Product</th>
+        <th>Status</th><th>Stores</th><th>Total On-Hand</th>
+      </tr></thead><tbody>${
+        (d.tracked_sku_rollup||[]).map(p => `<tr>
+          <td><code>${esc(p.sku)}</code></td>
+          <td>${esc(p.brand)}</td>
+          <td>${esc(p.product_name)}</td>
+          <td><span class="status-badge status-${(p.current_status||'L').toLowerCase()=='l'?'listed':((p.current_status||'').toLowerCase()=='d'?'delisting':'delisted')}">${esc(_statusLabel(p.current_status))}</span></td>
+          <td>${p.store_count}</td>
+          <td>${p.total_on_hand}</td>
+        </tr>`).join('') || '<tr><td colspan="6" class="muted">No SOD data yet — wait for first sync.</td></tr>'
+      }</tbody></table>`;
+
+    // Territory list
+    const tl = document.getElementById('crmTerritoryList');
+    tl.innerHTML = (d.territories||[]).map(t => `
+      <div class="terr-row" style="border-left:5px solid ${esc(t.color||'#888')}">
+        <div class="terr-name">${esc(t.name)}</div>
+        <div class="terr-count">${t.store_count} stores</div>
+      </div>`).join('') || '<p class="muted">No territories yet.</p>';
+
+    // Digest
+    const dt = document.getElementById('crmDigestTable');
+    const _ct = (c) => ({NEW_LISTING:'New', DELISTED:'Delisted', RELISTED:'Relisted', BASELINE:'Baseline', STATUS_FLIP:'Flip'})[c] || c;
+    dt.innerHTML = `<table class="data-table"><thead><tr>
+        <th>Date</th><th>Type</th><th>SKU</th><th>Product</th><th>Old → New</th>
+      </tr></thead><tbody>${
+        (dig.changes||[]).slice(0, 50).map(c => `<tr ${c.is_tracked?'class="row-tracked"':''}>
+          <td>${esc(c.change_date)}</td>
+          <td><span class="change-badge change-${esc(c.change_type)}">${esc(_ct(c.change_type))}</span></td>
+          <td><code>${esc(c.sku)}</code></td>
+          <td>${esc(c.product_name||'').slice(0,40)}</td>
+          <td>${esc(c.old_status||'-')} &rarr; ${esc(c.new_status||'-')}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">No changes in window.</td></tr>'
+      }</tbody></table>`;
+
+    // Opportunities (compact)
+    loadOpportunitiesCompact();
+  } catch(e) {
+    console.error('loadCrmDashboard', e);
+  }
+}
+
+async function loadOpportunitiesCompact() {
+  // Compact version embedded in CRM dashboard
+  const sku = document.getElementById('oppsSku')?.value || '';
+  const tid = document.getElementById('oppsTerr')?.value || '';
+  const thr = document.getElementById('oppsThreshold')?.value || 3;
+  const cont = document.getElementById('oppsTable');
+  if (!cont) return;
+  cont.innerHTML = '<p class="muted">Loading opportunities…</p>';
+  try {
+    const qs = new URLSearchParams();
+    if (sku) qs.set('sku', sku);
+    if (tid) qs.set('territory_id', tid);
+    qs.set('slow_threshold', thr);
+    qs.set('limit', '50');
+    const r = await fetch('/api/crm/opportunities?' + qs.toString());
+    const data = await r.json();
+    cont.innerHTML = renderOppsTable(data);
+  } catch(e) { cont.innerHTML = '<p class="text-bad">Failed to load: ' + esc(e.message) + '</p>'; }
+}
+
+async function loadOpportunitiesFull() {
+  await loadCrmFilterOptions();
+  const sku = document.getElementById('oppsFullSku')?.value || '';
+  const tid = document.getElementById('oppsFullTerr')?.value || '';
+  const thr = document.getElementById('oppsFullThreshold')?.value || 3;
+  const cont = document.getElementById('oppsFullTable');
+  if (!cont) return;
+  cont.innerHTML = '<p class="muted">Loading opportunities…</p>';
+  try {
+    const qs = new URLSearchParams();
+    if (sku) qs.set('sku', sku);
+    if (tid) qs.set('territory_id', tid);
+    qs.set('slow_threshold', thr);
+    qs.set('limit', '500');
+    const r = await fetch('/api/crm/opportunities?' + qs.toString());
+    const data = await r.json();
+    document.getElementById('oppsCount').textContent = `${data.length} opportunities`;
+    cont.innerHTML = renderOppsTable(data);
+  } catch(e) { cont.innerHTML = '<p class="text-bad">Failed: ' + esc(e.message) + '</p>'; }
+}
+
+function renderOppsTable(data) {
+  if (!data || !data.length) return '<p class="muted">No replacement opportunities right now. Run a SOD sync or widen the slow threshold.</p>';
+  return `<table class="data-table"><thead><tr>
+    <th>Score</th><th>Pitch SKU</th><th>Slow Competitor</th><th>Category</th>
+    <th>Store #</th><th>City</th><th>Territory</th>
+    <th>Comp Status</th><th>Comp On-Hand</th>
+  </tr></thead><tbody>${data.map(o => `<tr>
+    <td><strong style="color:${o.opportunity_score>=50?'#d63031':o.opportunity_score>=25?'#e17055':'#636e72'}">${o.opportunity_score}</strong></td>
+    <td><strong>${esc(o.our_brand)} ${esc(o.our_product)}</strong><br><code class="muted-small">${esc(o.our_sku)}</code></td>
+    <td>${esc((o.competitor_name||'').slice(0,32))}<br><code class="muted-small">${esc(o.competitor_sku)}</code></td>
+    <td>${esc(o.category)}</td>
+    <td>#${o.store_number}</td>
+    <td>${esc(o.city||'')}</td>
+    <td><span class="terr-pill" style="background:${esc(o.territory_color||'#888')}">${esc(o.territory_name||'')}</span></td>
+    <td><span class="status-badge status-${o.competitor_status==='L'?'listed':o.competitor_status==='D'?'delisting':'delisted'}">${esc(o.competitor_status)}</span></td>
+    <td>${o.competitor_on_hand}</td>
+  </tr>`).join('')}</tbody></table>`;
+}
+
+// ====== OOS Risk ======
+async function loadOos() {
+  await loadCrmFilterOptions();
+  const sku = document.getElementById('oosSku')?.value || '';
+  const tid = document.getElementById('oosTerr')?.value || '';
+  const thr = document.getElementById('oosThreshold')?.value || 2;
+  const cont = document.getElementById('oosTable');
+  if (!cont) return;
+  cont.innerHTML = '<p class="muted">Scanning…</p>';
+  try {
+    const qs = new URLSearchParams();
+    if (sku) qs.set('sku', sku);
+    if (tid) qs.set('territory_id', tid);
+    qs.set('threshold', thr);
+    const r = await fetch('/api/crm/oos-risk?' + qs.toString());
+    const data = await r.json();
+    if (!data.length) { cont.innerHTML = '<p class="muted">No stores at OOS risk. Excellent!</p>'; return; }
+    cont.innerHTML = `<table class="data-table"><thead><tr>
+      <th>Severity</th><th>SKU</th><th>Product</th>
+      <th>Store #</th><th>City</th><th>Territory</th>
+      <th>On-Hand</th><th>Snapshot</th>
+    </tr></thead><tbody>${data.map(r => `<tr>
+      <td><span class="sev-${esc(r.severity)}">${esc(r.severity.toUpperCase())}</span></td>
+      <td><code>${esc(r.sku)}</code></td>
+      <td>${esc(r.product_name||'').slice(0,32)}</td>
+      <td>#${r.store_number}</td>
+      <td>${esc(r.city||'')}</td>
+      <td><span class="terr-pill" style="background:${esc(r.territory_color||'#888')}">${esc(r.territory_name||'')}</span></td>
+      <td><strong style="color:${(r.on_hand||0)===0?'#d63031':(r.on_hand||0)<=1?'#e17055':'#fdcb6e'}">${r.on_hand}</strong></td>
+      <td>${esc(r.snapshot_date)}</td>
+    </tr>`).join('')}</tbody></table>`;
+  } catch(e) { cont.innerHTML = '<p class="text-bad">Failed: ' + esc(e.message) + '</p>'; }
+}
+
+// ====== Map (Leaflet) ======
+let _leafletMap = null, _leafletLayer = null;
+async function initMap() {
+  await loadCrmFilterOptions();
+  if (typeof L === 'undefined') {
+    setTimeout(initMap, 200);  // wait for Leaflet to load
+    return;
+  }
+  if (!_leafletMap) {
+    _leafletMap = L.map('storeMap').setView([43.7, -79.4], 8);  // Toronto-centered
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 18,
+    }).addTo(_leafletMap);
+  }
+  reloadMap();
+}
+
+async function reloadMap() {
+  if (!_leafletMap || typeof L === 'undefined') return;
+  const tid = document.getElementById('mapTerritory')?.value || '';
+  const colorBy = document.getElementById('mapColorBy')?.value || 'territory';
+  const sku = document.getElementById('mapSku')?.value || '';
+
+  if (_leafletLayer) { _leafletLayer.remove(); _leafletLayer = null; }
+  const qs = new URLSearchParams();
+  if (tid) qs.set('territory_id', tid);
+  qs.set('with_coords_only', '1');
+  let stores = [];
+  let listingMap = {};  // store_number -> status (for tracked sku)
+  try {
+    const sr = await fetch('/api/crm/stores?' + qs.toString());
+    stores = await sr.json();
+    if (colorBy === 'status' && sku) {
+      // get listing status for the chosen SKU
+      const ir = await fetch('/api/sod/inventory?sku=' + sku);
+      const inv = await ir.json();
+      (inv.rows || inv || []).forEach(r => { listingMap[r.store_number] = r.status; });
+    }
+  } catch(e) { console.warn('reloadMap fetch', e); }
+
+  document.getElementById('mapCount').textContent = `${stores.length} stores plotted`;
+
+  const markers = [];
+  const grp = L.layerGroup();
+  stores.forEach(s => {
+    if (!s.lat || !s.lng) return;
+    let color = s.territory_color || '#888';
+    let popup = `<strong>#${s.store_number} — ${esc(s.account||'')}</strong><br>
+      ${esc(s.address||'')}<br>${esc(s.city||'')} ${esc(s.postal||'')}<br>
+      Territory: <span style="color:${color}">${esc(s.territory_name||'Unassigned')}</span><br>
+      Rep: ${esc(s.rep||'—')} · ${esc(s.priority||'')}`;
+    if (colorBy === 'status' && sku) {
+      const st = listingMap[s.store_number];
+      color = st === 'L' ? '#00b894' : st === 'D' ? '#fdcb6e' : st === 'F' ? '#d63031' : '#bdc3c7';
+      popup += `<br><br>Status for SKU ${sku}: <strong>${st || 'Not Listed'}</strong>`;
+    }
+    const m = L.circleMarker([s.lat, s.lng], {
+      radius: 6, color, fillColor: color, fillOpacity: 0.7, weight: 1,
+    }).bindPopup(popup);
+    grp.addLayer(m);
+    markers.push(m);
+  });
+  grp.addTo(_leafletMap);
+  _leafletLayer = grp;
+  if (markers.length) {
+    const fg = L.featureGroup(markers);
+    try { _leafletMap.fitBounds(fg.getBounds().pad(0.1)); } catch(e) {}
+  }
+
+  // Legend
+  const lg = document.getElementById('mapLegend');
+  if (colorBy === 'territory') {
+    lg.innerHTML = (_crmTerritoriesCache||[]).map(t =>
+      `<span class="legend-item"><span class="dot" style="background:${esc(t.color)}"></span> ${esc(t.name)} (${t.store_count})</span>`
+    ).join('');
+  } else {
+    lg.innerHTML = `
+      <span class="legend-item"><span class="dot" style="background:#00b894"></span> Listed</span>
+      <span class="legend-item"><span class="dot" style="background:#fdcb6e"></span> Delisting</span>
+      <span class="legend-item"><span class="dot" style="background:#d63031"></span> Delisted</span>
+      <span class="legend-item"><span class="dot" style="background:#bdc3c7"></span> Not Listed</span>
+    `;
+  }
+}
+
+// ====== Goals ======
+async function loadGoals() {
+  try {
+    const [list, prog] = await Promise.all([
+      fetch('/api/crm/goals').then(r=>r.json()),
+      fetch('/api/crm/goals/progress').then(r=>r.json()),
+    ]);
+    const progMap = {};
+    prog.forEach(p => { progMap[p.id] = p; });
+    const cont = document.getElementById('goalsTable');
+    if (!list.length) { cont.innerHTML = '<p class="muted">No goals yet — add one above.</p>'; return; }
+    cont.innerHTML = `<table class="data-table"><thead><tr>
+      <th>Scope</th><th>Key</th><th>Period</th>
+      <th>Listings (achieved/target)</th><th>%</th>
+      <th>Units (achieved/target)</th><th>%</th>
+      <th>Notes</th><th></th>
+    </tr></thead><tbody>${list.map(g => {
+      const p = progMap[g.id] || {};
+      return `<tr>
+        <td>${esc(g.scope)}</td>
+        <td><code>${esc(g.scope_key)}</code></td>
+        <td>${esc(g.period_start)} → ${esc(g.period_end)}</td>
+        <td>${p.achieved_listings ?? '—'} / ${g.target_listings}</td>
+        <td>${renderProgressBar(p.pct_listings)}</td>
+        <td>${p.achieved_units ?? '—'} / ${g.target_units}</td>
+        <td>${renderProgressBar(p.pct_units)}</td>
+        <td>${esc(g.notes||'')}</td>
+        <td><button class="btn-link" onclick="deleteGoal(${g.id})">Delete</button></td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+  } catch(e) { console.warn('loadGoals', e); }
+}
+
+function renderProgressBar(pct) {
+  if (pct == null) return '—';
+  const clamped = Math.max(0, Math.min(100, pct));
+  const color = pct >= 100 ? '#00b894' : pct >= 75 ? '#a3d977' : pct >= 50 ? '#fdcb6e' : pct >= 25 ? '#e17055' : '#d63031';
+  return `<div class="progress-bar"><div class="progress-fill" style="width:${clamped}%;background:${color}"></div><span class="progress-label">${pct}%</span></div>`;
+}
+
+async function createGoal() {
+  const body = {
+    scope: document.getElementById('goalScope').value,
+    scope_key: document.getElementById('goalKey').value.trim(),
+    period_start: document.getElementById('goalStart').value,
+    period_end: document.getElementById('goalEnd').value,
+    target_listings: parseInt(document.getElementById('goalListings').value || 0),
+    target_units: parseInt(document.getElementById('goalUnits').value || 0),
+    target_revenue: parseFloat(document.getElementById('goalRevenue').value || 0),
+    notes: document.getElementById('goalNotes').value || '',
+  };
+  try {
+    const r = await fetch('/api/crm/goals', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).error || 'failed');
+    document.getElementById('goalForm').reset();
+    loadGoals();
+  } catch(e) { alert('Failed to save goal: ' + e.message); }
+}
+
+async function deleteGoal(id) {
+  if (!confirm('Delete this goal?')) return;
+  await fetch('/api/crm/goals/' + id, {method:'DELETE'});
+  loadGoals();
+}
+
+// ====== HORECA ======
+async function loadHoreca() {
+  await loadCrmFilterOptions();
+  const t = document.getElementById('hFilterType').value;
+  const s = document.getElementById('hFilterStatus').value;
+  const tid = document.getElementById('hFilterTerr').value;
+  const qs = new URLSearchParams();
+  if (t) qs.set('type', t);
+  if (s) qs.set('status', s);
+  if (tid) qs.set('territory_id', tid);
+  try {
+    const r = await fetch('/api/crm/horeca?' + qs.toString());
+    const data = await r.json();
+    const cont = document.getElementById('horecaTable');
+    if (!data.length) { cont.innerHTML = '<p class="muted">No HORECA accounts yet — add one above.</p>'; return; }
+    cont.innerHTML = `<table class="data-table"><thead><tr>
+      <th>Name</th><th>Type</th><th>City</th><th>Territory</th>
+      <th>Contact</th><th>Phone</th><th>Status</th><th>Priority</th>
+      <th>Last Visit</th><th>Next Visit</th><th>Products</th><th></th>
+    </tr></thead><tbody>${data.map(h => `<tr>
+      <td><strong>${esc(h.name)}</strong></td>
+      <td>${esc(h.account_type)}</td>
+      <td>${esc(h.city||'')}</td>
+      <td><span class="terr-pill" style="background:${esc(h.territory_color||'#888')}">${esc(h.territory_name||'')}</span></td>
+      <td>${esc(h.contact_name||'')} <span class="muted-small">${esc(h.contact_title||'')}</span></td>
+      <td>${esc(h.phone||'')}</td>
+      <td><span class="status-pill status-${esc(h.status)}">${esc(h.status)}</span></td>
+      <td>${esc(h.priority||'')}</td>
+      <td>${esc(h.last_visit||'')}</td>
+      <td>${esc(h.next_visit||'')}</td>
+      <td>${esc((h.products_carried||'').slice(0,30))}</td>
+      <td><button class="btn-link text-bad" onclick="deleteHoreca(${h.id})">Delete</button></td>
+    </tr>`).join('')}</tbody></table>`;
+  } catch(e) { console.warn('loadHoreca', e); }
+}
+
+async function createHoreca() {
+  const body = {
+    name: document.getElementById('hName').value.trim(),
+    account_type: document.getElementById('hType').value,
+    address: document.getElementById('hAddress').value,
+    city: document.getElementById('hCity').value,
+    postal: document.getElementById('hPostal').value,
+    phone: document.getElementById('hPhone').value,
+    email: document.getElementById('hEmail').value,
+    contact_name: document.getElementById('hContact').value,
+    contact_title: document.getElementById('hTitle').value,
+    status: document.getElementById('hStatus').value,
+    priority: document.getElementById('hPriority').value,
+    products_carried: document.getElementById('hProducts').value,
+    notes: document.getElementById('hNotes').value,
+  };
+  try {
+    const r = await fetch('/api/crm/horeca', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).error || 'failed');
+    document.getElementById('horecaForm').reset();
+    loadHoreca();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
+
+async function deleteHoreca(id) {
+  if (!confirm('Delete this account?')) return;
+  await fetch('/api/crm/horeca/' + id, {method:'DELETE'});
+  loadHoreca();
+}
+
+// ====== Territories ======
+async function loadTerritories() {
+  try {
+    const r = await fetch('/api/crm/territories');
+    const data = await r.json();
+    const cont = document.getElementById('terrTable');
+    cont.innerHTML = `<table class="data-table"><thead><tr>
+      <th></th><th>Code</th><th>Name</th><th>Region</th>
+      <th>Stores</th><th>HORECA</th><th>FSA Prefixes</th><th>Rep</th>
+    </tr></thead><tbody>${data.map(t => `<tr>
+      <td><span class="dot" style="background:${esc(t.color)}"></span></td>
+      <td><code>${esc(t.code)}</code></td>
+      <td><strong>${esc(t.name)}</strong></td>
+      <td>${esc(t.region||'')}</td>
+      <td>${t.store_count}</td>
+      <td>${t.horeca_count}</td>
+      <td><code class="muted-small">${esc(t.fsa_prefixes||'')}</code></td>
+      <td><input type="text" data-tid="${t.id}" value="${esc(t.rep_name||'')}" onblur="setTerritoryRep(this)" placeholder="(unassigned)"></td>
+    </tr>`).join('')}</tbody></table>`;
+  } catch(e) { console.warn('loadTerritories', e); }
+}
+
+async function setTerritoryRep(input) {
+  const tid = input.dataset.tid;
+  const rep = input.value.trim();
+  await fetch('/api/crm/territories/' + tid, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rep_name: rep})});
+}
+
+async function reassignTerritories() {
+  if (!confirm('Re-run FSA-based auto-assignment for all stores?')) return;
+  const r = await fetch('/api/crm/territories/reassign', {method:'POST'});
+  const data = await r.json();
+  alert(`Reassigned ${data.reassigned} stores.`);
+  loadTerritories();
 }

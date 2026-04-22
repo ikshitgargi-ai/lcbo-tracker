@@ -9,6 +9,11 @@
 <link rel="manifest" href="/static/manifest.json">
 <title>Anu Spirits — LCBO Tracker</title>
 <link rel="stylesheet" href="/static/style.css">
+<!-- Leaflet for the Map view (free OpenStreetMap tiles, no API key) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 </head>
 <body>
 <div id="app">
@@ -50,6 +55,27 @@
       </button>
       <button class="nav-btn" data-view="reports" onclick="showView('reports')">
         <span class="icon">&#128196;</span><span class="nav-label">Reports</span>
+      </button>
+      <button class="nav-btn" data-view="crm" onclick="showView('crm')">
+        <span class="icon">&#127919;</span><span class="nav-label">CRM</span>
+      </button>
+      <button class="nav-btn" data-view="map" onclick="showView('map')">
+        <span class="icon">&#128205;</span><span class="nav-label">Map</span>
+      </button>
+      <button class="nav-btn" data-view="oosrisk" onclick="showView('oosrisk')">
+        <span class="icon">&#9888;</span><span class="nav-label">OOS Risk</span>
+      </button>
+      <button class="nav-btn" data-view="opps" onclick="showView('opps')">
+        <span class="icon">&#128176;</span><span class="nav-label">Opportunities+</span>
+      </button>
+      <button class="nav-btn" data-view="goals" onclick="showView('goals')">
+        <span class="icon">&#127919;</span><span class="nav-label">Goals</span>
+      </button>
+      <button class="nav-btn" data-view="horeca" onclick="showView('horeca')">
+        <span class="icon">&#127863;</span><span class="nav-label">HORECA</span>
+      </button>
+      <button class="nav-btn" data-view="territories" onclick="showView('territories')">
+        <span class="icon">&#127760;</span><span class="nav-label">Territories</span>
       </button>
       <button class="nav-btn" data-view="routes" onclick="showView('routes')">
         <span class="icon">&#128506;</span><span class="nav-label">Routes</span>
@@ -467,6 +493,243 @@
         <h3>&#128279; Google Sheets Live Sync</h3>
         <p style="margin-bottom:12px">Paste in Google Sheets cell A1 — auto-refreshes hourly:</p>
         <code class="code-block">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
+      </div>
+    </section>
+
+    <!-- ===== CRM DASHBOARD ===== -->
+    <section id="view-crm" class="view">
+      <div class="view-header">
+        <h1>CRM Command Center</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">One-glance view of tracked products, OOS risk, listing changes, territory health. Pulls from SOD daily feed + LCBO.com live data.</p>
+
+      <div id="crmKpiGrid" class="crm-kpi-grid">
+        <div class="kpi-card"><div class="kpi-label">Latest SOD Snapshot</div><div class="kpi-value" id="kpiSnapshot">—</div></div>
+        <div class="kpi-card alert"><div class="kpi-label">Brink-of-OOS Stores</div><div class="kpi-value" id="kpiOos">—</div><div class="kpi-sub">Tracked SKU listed but on_hand &le; 2</div></div>
+        <div class="kpi-card good"><div class="kpi-label">New Listings (7d)</div><div class="kpi-value" id="kpiNewListings">—</div></div>
+        <div class="kpi-card warn"><div class="kpi-label">Delistings (7d)</div><div class="kpi-value" id="kpiDelistings">—</div></div>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Tracked Product Rollup</h3>
+        <div id="crmTrackedTable" class="scroll-x"></div>
+      </div>
+
+      <div class="crm-2col">
+        <div class="card crm-card">
+          <h3>Territory Coverage</h3>
+          <div id="crmTerritoryList"></div>
+        </div>
+        <div class="card crm-card">
+          <h3>Recent Listing Changes (last 14 days)</h3>
+          <div id="crmDigestTable" class="scroll-x"></div>
+        </div>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Top Replacement Opportunities <span class="muted-small">(slow-moving competitors where we're not listed)</span></h3>
+        <div class="row-controls">
+          <label>For SKU:
+            <select id="oppsSku" onchange="loadOpportunitiesCompact()"></select>
+          </label>
+          <label>Territory:
+            <select id="oppsTerr" onchange="loadOpportunitiesCompact()"><option value="">All</option></select>
+          </label>
+          <label>Slow if on_hand &le;
+            <input type="number" id="oppsThreshold" value="3" min="0" max="20" style="width:60px" onchange="loadOpportunitiesCompact()">
+          </label>
+        </div>
+        <div id="oppsTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== MAP VIEW ===== -->
+    <section id="view-map" class="view">
+      <div class="view-header">
+        <h1>Store Map</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">All LCBO stores in your CRM, colored by territory. Click a marker for details. Filter by territory or by tracked-SKU listing status.</p>
+      <div class="row-controls">
+        <label>Territory:
+          <select id="mapTerritory" onchange="reloadMap()"><option value="">All territories</option></select>
+        </label>
+        <label>Color by:
+          <select id="mapColorBy" onchange="reloadMap()">
+            <option value="territory">Territory</option>
+            <option value="status">Tracked-SKU Status</option>
+          </select>
+        </label>
+        <label>SKU:
+          <select id="mapSku" onchange="reloadMap()"></select>
+        </label>
+        <button class="btn-secondary" onclick="reloadMap()">&#x21bb; Reload</button>
+        <span id="mapCount" class="muted-small"></span>
+      </div>
+      <div id="storeMap" class="map-container"></div>
+      <div class="map-legend" id="mapLegend"></div>
+    </section>
+
+    <!-- ===== OOS RISK ===== -->
+    <section id="view-oosrisk" class="view">
+      <div class="view-header"><h1>Out-of-Stock Risk Watch</h1></div>
+      <p class="view-desc">Stores carrying our tracked SKU where on-hand stock is at or below threshold. Critical = 0 units, High = 1, Medium = 2.</p>
+      <div class="row-controls">
+        <label>SKU:
+          <select id="oosSku" onchange="loadOos()"></select>
+        </label>
+        <label>Territory:
+          <select id="oosTerr" onchange="loadOos()"><option value="">All</option></select>
+        </label>
+        <label>Threshold:
+          <input type="number" id="oosThreshold" value="2" min="0" max="20" style="width:60px" onchange="loadOos()">
+        </label>
+        <button class="btn-secondary" onclick="loadOos()">&#x21bb; Refresh</button>
+      </div>
+      <div id="oosTable" class="scroll-x"></div>
+    </section>
+
+    <!-- ===== OPPORTUNITIES (replacement finder) ===== -->
+    <section id="view-opps" class="view">
+      <div class="view-header"><h1>Opportunities — Replace Slow Movers</h1></div>
+      <p class="view-desc">For each tracked SKU, find stores where a competitor product in the same category is slow-moving (on_hand low) or being delisted. These are your highest-conversion pitch targets — same shelf, same category, our SKU bumps theirs.</p>
+      <div class="row-controls">
+        <label>Pitch our SKU:
+          <select id="oppsFullSku" onchange="loadOpportunitiesFull()"></select>
+        </label>
+        <label>Territory:
+          <select id="oppsFullTerr" onchange="loadOpportunitiesFull()"><option value="">All</option></select>
+        </label>
+        <label>Slow if on_hand &le;
+          <input type="number" id="oppsFullThreshold" value="3" min="0" max="20" style="width:60px" onchange="loadOpportunitiesFull()">
+        </label>
+        <button class="btn-secondary" onclick="loadOpportunitiesFull()">&#x21bb; Refresh</button>
+        <span id="oppsCount" class="muted-small"></span>
+      </div>
+      <div id="oppsFullTable" class="scroll-x"></div>
+    </section>
+
+    <!-- ===== GOALS ===== -->
+    <section id="view-goals" class="view">
+      <div class="view-header"><h1>Sales Goals</h1></div>
+      <p class="view-desc">Track listing & volume targets per SKU, territory, or rep. Progress is computed from the latest SOD snapshot.</p>
+
+      <div class="card crm-card">
+        <h3>New Goal</h3>
+        <form id="goalForm" onsubmit="event.preventDefault(); createGoal();" class="goal-form">
+          <label>Scope
+            <select id="goalScope" required>
+              <option value="sku">SKU</option>
+              <option value="territory">Territory</option>
+              <option value="rep">Rep</option>
+            </select>
+          </label>
+          <label>Target key
+            <input type="text" id="goalKey" required placeholder="e.g. 0020187 / TOR_CORE / Rep Name">
+          </label>
+          <label>Period start <input type="date" id="goalStart" required></label>
+          <label>Period end <input type="date" id="goalEnd" required></label>
+          <label>Target listings <input type="number" id="goalListings" value="0" min="0"></label>
+          <label>Target units <input type="number" id="goalUnits" value="0" min="0"></label>
+          <label>Target revenue <input type="number" id="goalRevenue" value="0" min="0" step="0.01"></label>
+          <label>Notes <input type="text" id="goalNotes" placeholder="Optional"></label>
+          <button type="submit" class="btn-primary">Save Goal</button>
+        </form>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Active Goals — Live Progress</h3>
+        <div id="goalsTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== HORECA ACCOUNTS ===== -->
+    <section id="view-horeca" class="view">
+      <div class="view-header"><h1>HORECA Accounts</h1></div>
+      <p class="view-desc">Hotels, Restaurants, Caterers, Bars. Track on-premise targets alongside LCBO retail.</p>
+
+      <div class="card crm-card">
+        <h3>New Account</h3>
+        <form id="horecaForm" onsubmit="event.preventDefault(); createHoreca();" class="horeca-form">
+          <label>Name <input type="text" id="hName" required></label>
+          <label>Type
+            <select id="hType">
+              <option value="restaurant">Restaurant</option>
+              <option value="bar">Bar</option>
+              <option value="hotel">Hotel</option>
+              <option value="catering">Catering</option>
+              <option value="club">Club / Lounge</option>
+            </select>
+          </label>
+          <label>Address <input type="text" id="hAddress"></label>
+          <label>City <input type="text" id="hCity"></label>
+          <label>Postal <input type="text" id="hPostal" placeholder="M5V 1J1"></label>
+          <label>Phone <input type="text" id="hPhone"></label>
+          <label>Email <input type="email" id="hEmail"></label>
+          <label>Contact <input type="text" id="hContact"></label>
+          <label>Title <input type="text" id="hTitle"></label>
+          <label>Status
+            <select id="hStatus">
+              <option value="prospect">Prospect</option>
+              <option value="active">Active</option>
+              <option value="dormant">Dormant</option>
+              <option value="lost">Lost</option>
+            </select>
+          </label>
+          <label>Priority
+            <select id="hPriority">
+              <option value="Standard">Standard</option>
+              <option value="High">High</option>
+              <option value="Top">Top</option>
+            </select>
+          </label>
+          <label>Products carried <input type="text" id="hProducts" placeholder="Red Admiral, Chak De"></label>
+          <label class="full-width">Notes <input type="text" id="hNotes"></label>
+          <button type="submit" class="btn-primary">Add Account</button>
+        </form>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Accounts</h3>
+        <div class="row-controls">
+          <label>Filter type:
+            <select id="hFilterType" onchange="loadHoreca()">
+              <option value="">All types</option>
+              <option value="restaurant">Restaurant</option>
+              <option value="bar">Bar</option>
+              <option value="hotel">Hotel</option>
+              <option value="catering">Catering</option>
+              <option value="club">Club</option>
+            </select>
+          </label>
+          <label>Status:
+            <select id="hFilterStatus" onchange="loadHoreca()">
+              <option value="">Any</option>
+              <option value="prospect">Prospect</option>
+              <option value="active">Active</option>
+              <option value="dormant">Dormant</option>
+              <option value="lost">Lost</option>
+            </select>
+          </label>
+          <label>Territory:
+            <select id="hFilterTerr" onchange="loadHoreca()"><option value="">All</option></select>
+          </label>
+        </div>
+        <div id="horecaTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== TERRITORIES ===== -->
+    <section id="view-territories" class="view">
+      <div class="view-header"><h1>Territories</h1></div>
+      <p class="view-desc">Ontario stores grouped by FSA postal code. Click "Reassign" if you've added new stores or want to recompute auto-assignments.</p>
+      <div class="row-controls">
+        <button class="btn-secondary" onclick="reassignTerritories()">&#x21bb; Re-run Auto-Assignment</button>
+      </div>
+      <div class="card crm-card">
+        <h3>Territory Coverage</h3>
+        <div id="terrTable" class="scroll-x"></div>
       </div>
     </section>
 

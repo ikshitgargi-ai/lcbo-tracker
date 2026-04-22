@@ -425,6 +425,87 @@ def init_db():
             except Exception:
                 pass
 
+        # ======== CRM tables: territories, goals, HORECA accounts ========
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS territories (
+                id SERIAL PRIMARY KEY,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                region TEXT DEFAULT '',
+                rep_name TEXT DEFAULT '',
+                color TEXT DEFAULT '#b22222',
+                fsa_prefixes TEXT DEFAULT '',
+                city_prefixes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sales_goals (
+                id SERIAL PRIMARY KEY,
+                scope TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                period_start DATE NOT NULL,
+                period_end DATE NOT NULL,
+                target_units INTEGER DEFAULT 0,
+                target_revenue NUMERIC(12,2) DEFAULT 0,
+                target_listings INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(scope, scope_key, period_start, period_end)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS horeca_accounts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                account_type TEXT DEFAULT 'restaurant',
+                address TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                postal TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                email TEXT DEFAULT '',
+                contact_name TEXT DEFAULT '',
+                contact_title TEXT DEFAULT '',
+                territory_id INTEGER REFERENCES territories(id),
+                rep_name TEXT DEFAULT '',
+                status TEXT DEFAULT 'prospect',
+                priority TEXT DEFAULT 'Standard',
+                lat REAL DEFAULT 0,
+                lng REAL DEFAULT 0,
+                last_visit DATE,
+                next_visit DATE,
+                products_carried TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_terr_code ON territories(code)",
+            "CREATE INDEX IF NOT EXISTS idx_goals_scope ON sales_goals(scope, scope_key)",
+            "CREATE INDEX IF NOT EXISTS idx_goals_period ON sales_goals(period_start, period_end)",
+            "CREATE INDEX IF NOT EXISTS idx_horeca_territory ON horeca_accounts(territory_id)",
+            "CREATE INDEX IF NOT EXISTS idx_horeca_status ON horeca_accounts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_horeca_city ON horeca_accounts(city)",
+        ]:
+            try:
+                cur.execute(idx)
+            except Exception:
+                pass
+
+        # Add new columns on existing tables (upgrade-safe)
+        crm_migrate_cols = [
+            ('stores', 'territory_id', 'INTEGER'),
+            ('sod_products', 'category', "TEXT DEFAULT ''"),
+            ('sod_products', 'category_group', "TEXT DEFAULT ''"),
+        ]
+        for table, col, coltype in crm_migrate_cols:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+
         cur.close()
         conn.close()
         print("[DB] PostgreSQL tables initialized successfully")
@@ -571,6 +652,64 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sod_changes_sku ON sod_listing_changes(sku);
             CREATE INDEX IF NOT EXISTS idx_sod_changes_date ON sod_listing_changes(change_date DESC);
             CREATE INDEX IF NOT EXISTS idx_sod_products_tracked ON sod_products(is_tracked);
+
+            -- ======== CRM tables: territories, goals, HORECA accounts ========
+            CREATE TABLE IF NOT EXISTS territories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                region TEXT DEFAULT '',
+                rep_name TEXT DEFAULT '',
+                color TEXT DEFAULT '#b22222',
+                fsa_prefixes TEXT DEFAULT '',
+                city_prefixes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS sales_goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                target_units INTEGER DEFAULT 0,
+                target_revenue REAL DEFAULT 0,
+                target_listings INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(scope, scope_key, period_start, period_end)
+            );
+            CREATE TABLE IF NOT EXISTS horeca_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                account_type TEXT DEFAULT 'restaurant',
+                address TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                postal TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                email TEXT DEFAULT '',
+                contact_name TEXT DEFAULT '',
+                contact_title TEXT DEFAULT '',
+                territory_id INTEGER,
+                rep_name TEXT DEFAULT '',
+                status TEXT DEFAULT 'prospect',
+                priority TEXT DEFAULT 'Standard',
+                lat REAL DEFAULT 0,
+                lng REAL DEFAULT 0,
+                last_visit TEXT,
+                next_visit TEXT,
+                products_carried TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (territory_id) REFERENCES territories(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_terr_code ON territories(code);
+            CREATE INDEX IF NOT EXISTS idx_goals_scope ON sales_goals(scope, scope_key);
+            CREATE INDEX IF NOT EXISTS idx_goals_period ON sales_goals(period_start, period_end);
+            CREATE INDEX IF NOT EXISTS idx_horeca_territory ON horeca_accounts(territory_id);
+            CREATE INDEX IF NOT EXISTS idx_horeca_status ON horeca_accounts(status);
+            CREATE INDEX IF NOT EXISTS idx_horeca_city ON horeca_accounts(city);
         ''')
         migrate_cols = [
             ('stores', 'manager_name', "TEXT DEFAULT ''"), ('stores', 'asst_manager_name', "TEXT DEFAULT ''"),
@@ -578,12 +717,15 @@ def init_db():
             ('stores', 'producer', "TEXT DEFAULT ''"), ('stores', 'lat', "REAL DEFAULT 0"),
             ('stores', 'lng', "REAL DEFAULT 0"),
             ('stores', 'lcbo_store_id', "TEXT DEFAULT ''"),
+            ('stores', 'territory_id', "INTEGER"),
             ('activities', 'producer', "TEXT DEFAULT ''"), ('activities', 'venue_type', "TEXT DEFAULT ''"),
             ('activities', 'follow_up_date', "TEXT DEFAULT ''"),
             ('activities', 'status_code', "INTEGER DEFAULT 0"),
             ('products', 'listing_status', "INTEGER DEFAULT 2"),
             ('products', 'listing_date', "TEXT DEFAULT ''"),
             ('products', 'delisting_date', "TEXT DEFAULT ''"),
+            ('sod_products', 'category', "TEXT DEFAULT ''"),
+            ('sod_products', 'category_group', "TEXT DEFAULT ''"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -3333,11 +3475,1504 @@ def api_sod_health():
     }), 200 if fresh else 503
 
 
+# ======================================================================================
+# ================================= CRM LAYER ==========================================
+#
+# Commercial-grade CRM features built on top of SOD + LCBO.com data:
+#   - Territory model (Ontario FSA postal-code prefixes → territories → reps)
+#   - Store-level classification (fast FSA lookup)
+#   - Category inference (product-name pattern matching, enrich-on-demand from LCBO.com)
+#   - Brink-of-OOS detection (stores with tracked SKU listed but on_hand <= threshold)
+#   - Gap analysis grouped by territory
+#   - Opportunity finder (slow-mover replacement candidates per store)
+#   - Sales goals (rep/SKU/territory-scoped, period-bounded, with progress from SOD)
+#   - HORECA accounts (bar/restaurant/hotel/catering CRM)
+#   - Unified store detail (SOD + live LCBO.com inventory side-by-side)
+#   - Listing-change digest (last N days, grouped)
+#   - Full-DB JSON backup endpoint
+#
+# All data is idempotent-upserted; init_db() is a no-op on existing tables; Neon Postgres
+# is external so Render worker restarts can NEVER lose persisted data.
+# ======================================================================================
+
+# ------- Ontario FSA (postal-code) → Territory map -------
+# Ontario postal codes start with K/L/M/N/P. Grouping below follows common LCBO/wholesale
+# territorial splits. Editable via the /api/crm/territories endpoint.
+ONTARIO_TERRITORIES = [
+    {
+        'code': 'TOR_CORE',
+        'name': 'Toronto Core',
+        'region': 'GTA',
+        'color': '#b22222',
+        'fsa_prefixes': 'M4,M5,M6',
+        'city_prefixes': 'toronto',
+    },
+    {
+        'code': 'TOR_EAST',
+        'name': 'Toronto East + Scarborough',
+        'region': 'GTA',
+        'color': '#d4a574',
+        'fsa_prefixes': 'M1,M3,M4L,M4M',
+        'city_prefixes': 'scarborough,east york,north york',
+    },
+    {
+        'code': 'TOR_WEST',
+        'name': 'Toronto West + Etobicoke',
+        'region': 'GTA',
+        'color': '#e07a5f',
+        'fsa_prefixes': 'M8,M9',
+        'city_prefixes': 'etobicoke,york',
+    },
+    {
+        'code': 'GTA_WEST',
+        'name': 'Mississauga / Oakville / Brampton',
+        'region': 'GTA',
+        'color': '#f2cc8f',
+        'fsa_prefixes': 'L4,L5,L6,L7',
+        'city_prefixes': 'mississauga,oakville,brampton,milton,burlington',
+    },
+    {
+        'code': 'GTA_NORTH',
+        'name': 'York Region / Vaughan / Markham',
+        'region': 'GTA',
+        'color': '#81b29a',
+        'fsa_prefixes': 'L3,L4',
+        'city_prefixes': 'vaughan,markham,richmond hill,aurora,newmarket',
+    },
+    {
+        'code': 'HAMILTON_NIAGARA',
+        'name': 'Hamilton / Niagara',
+        'region': 'Southwest',
+        'color': '#3d5a80',
+        'fsa_prefixes': 'L8,L9,L0R,L2,L3',
+        'city_prefixes': 'hamilton,niagara,st catharines,st. catharines,welland',
+    },
+    {
+        'code': 'SW_ONT',
+        'name': 'Southwest Ontario (London/Windsor)',
+        'region': 'Southwest',
+        'color': '#6a994e',
+        'fsa_prefixes': 'N',
+        'city_prefixes': 'london,windsor,kitchener,waterloo,cambridge,guelph',
+    },
+    {
+        'code': 'OTTAWA',
+        'name': 'Ottawa + Eastern Ontario',
+        'region': 'East',
+        'color': '#457b9d',
+        'fsa_prefixes': 'K1,K2,K4,K6,K7',
+        'city_prefixes': 'ottawa,kingston,kanata,nepean,gloucester,orleans',
+    },
+    {
+        'code': 'CENTRAL_ONT',
+        'name': 'Central Ontario (Barrie/Muskoka)',
+        'region': 'Central',
+        'color': '#a98467',
+        'fsa_prefixes': 'L0,L4M,L4N,L9,P0',
+        'city_prefixes': 'barrie,orillia,gravenhurst,bracebridge,huntsville,peterborough',
+    },
+    {
+        'code': 'NORTHERN_ONT',
+        'name': 'Northern Ontario',
+        'region': 'North',
+        'color': '#264653',
+        'fsa_prefixes': 'P',
+        'city_prefixes': 'sudbury,thunder bay,sault ste marie,sault ste. marie,north bay,timmins',
+    },
+]
+
+
+def _fsa_from_postal(postal):
+    """Return the 3-char FSA from a Canadian postal code string."""
+    if not postal:
+        return ''
+    p = str(postal).upper().replace(' ', '').replace('-', '')
+    if len(p) < 3:
+        return ''
+    return p[:3]
+
+
+def classify_territory(postal, city):
+    """Best-match territory_code for a store given postal + city.
+
+    Strategy: FSA prefix match first (most specific wins), then city name contains.
+    Returns the territory_code string, or 'UNASSIGNED' if nothing matches.
+    """
+    fsa = _fsa_from_postal(postal)
+    city_l = (city or '').strip().lower()
+
+    # Score each territory: longer FSA-prefix match wins; city substring match is fallback.
+    best_code = None
+    best_score = 0
+    for t in ONTARIO_TERRITORIES:
+        score = 0
+        for prefix in t['fsa_prefixes'].split(','):
+            prefix = prefix.strip().upper()
+            if prefix and fsa.startswith(prefix):
+                # Longer prefix = more specific match
+                score = max(score, 10 + len(prefix))
+        if score == 0 and city_l:
+            for cp in t['city_prefixes'].split(','):
+                cp = cp.strip().lower()
+                if cp and cp in city_l:
+                    score = max(score, 5 + len(cp) // 2)
+        if score > best_score:
+            best_score = score
+            best_code = t['code']
+    return best_code or 'UNASSIGNED'
+
+
+def seed_territories():
+    """Idempotently upsert ONTARIO_TERRITORIES into the territories table."""
+    ph = _sod_ph()
+    conn = _sod_get_conn()
+    try:
+        cur = conn.cursor()
+        for t in ONTARIO_TERRITORIES:
+            if USE_POSTGRES:
+                cur.execute(
+                    """INSERT INTO territories (code, name, region, color, fsa_prefixes, city_prefixes)
+                       VALUES (%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (code) DO UPDATE SET
+                           name=EXCLUDED.name, region=EXCLUDED.region, color=EXCLUDED.color,
+                           fsa_prefixes=EXCLUDED.fsa_prefixes, city_prefixes=EXCLUDED.city_prefixes""",
+                    (t['code'], t['name'], t['region'], t['color'], t['fsa_prefixes'], t['city_prefixes']),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO territories (code, name, region, color, fsa_prefixes, city_prefixes)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(code) DO UPDATE SET
+                           name=excluded.name, region=excluded.region, color=excluded.color,
+                           fsa_prefixes=excluded.fsa_prefixes, city_prefixes=excluded.city_prefixes""",
+                    (t['code'], t['name'], t['region'], t['color'], t['fsa_prefixes'], t['city_prefixes']),
+                )
+        # Also add an UNASSIGNED catch-all
+        if USE_POSTGRES:
+            cur.execute(
+                """INSERT INTO territories (code, name, region, color)
+                   VALUES ('UNASSIGNED','Unassigned','','#888888')
+                   ON CONFLICT (code) DO NOTHING""",
+            )
+        else:
+            cur.execute(
+                """INSERT OR IGNORE INTO territories (code, name, region, color)
+                   VALUES ('UNASSIGNED','Unassigned','','#888888')""",
+            )
+        conn.commit()
+        # Now auto-assign stores that don't yet have a territory_id
+        cur.execute("SELECT id, code FROM territories")
+        code_to_id = {row[1]: row[0] for row in cur.fetchall()}
+        cur.execute("SELECT id, postal, city FROM stores WHERE territory_id IS NULL OR territory_id = 0")
+        unassigned = cur.fetchall()
+        assigned_count = 0
+        for sid, postal, city in unassigned:
+            tcode = classify_territory(postal, city)
+            tid = code_to_id.get(tcode) or code_to_id.get('UNASSIGNED')
+            if tid:
+                if USE_POSTGRES:
+                    cur.execute("UPDATE stores SET territory_id=%s WHERE id=%s", (tid, sid))
+                else:
+                    cur.execute("UPDATE stores SET territory_id=? WHERE id=?", (tid, sid))
+                assigned_count += 1
+        conn.commit()
+        cur.close()
+        print(f"[CRM] Territories seeded: {len(ONTARIO_TERRITORIES)} + UNASSIGNED. "
+              f"Auto-assigned territory to {assigned_count} stores.")
+    except Exception as e:
+        print(f"[CRM] seed_territories failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ------- SKU Category classifier -------
+# SOD rows don't include category. We infer from product_name using keyword patterns,
+# good-enough for the opportunity finder. Can be enriched later from LCBO.com GraphQL.
+CATEGORY_PATTERNS = [
+    # (category_group, category, keywords-lowercase)
+    ('SPIRITS', 'Vodka',     ['vodka']),
+    ('SPIRITS', 'Whisky',    ['whisky', 'whiskey', 'bourbon', 'rye', 'scotch']),
+    ('SPIRITS', 'Gin',       ['gin']),
+    ('SPIRITS', 'Rum',       ['rum']),
+    ('SPIRITS', 'Tequila',   ['tequila', 'mezcal']),
+    ('SPIRITS', 'Brandy',    ['brandy', 'cognac', 'armagnac']),
+    ('SPIRITS', 'Liqueur',   ['liqueur', 'amaretto', 'sambuca', 'schnapps']),
+    ('SPIRITS', 'Feni',      ['feni']),
+    ('SPIRITS', 'Other Spirits', ['cachaca', 'cachaça', 'grappa', 'pisco', 'arrack', 'aquavit', 'soju', 'baijiu']),
+    ('WINE',    'Red Wine',  ['shiraz', 'cabernet', 'merlot', 'pinot noir', 'malbec', 'tempranillo', 'syrah', 'zinfandel', 'sangiovese']),
+    ('WINE',    'White Wine',['chardonnay', 'sauvignon', 'pinot grigio', 'riesling', 'chenin', 'gewurz', 'viognier', 'semillon']),
+    ('WINE',    'Rose',      ['rose', 'rosé']),
+    ('WINE',    'Sparkling', ['champagne', 'prosecco', 'cava', 'sparkling']),
+    ('WINE',    'Fortified', ['port', 'sherry', 'madeira', 'vermouth']),
+    ('BEER',    'Beer',      [' beer', 'lager', 'pilsner', 'pilsener', ' ale', ' ipa', 'stout', 'porter', 'weiss', 'hefeweiss']),
+    ('BEER',    'Cider',     [' cider']),
+    ('RTD',     'Cooler/RTD',['cooler', 'seltzer', ' rtd', 'ready to drink', 'mixed drink']),
+]
+
+
+def classify_sku_category(name):
+    """Return (category_group, category) for a product name. Defaults to ('', '')."""
+    if not name:
+        return '', ''
+    nl = ' ' + name.lower() + ' '
+    for group, cat, keywords in CATEGORY_PATTERNS:
+        for kw in keywords:
+            if kw in nl:
+                return group, cat
+    return '', ''
+
+
+def refresh_sod_product_categories():
+    """Backfill sod_products.category / category_group for rows that lack them.
+
+    Called once on startup. Fast — only touches rows with NULL/empty category.
+    """
+    ph = _sod_ph()
+    conn = _sod_get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT sku, product_name FROM sod_products WHERE COALESCE(category, '') = ''")
+        rows = cur.fetchall()
+        updated = 0
+        for sku, name in rows:
+            grp, cat = classify_sku_category(name)
+            if cat:
+                if USE_POSTGRES:
+                    cur.execute(
+                        "UPDATE sod_products SET category=%s, category_group=%s WHERE sku=%s",
+                        (cat, grp, sku),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE sod_products SET category=?, category_group=? WHERE sku=?",
+                        (cat, grp, sku),
+                    )
+                updated += 1
+        conn.commit()
+        cur.close()
+        if updated:
+            print(f"[CRM] Classified category for {updated} SOD products.")
+    except Exception as e:
+        print(f"[CRM] refresh_sod_product_categories failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ======== CRM API endpoints ========
+
+@app.route('/api/crm/territories', methods=['GET'])
+def api_crm_territories():
+    """List all territories with store counts."""
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    if USE_POSTGRES:
+        cur.execute("""
+            SELECT t.id, t.code, t.name, t.region, t.rep_name, t.color,
+                   t.fsa_prefixes, t.city_prefixes,
+                   COALESCE(sc.store_count, 0) AS store_count,
+                   COALESCE(hc.horeca_count, 0) AS horeca_count
+            FROM territories t
+            LEFT JOIN (SELECT territory_id, COUNT(*) AS store_count FROM stores WHERE territory_id IS NOT NULL GROUP BY territory_id) sc
+                ON sc.territory_id = t.id
+            LEFT JOIN (SELECT territory_id, COUNT(*) AS horeca_count FROM horeca_accounts WHERE territory_id IS NOT NULL GROUP BY territory_id) hc
+                ON hc.territory_id = t.id
+            ORDER BY t.region, t.name
+        """)
+        rows = cur.fetchall()
+        result = [{'id': r[0], 'code': r[1], 'name': r[2], 'region': r[3], 'rep_name': r[4],
+                   'color': r[5], 'fsa_prefixes': r[6], 'city_prefixes': r[7],
+                   'store_count': r[8], 'horeca_count': r[9]} for r in rows]
+    else:
+        rows = db.execute("""
+            SELECT t.id, t.code, t.name, t.region, t.rep_name, t.color,
+                   t.fsa_prefixes, t.city_prefixes,
+                   COALESCE(sc.store_count, 0),
+                   COALESCE(hc.horeca_count, 0)
+            FROM territories t
+            LEFT JOIN (SELECT territory_id, COUNT(*) AS store_count FROM stores WHERE territory_id IS NOT NULL GROUP BY territory_id) sc
+                ON sc.territory_id = t.id
+            LEFT JOIN (SELECT territory_id, COUNT(*) AS horeca_count FROM horeca_accounts WHERE territory_id IS NOT NULL GROUP BY territory_id) hc
+                ON hc.territory_id = t.id
+            ORDER BY t.region, t.name
+        """).fetchall()
+        result = [{'id': r[0], 'code': r[1], 'name': r[2], 'region': r[3], 'rep_name': r[4],
+                   'color': r[5], 'fsa_prefixes': r[6], 'city_prefixes': r[7],
+                   'store_count': r[8], 'horeca_count': r[9]} for r in rows]
+    return jsonify(result)
+
+
+@app.route('/api/crm/territories/<int:territory_id>', methods=['PUT'])
+def api_crm_territory_update(territory_id):
+    """Update a territory — typically to assign a rep_name."""
+    data = request.get_json() or {}
+    fields = []
+    params = []
+    for col in ('name', 'region', 'rep_name', 'color', 'fsa_prefixes', 'city_prefixes'):
+        if col in data:
+            fields.append(f"{col}=%s" if USE_POSTGRES else f"{col}=?")
+            params.append(data[col])
+    if not fields:
+        return jsonify({'error': 'no updatable fields provided'}), 400
+    params.append(territory_id)
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"UPDATE territories SET {', '.join(fields)} WHERE id=%s", params)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"UPDATE territories SET {', '.join(fields)} WHERE id=?", params)
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/crm/territories/reassign', methods=['POST'])
+def api_crm_territories_reassign():
+    """Re-run the FSA-based classifier for ALL stores (force reassignment)."""
+    seed_territories()
+    # Force re-classify even for stores that already have a territory_id
+    conn = _sod_get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, code FROM territories")
+        code_to_id = {row[1]: row[0] for row in cur.fetchall()}
+        cur.execute("SELECT id, postal, city FROM stores")
+        rows = cur.fetchall()
+        n = 0
+        for sid, postal, city in rows:
+            tcode = classify_territory(postal, city)
+            tid = code_to_id.get(tcode) or code_to_id.get('UNASSIGNED')
+            if tid:
+                if USE_POSTGRES:
+                    cur.execute("UPDATE stores SET territory_id=%s WHERE id=%s", (tid, sid))
+                else:
+                    cur.execute("UPDATE stores SET territory_id=? WHERE id=?", (tid, sid))
+                n += 1
+        conn.commit()
+        cur.close()
+        return jsonify({'status': 'ok', 'reassigned': n})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/crm/stores', methods=['GET'])
+def api_crm_stores():
+    """Stores list with territory join — for the Map view.
+
+    Query params:
+      territory_id: filter by one territory
+      with_coords_only=1: only stores with lat/lng
+    """
+    territory_id = request.args.get('territory_id', type=int)
+    coords_only = request.args.get('with_coords_only', '').lower() in ('1', 'true', 'yes')
+    db = get_db()
+    where = ['1=1']
+    params = []
+    if territory_id:
+        where.append('s.territory_id=' + ('%s' if USE_POSTGRES else '?'))
+        params.append(territory_id)
+    if coords_only:
+        where.append('s.lat IS NOT NULL AND s.lng IS NOT NULL AND s.lat <> 0 AND s.lng <> 0')
+    where_sql = ' AND '.join(where)
+    q = f"""
+        SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+               s.priority, s.rep, s.lat, s.lng, s.territory_id,
+               COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+        FROM stores s
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE {where_sql}
+        ORDER BY s.city, s.store_number
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+    return jsonify([{
+        'id': r[0], 'store_number': r[1], 'account': r[2], 'address': r[3],
+        'city': r[4], 'postal': r[5], 'priority': r[6], 'rep': r[7],
+        'lat': r[8] or 0, 'lng': r[9] or 0, 'territory_id': r[10],
+        'territory_code': r[11], 'territory_name': r[12], 'territory_color': r[13],
+    } for r in rows])
+
+
+@app.route('/api/crm/stores/<int:store_id>/territory', methods=['PUT'])
+def api_crm_store_set_territory(store_id):
+    """Manually override a store's territory."""
+    data = request.get_json() or {}
+    tid = data.get('territory_id')
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("UPDATE stores SET territory_id=%s WHERE id=%s", (tid, store_id))
+        db.commit()
+        cur.close()
+    else:
+        db.execute("UPDATE stores SET territory_id=? WHERE id=?", (tid, store_id))
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+# ------- Brink-of-OOS detection -------
+@app.route('/api/crm/oos-risk', methods=['GET'])
+def api_crm_oos_risk():
+    """Stores carrying a tracked SKU but on_hand is dangerously low.
+
+    Query params:
+      threshold: max on_hand (default 2 = brink)
+      sku: limit to one SKU
+      territory_id: limit to one territory
+
+    Returns list sorted by on_hand asc then store_number.
+    """
+    threshold = request.args.get('threshold', default=2, type=int)
+    sku = request.args.get('sku', '').strip()
+    territory_id = request.args.get('territory_id', type=int)
+    tracked_skus = list(SOD_TRACKED_SKUS.keys())
+    if not tracked_skus:
+        return jsonify([])
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    # Use the latest snapshot per SKU
+    params = []
+    sku_filter = ''
+    if sku:
+        skus = [sku.zfill(7)]
+    else:
+        skus = tracked_skus
+    placeholders = ','.join([ph] * len(skus))
+    q = f"""
+        WITH latest AS (
+            SELECT sku, MAX(snapshot_date) AS d
+            FROM sod_inventory WHERE sku IN ({placeholders})
+            GROUP BY sku
+        )
+        SELECT i.sku, i.product_name, i.store_number, i.status, i.on_hand, i.snapshot_date,
+               s.id AS store_id, s.account, s.city, s.postal, s.rep,
+               t.id AS territory_id, t.code AS territory_code, t.name AS territory_name, t.color
+        FROM sod_inventory i
+        JOIN latest l ON l.sku = i.sku AND l.d = i.snapshot_date
+        LEFT JOIN stores s ON s.store_number = i.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE i.status = 'L'
+          AND i.on_hand <= {ph}
+    """
+    params = list(skus) + [threshold]
+    if territory_id:
+        q += f" AND s.territory_id = {ph}"
+        params.append(territory_id)
+    q += " ORDER BY i.on_hand ASC, i.sku, i.store_number"
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+    return jsonify([{
+        'sku': r[0], 'product_name': r[1], 'store_number': r[2], 'status': r[3],
+        'on_hand': r[4], 'snapshot_date': str(r[5]),
+        'store_id': r[6], 'account': r[7], 'city': r[8], 'postal': r[9], 'rep': r[10],
+        'territory_id': r[11], 'territory_code': r[12], 'territory_name': r[13],
+        'territory_color': r[14],
+        'severity': 'critical' if (r[4] or 0) == 0 else ('high' if (r[4] or 0) <= 1 else 'medium'),
+    } for r in rows])
+
+
+# ------- Gap analysis by territory -------
+@app.route('/api/crm/gap-by-territory', methods=['GET'])
+def api_crm_gap_by_territory():
+    """For each tracked SKU, list stores NOT currently listing it, grouped by territory.
+
+    Query params:
+      sku: limit to one SKU (else all tracked)
+      territory_id: limit to one territory
+    """
+    sku = request.args.get('sku', '').strip()
+    territory_id = request.args.get('territory_id', type=int)
+    tracked_skus = list(SOD_TRACKED_SKUS.keys())
+    if not tracked_skus:
+        return jsonify([])
+    if sku:
+        target_skus = [sku.zfill(7)]
+    else:
+        target_skus = tracked_skus
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    results = []
+    for tsku in target_skus:
+        # latest snapshot date for this sku
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (tsku,))
+            r = cur.fetchone()
+        else:
+            r = db.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?", (tsku,)).fetchone()
+        latest_d = r[0] if r else None
+        # stores currently listing it
+        listing_stores = set()
+        if latest_d:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT store_number FROM sod_inventory WHERE sku=%s AND snapshot_date=%s AND status='L'",
+                    (tsku, latest_d),
+                )
+                listing_stores = {row[0] for row in cur.fetchall()}
+                cur.close()
+            else:
+                listing_stores = {row[0] for row in db.execute(
+                    "SELECT store_number FROM sod_inventory WHERE sku=? AND snapshot_date=? AND status='L'",
+                    (tsku, latest_d),
+                ).fetchall()}
+        # all stores (optionally filtered by territory)
+        sw = [' 1=1 ']
+        sp = []
+        if territory_id:
+            sw.append(' s.territory_id=' + ph)
+            sp.append(territory_id)
+        sq = f"""
+            SELECT s.id, s.store_number, s.account, s.city, s.postal, s.rep, s.priority,
+                   s.territory_id, COALESCE(t.code,''), COALESCE(t.name,''), COALESCE(t.color,'#888')
+            FROM stores s
+            LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE {' AND '.join(sw)}
+            ORDER BY COALESCE(t.name,'zzz'), s.city, s.store_number
+        """
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(sq, sp)
+            stores_rows = cur.fetchall()
+            cur.close()
+        else:
+            stores_rows = db.execute(sq, sp).fetchall()
+        brand, pname = SOD_TRACKED_SKUS.get(tsku, ('', tsku))
+        for sr in stores_rows:
+            if sr[1] in listing_stores:
+                continue
+            results.append({
+                'sku': tsku, 'brand': brand, 'product_name': pname,
+                'store_id': sr[0], 'store_number': sr[1], 'account': sr[2],
+                'city': sr[3], 'postal': sr[4], 'rep': sr[5], 'priority': sr[6],
+                'territory_id': sr[7], 'territory_code': sr[8],
+                'territory_name': sr[9] or 'Unassigned', 'territory_color': sr[10],
+                'latest_snapshot': str(latest_d) if latest_d else None,
+            })
+    return jsonify(results)
+
+
+# ------- Opportunity finder: slow-mover replacement candidates -------
+@app.route('/api/crm/opportunities', methods=['GET'])
+def api_crm_opportunities():
+    """For each store where our tracked SKU is NOT listed, find competitor SKUs in the same
+    category that are:
+      - Currently listed at that store (status='L')
+      - Underperforming: on_hand <= slow_threshold (default 3) OR status in ('D','F')
+    These are the best replacement pitches — "delist this slow-mover, list our SKU instead."
+
+    Query params:
+      sku: target tracked SKU (required to pitch a specific product)
+      slow_threshold: max on_hand considered slow (default 3)
+      territory_id: limit to one territory
+      limit: max results per SKU (default 200)
+    """
+    sku = request.args.get('sku', '').strip()
+    slow_threshold = request.args.get('slow_threshold', default=3, type=int)
+    territory_id = request.args.get('territory_id', type=int)
+    limit = request.args.get('limit', default=200, type=int)
+
+    tracked_skus = list(SOD_TRACKED_SKUS.keys())
+    if not tracked_skus:
+        return jsonify([])
+    target_skus = [sku.zfill(7)] if sku else tracked_skus
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    out = []
+
+    for tsku in target_skus:
+        brand, pname = SOD_TRACKED_SKUS.get(tsku, ('', tsku))
+        # Determine this SKU's category (from sod_products, else classify its name)
+        grp, cat = '', ''
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute("SELECT category_group, category, product_name FROM sod_products WHERE sku=%s", (tsku,))
+            pr = cur.fetchone()
+        else:
+            pr = db.execute("SELECT category_group, category, product_name FROM sod_products WHERE sku=?", (tsku,)).fetchone()
+        if pr:
+            grp, cat = pr[0] or '', pr[1] or ''
+            if not cat:
+                grp, cat = classify_sku_category(pr[2] or pname)
+        else:
+            grp, cat = classify_sku_category(pname)
+        if not cat:
+            # Unknown category — skip, can't build opportunities
+            continue
+
+        # Latest snapshot globally — simplest assumption
+        if USE_POSTGRES:
+            cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+            latest = cur.fetchone()[0]
+        else:
+            latest = db.execute("SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
+        if not latest:
+            continue
+
+        # Find stores already listing OUR SKU at latest snapshot (exclude them from opportunities)
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT store_number FROM sod_inventory WHERE sku=%s AND snapshot_date=%s AND status='L'",
+                (tsku, latest),
+            )
+            our_listed = {row[0] for row in cur.fetchall()}
+        else:
+            our_listed = {row[0] for row in db.execute(
+                "SELECT store_number FROM sod_inventory WHERE sku=? AND snapshot_date=? AND status='L'",
+                (tsku, latest),
+            ).fetchall()}
+
+        # Find slow/delisting rows in the same category at the latest snapshot
+        params = [latest, slow_threshold]
+        terr_join = ""
+        terr_where = ""
+        if territory_id:
+            terr_where = f" AND s.territory_id = {ph}"
+            params.append(territory_id)
+        q = f"""
+            SELECT i.sku, i.product_name, i.store_number, i.status, i.on_hand,
+                   p.category_group, p.category,
+                   s.id, s.account, s.city, s.postal, s.rep,
+                   s.territory_id, COALESCE(t.code,''), COALESCE(t.name,''), COALESCE(t.color,'#888')
+            FROM sod_inventory i
+            JOIN sod_products p ON p.sku = i.sku
+            LEFT JOIN stores s ON s.store_number = i.store_number
+            LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE i.snapshot_date = {ph}
+              AND p.category = {ph}
+              AND (
+                    (i.status = 'L' AND i.on_hand <= {ph})
+                 OR i.status IN ('D', 'F')
+              )
+              AND i.sku <> {ph}
+              {terr_where}
+            ORDER BY i.status DESC, i.on_hand ASC, i.store_number
+            LIMIT {ph}
+        """
+        params = [latest, cat, slow_threshold, tsku] + ([territory_id] if territory_id else []) + [limit * 4]  # over-fetch, we filter more below
+        # Rebuild params in correct order (SQL above uses: latest, cat, slow_threshold, tsku, [territory_id], limit)
+        params_final = [latest, cat, slow_threshold, tsku]
+        if territory_id:
+            params_final.append(territory_id)
+        params_final.append(limit * 4)
+        if USE_POSTGRES:
+            cur.execute(q, params_final)
+            rows = cur.fetchall()
+        else:
+            rows = db.execute(q, params_final).fetchall()
+
+        # Filter: skip stores that already carry our SKU
+        kept = 0
+        for r in rows:
+            if r[2] in our_listed:
+                continue
+            severity = 'delisting' if r[3] in ('D', 'F') else ('critical_slow' if (r[4] or 0) == 0 else 'slow')
+            score = 0
+            if r[3] == 'D':
+                score += 50
+            elif r[3] == 'F':
+                score += 30
+            if (r[4] or 0) == 0:
+                score += 40
+            elif (r[4] or 0) <= 1:
+                score += 25
+            elif (r[4] or 0) <= 3:
+                score += 10
+            out.append({
+                'our_sku': tsku, 'our_brand': brand, 'our_product': pname,
+                'category': cat, 'category_group': grp,
+                'competitor_sku': r[0], 'competitor_name': r[1],
+                'competitor_status': r[3], 'competitor_on_hand': r[4] or 0,
+                'store_id': r[7], 'store_number': r[2], 'account': r[8],
+                'city': r[9], 'postal': r[10], 'rep': r[11],
+                'territory_id': r[12], 'territory_code': r[13],
+                'territory_name': r[14] or 'Unassigned', 'territory_color': r[15],
+                'severity': severity, 'opportunity_score': score,
+            })
+            kept += 1
+            if kept >= limit:
+                break
+        if USE_POSTGRES:
+            cur.close()
+
+    # Sort by opportunity score descending
+    out.sort(key=lambda x: (-x['opportunity_score'], x['our_sku'], x['store_number']))
+    return jsonify(out[:limit * len(target_skus)])
+
+
+# ------- Listing / delisting digest for dashboard -------
+@app.route('/api/crm/listing-digest', methods=['GET'])
+def api_crm_listing_digest():
+    """Aggregate sod_listing_changes over the last N days (default 7).
+
+    Returns: counts by change_type + top movements + tracked-SKU highlights.
+    """
+    days = request.args.get('days', default=7, type=int)
+    tracked_only = request.args.get('tracked_only', '').lower() in ('1', 'true', 'yes')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    # counts by change_type
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT change_type, COUNT(*) FROM sod_listing_changes WHERE change_date >= %s GROUP BY change_type ORDER BY COUNT(*) DESC",
+            (since,),
+        )
+        counts = [{'change_type': r[0], 'count': r[1]} for r in cur.fetchall()]
+    else:
+        counts = [{'change_type': r[0], 'count': r[1]} for r in db.execute(
+            "SELECT change_type, COUNT(*) FROM sod_listing_changes WHERE change_date >= ? GROUP BY change_type ORDER BY COUNT(*) DESC",
+            (since,),
+        ).fetchall()]
+
+    # recent rows (latest 100, optional tracked-only)
+    where = "WHERE change_date >= " + ph
+    params = [since]
+    if tracked_only:
+        tracked_list = list(SOD_TRACKED_SKUS.keys())
+        if tracked_list:
+            phs = ','.join([ph] * len(tracked_list))
+            where += f" AND c.sku IN ({phs})"
+            params.extend(tracked_list)
+    q = f"""
+        SELECT c.sku, COALESCE(p.product_name, ''), c.change_date,
+               c.old_status, c.new_status, c.change_type,
+               COALESCE(p.brand,''), COALESCE(p.is_tracked, {'FALSE' if USE_POSTGRES else '0'})
+        FROM sod_listing_changes c
+        LEFT JOIN sod_products p ON p.sku = c.sku
+        {where}
+        ORDER BY c.change_date DESC, c.id DESC
+        LIMIT 200
+    """
+    if USE_POSTGRES:
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+    changes = [{
+        'sku': r[0], 'product_name': r[1], 'change_date': str(r[2]),
+        'old_status': r[3], 'new_status': r[4], 'change_type': r[5],
+        'brand': r[6], 'is_tracked': bool(r[7]),
+    } for r in rows]
+
+    return jsonify({
+        'window_days': days,
+        'since': since,
+        'counts': counts,
+        'changes': changes,
+    })
+
+
+# ------- Sales goals -------
+@app.route('/api/crm/goals', methods=['GET'])
+def api_crm_goals_list():
+    """List all goals, optionally filtered by scope/period."""
+    scope = request.args.get('scope', '').strip()
+    active_on = request.args.get('active_on', '').strip()  # YYYY-MM-DD
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = ['1=1']
+    params = []
+    if scope:
+        where.append(f'scope={ph}')
+        params.append(scope)
+    if active_on:
+        where.append(f'period_start <= {ph} AND period_end >= {ph}')
+        params.extend([active_on, active_on])
+    q = f"""
+        SELECT id, scope, scope_key, period_start, period_end,
+               target_units, target_revenue, target_listings, notes
+        FROM sales_goals WHERE {' AND '.join(where)}
+        ORDER BY period_end DESC, scope, scope_key
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+    return jsonify([{
+        'id': r[0], 'scope': r[1], 'scope_key': r[2],
+        'period_start': str(r[3]), 'period_end': str(r[4]),
+        'target_units': r[5], 'target_revenue': float(r[6] or 0),
+        'target_listings': r[7], 'notes': r[8],
+    } for r in rows])
+
+
+@app.route('/api/crm/goals', methods=['POST'])
+def api_crm_goals_create():
+    data = request.get_json() or {}
+    required = ['scope', 'scope_key', 'period_start', 'period_end']
+    missing = [k for k in required if not data.get(k)]
+    if missing:
+        return jsonify({'error': f'missing fields: {missing}'}), 400
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    q = f"""
+        INSERT INTO sales_goals
+            (scope, scope_key, period_start, period_end,
+             target_units, target_revenue, target_listings, notes, updated_at)
+        VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'})
+        ON CONFLICT (scope, scope_key, period_start, period_end) DO UPDATE SET
+            target_units=EXCLUDED.target_units,
+            target_revenue=EXCLUDED.target_revenue,
+            target_listings=EXCLUDED.target_listings,
+            notes=EXCLUDED.notes,
+            updated_at={'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'}
+    """ if USE_POSTGRES else f"""
+        INSERT INTO sales_goals
+            (scope, scope_key, period_start, period_end,
+             target_units, target_revenue, target_listings, notes, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(scope, scope_key, period_start, period_end) DO UPDATE SET
+            target_units=excluded.target_units,
+            target_revenue=excluded.target_revenue,
+            target_listings=excluded.target_listings,
+            notes=excluded.notes,
+            updated_at=CURRENT_TIMESTAMP
+    """
+    params = (data['scope'], data['scope_key'], data['period_start'], data['period_end'],
+              int(data.get('target_units') or 0), float(data.get('target_revenue') or 0),
+              int(data.get('target_listings') or 0), data.get('notes', ''))
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(q, params)
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/crm/goals/<int:goal_id>', methods=['DELETE'])
+def api_crm_goals_delete(goal_id):
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"DELETE FROM sales_goals WHERE id={ph}", (goal_id,))
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"DELETE FROM sales_goals WHERE id={ph}", (goal_id,))
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/crm/goals/progress', methods=['GET'])
+def api_crm_goals_progress():
+    """Compute progress per active goal.
+
+    Progress metrics (best-effort from SOD):
+      - listings: # of stores currently listing this SKU (for scope='sku')
+      - units: cumulative on_hand across stores at latest snapshot
+      - revenue: not tracked (requires price × units; stubbed 0)
+    """
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT id, scope, scope_key, period_start, period_end, target_units, target_revenue, target_listings, notes "
+            "FROM sales_goals WHERE period_start <= %s AND period_end >= %s",
+            (today, today),
+        )
+        goals = cur.fetchall()
+    else:
+        goals = db.execute(
+            "SELECT id, scope, scope_key, period_start, period_end, target_units, target_revenue, target_listings, notes "
+            "FROM sales_goals WHERE period_start <= ? AND period_end >= ?",
+            (today, today),
+        ).fetchall()
+
+    out = []
+    for g in goals:
+        gid, scope, key, pstart, pend, tunits, trev, tlist, notes = g
+        achieved_units = 0
+        achieved_listings = 0
+        if scope == 'sku':
+            sku = str(key).zfill(7)
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT COALESCE(SUM(on_hand),0), SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) "
+                    "FROM sod_inventory WHERE sku=%s AND snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s)",
+                    (sku, sku),
+                )
+                r = cur.fetchone()
+            else:
+                r = db.execute(
+                    "SELECT COALESCE(SUM(on_hand),0), SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) "
+                    "FROM sod_inventory WHERE sku=? AND snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?)",
+                    (sku, sku),
+                ).fetchone()
+            achieved_units = int(r[0] or 0)
+            achieved_listings = int(r[1] or 0)
+        elif scope == 'territory':
+            # aggregate across all tracked SKUs for stores in this territory
+            tracked = list(SOD_TRACKED_SKUS.keys())
+            if tracked:
+                phs = ','.join([ph] * len(tracked))
+                if USE_POSTGRES:
+                    cur.execute(
+                        f"""SELECT COALESCE(SUM(i.on_hand),0),
+                                   SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END)
+                            FROM sod_inventory i
+                            JOIN stores s ON s.store_number = i.store_number
+                            WHERE i.sku IN ({phs})
+                              AND s.territory_id = (SELECT id FROM territories WHERE code=%s OR CAST(id AS TEXT)=%s LIMIT 1)
+                              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)""",
+                        tracked + [key, key],
+                    )
+                    r = cur.fetchone()
+                else:
+                    r = db.execute(
+                        f"""SELECT COALESCE(SUM(i.on_hand),0),
+                                   SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END)
+                            FROM sod_inventory i
+                            JOIN stores s ON s.store_number = i.store_number
+                            WHERE i.sku IN ({phs})
+                              AND s.territory_id = (SELECT id FROM territories WHERE code=? OR CAST(id AS TEXT)=? LIMIT 1)
+                              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)""",
+                        tracked + [key, key],
+                    ).fetchone()
+                achieved_units = int(r[0] or 0)
+                achieved_listings = int(r[1] or 0)
+        # rep scope — roll up across all tracked SKUs in stores assigned to this rep
+        elif scope == 'rep':
+            tracked = list(SOD_TRACKED_SKUS.keys())
+            if tracked:
+                phs = ','.join([ph] * len(tracked))
+                if USE_POSTGRES:
+                    cur.execute(
+                        f"""SELECT COALESCE(SUM(i.on_hand),0),
+                                   SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END)
+                            FROM sod_inventory i
+                            JOIN stores s ON s.store_number = i.store_number
+                            WHERE i.sku IN ({phs}) AND LOWER(s.rep) = LOWER(%s)
+                              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)""",
+                        tracked + [key],
+                    )
+                    r = cur.fetchone()
+                else:
+                    r = db.execute(
+                        f"""SELECT COALESCE(SUM(i.on_hand),0),
+                                   SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END)
+                            FROM sod_inventory i
+                            JOIN stores s ON s.store_number = i.store_number
+                            WHERE i.sku IN ({phs}) AND LOWER(s.rep) = LOWER(?)
+                              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)""",
+                        tracked + [key],
+                    ).fetchone()
+                achieved_units = int(r[0] or 0)
+                achieved_listings = int(r[1] or 0)
+        out.append({
+            'id': gid, 'scope': scope, 'scope_key': key,
+            'period_start': str(pstart), 'period_end': str(pend),
+            'target_units': tunits, 'target_revenue': float(trev or 0), 'target_listings': tlist,
+            'achieved_units': achieved_units, 'achieved_listings': achieved_listings,
+            'pct_units': round(100 * achieved_units / tunits, 1) if tunits else None,
+            'pct_listings': round(100 * achieved_listings / tlist, 1) if tlist else None,
+            'notes': notes,
+        })
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify(out)
+
+
+# ------- HORECA accounts CRUD -------
+@app.route('/api/crm/horeca', methods=['GET'])
+def api_crm_horeca_list():
+    """List HORECA accounts with territory join."""
+    territory_id = request.args.get('territory_id', type=int)
+    status = request.args.get('status', '').strip()
+    account_type = request.args.get('type', '').strip()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = ['1=1']
+    params = []
+    if territory_id:
+        where.append(f'h.territory_id={ph}')
+        params.append(territory_id)
+    if status:
+        where.append(f'h.status={ph}')
+        params.append(status)
+    if account_type:
+        where.append(f'h.account_type={ph}')
+        params.append(account_type)
+    q = f"""
+        SELECT h.id, h.name, h.account_type, h.address, h.city, h.postal,
+               h.phone, h.email, h.contact_name, h.contact_title,
+               h.territory_id, COALESCE(t.name,'') AS territory_name,
+               COALESCE(t.color,'#888'),
+               h.rep_name, h.status, h.priority, h.lat, h.lng,
+               h.last_visit, h.next_visit, h.products_carried, h.notes,
+               h.created_at, h.updated_at
+        FROM horeca_accounts h
+        LEFT JOIN territories t ON t.id = h.territory_id
+        WHERE {' AND '.join(where)}
+        ORDER BY h.priority DESC, h.name
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+    return jsonify([{
+        'id': r[0], 'name': r[1], 'account_type': r[2], 'address': r[3],
+        'city': r[4], 'postal': r[5], 'phone': r[6], 'email': r[7],
+        'contact_name': r[8], 'contact_title': r[9],
+        'territory_id': r[10], 'territory_name': r[11], 'territory_color': r[12],
+        'rep_name': r[13], 'status': r[14], 'priority': r[15],
+        'lat': r[16] or 0, 'lng': r[17] or 0,
+        'last_visit': str(r[18]) if r[18] else '',
+        'next_visit': str(r[19]) if r[19] else '',
+        'products_carried': r[20] or '',
+        'notes': r[21] or '',
+        'created_at': str(r[22]) if r[22] else '',
+        'updated_at': str(r[23]) if r[23] else '',
+    } for r in rows])
+
+
+@app.route('/api/crm/horeca', methods=['POST'])
+def api_crm_horeca_create():
+    data = request.get_json() or {}
+    if not data.get('name'):
+        return jsonify({'error': 'name is required'}), 400
+    # Auto-assign territory from postal+city if not provided
+    tid = data.get('territory_id')
+    if not tid:
+        tcode = classify_territory(data.get('postal', ''), data.get('city', ''))
+        db0 = get_db()
+        ph0 = '%s' if USE_POSTGRES else '?'
+        if USE_POSTGRES:
+            cur0 = db0.cursor()
+            cur0.execute(f"SELECT id FROM territories WHERE code={ph0}", (tcode,))
+            row = cur0.fetchone()
+            cur0.close()
+        else:
+            row = db0.execute(f"SELECT id FROM territories WHERE code={ph0}", (tcode,)).fetchone()
+        tid = row[0] if row else None
+    cols = ['name', 'account_type', 'address', 'city', 'postal', 'phone', 'email',
+            'contact_name', 'contact_title', 'territory_id', 'rep_name', 'status',
+            'priority', 'lat', 'lng', 'last_visit', 'next_visit', 'products_carried', 'notes']
+    vals = (
+        data.get('name', ''), data.get('account_type', 'restaurant'),
+        data.get('address', ''), data.get('city', ''), data.get('postal', ''),
+        data.get('phone', ''), data.get('email', ''),
+        data.get('contact_name', ''), data.get('contact_title', ''),
+        tid, data.get('rep_name', ''), data.get('status', 'prospect'),
+        data.get('priority', 'Standard'),
+        float(data.get('lat') or 0), float(data.get('lng') or 0),
+        data.get('last_visit') or None, data.get('next_visit') or None,
+        data.get('products_carried', ''), data.get('notes', ''),
+    )
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"INSERT INTO horeca_accounts ({', '.join(cols)}) VALUES ({','.join(['%s']*len(cols))}) RETURNING id",
+            vals,
+        )
+        new_id = cur.fetchone()[0]
+        db.commit()
+        cur.close()
+    else:
+        c = db.execute(
+            f"INSERT INTO horeca_accounts ({', '.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            vals,
+        )
+        new_id = c.lastrowid
+        db.commit()
+    return jsonify({'status': 'ok', 'id': new_id})
+
+
+@app.route('/api/crm/horeca/<int:hid>', methods=['PUT'])
+def api_crm_horeca_update(hid):
+    data = request.get_json() or {}
+    allowed = ('name', 'account_type', 'address', 'city', 'postal', 'phone', 'email',
+               'contact_name', 'contact_title', 'territory_id', 'rep_name', 'status',
+               'priority', 'lat', 'lng', 'last_visit', 'next_visit', 'products_carried', 'notes')
+    fields = []
+    params = []
+    ph = '%s' if USE_POSTGRES else '?'
+    for col in allowed:
+        if col in data:
+            fields.append(f"{col}={ph}")
+            params.append(data[col] if data[col] != '' else None if col in ('last_visit', 'next_visit', 'territory_id') else data[col])
+    if not fields:
+        return jsonify({'error': 'no updatable fields'}), 400
+    fields.append(f"updated_at={'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'}")
+    params.append(hid)
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"UPDATE horeca_accounts SET {', '.join(fields)} WHERE id={ph}", params)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"UPDATE horeca_accounts SET {', '.join(fields)} WHERE id={ph}", params)
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/crm/horeca/<int:hid>', methods=['DELETE'])
+def api_crm_horeca_delete(hid):
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"DELETE FROM horeca_accounts WHERE id={ph}", (hid,))
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"DELETE FROM horeca_accounts WHERE id={ph}", (hid,))
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+# ------- Unified store detail (SOD + live LCBO.com) -------
+@app.route('/api/crm/store/<int:store_number>/inventory', methods=['GET'])
+def api_crm_store_inventory(store_number):
+    """Return current tracked-SKU status at this store from BOTH sources:
+      - SOD (last snapshot): status, on_hand
+      - LCBO.com live (optional, set live=1): on_hand right now
+    """
+    include_live = request.args.get('live', '').lower() in ('1', 'true', 'yes')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    if not tracked:
+        return jsonify({'store_number': store_number, 'sod': [], 'live': []})
+    phs = ','.join([ph] * len(tracked))
+    q = f"""
+        WITH latest AS (
+            SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+            WHERE sku IN ({phs}) GROUP BY sku
+        )
+        SELECT i.sku, i.product_name, i.status, i.on_hand, i.snapshot_date
+        FROM sod_inventory i
+        JOIN latest l ON l.sku = i.sku AND l.d = i.snapshot_date
+        WHERE i.store_number = {ph}
+        ORDER BY i.sku
+    """
+    params = tracked + [store_number]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        sod_rows = cur.fetchall()
+        cur.close()
+    else:
+        sod_rows = db.execute(q, params).fetchall()
+    sod = [{
+        'sku': r[0], 'product_name': r[1], 'status': r[2],
+        'on_hand': r[3], 'snapshot_date': str(r[4]),
+        'brand': SOD_TRACKED_SKUS.get(r[0], ('', ''))[0],
+    } for r in sod_rows]
+
+    live = []
+    if include_live:
+        # Use existing scrape_lcbo_inventory for each tracked SKU, filter for this store
+        try:
+            for sku in tracked:
+                try:
+                    results = scrape_lcbo_inventory(sku.lstrip('0'))  # type: ignore[name-defined]
+                except Exception:
+                    results = []
+                for row in results or []:
+                    if str(row.get('store_number', '')) == str(store_number):
+                        live.append({
+                            'sku': sku,
+                            'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+                            'product_name': SOD_TRACKED_SKUS.get(sku, ('', ''))[1],
+                            'quantity': row.get('quantity', 0),
+                            'store_name': row.get('store_name', ''),
+                            'city': row.get('store_city', ''),
+                            'source': 'lcbo.com_live',
+                        })
+                        break
+        except Exception as e:
+            live = [{'error': f'live fetch failed: {e}'}]
+    return jsonify({'store_number': store_number, 'sod': sod, 'live': live})
+
+
+# ------- Full-DB backup (JSON) -------
+@app.route('/api/crm/backup', methods=['GET'])
+def api_crm_backup():
+    """One-shot JSON dump of all CRM + SOD tables. Use for offline backup / disaster recovery.
+
+    Pipe to a file:  curl https://.../api/crm/backup > backup-$(date +%F).json
+    """
+    db = get_db()
+    tables = [
+        'territories', 'stores', 'horeca_accounts', 'sales_goals',
+        'sod_products', 'sod_listing_changes',
+        # intentionally excluded (too large for a quick backup): sod_inventory, inventory_history
+        'reps', 'products', 'followups',
+    ]
+    out = {'generated_at': datetime.utcnow().isoformat() + 'Z', 'tables': {}}
+    for t in tables:
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(f"SELECT * FROM {t}")
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in cur.fetchall()]
+                cur.close()
+            else:
+                rows_raw = db.execute(f"SELECT * FROM {t}").fetchall()
+                cols = [d[0] for d in db.execute(f"SELECT * FROM {t} LIMIT 0").description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in rows_raw]
+            out['tables'][t] = {'row_count': len(rows), 'rows': rows}
+        except Exception as e:
+            out['tables'][t] = {'error': str(e)}
+    return jsonify(out)
+
+
+def _json_safe(v):
+    """Make a DB value JSON-friendly."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float, bool, str)):
+        return v
+    try:
+        # datetime/date
+        return v.isoformat()
+    except Exception:
+        return str(v)
+
+
+# ------- CRM dashboard rollup — one-shot for the homepage -------
+@app.route('/api/crm/dashboard', methods=['GET'])
+def api_crm_dashboard():
+    """Everything the main CRM dashboard needs in one call.
+
+    Returns: summary KPIs, OOS-risk count, gap count, recent listings/delistings,
+             territory breakdown, tracked-SKU rollup.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # SOD latest snapshot
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+        latest = cur.fetchone()[0]
+    else:
+        latest = db.execute("SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
+
+    # Tracked SKU rollup from sod_products
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    sku_rollup = []
+    if tracked:
+        phs = ','.join([ph] * len(tracked))
+        if USE_POSTGRES:
+            cur.execute(
+                f"SELECT sku, product_name, current_status, store_count, total_on_hand, brand "
+                f"FROM sod_products WHERE sku IN ({phs}) ORDER BY sku",
+                tracked,
+            )
+            rr = cur.fetchall()
+        else:
+            rr = db.execute(
+                f"SELECT sku, product_name, current_status, store_count, total_on_hand, brand "
+                f"FROM sod_products WHERE sku IN ({phs}) ORDER BY sku",
+                tracked,
+            ).fetchall()
+        for r in rr:
+            brand, pname = SOD_TRACKED_SKUS.get(r[0], (r[5] or '', r[1]))
+            sku_rollup.append({
+                'sku': r[0], 'brand': brand, 'product_name': pname or r[1],
+                'current_status': r[2], 'store_count': r[3], 'total_on_hand': r[4],
+            })
+
+    # OOS brink count (on_hand <= 2, tracked, L)
+    oos_brink_count = 0
+    if tracked and latest:
+        phs = ','.join([ph] * len(tracked))
+        if USE_POSTGRES:
+            cur.execute(
+                f"""SELECT COUNT(*) FROM sod_inventory
+                    WHERE sku IN ({phs}) AND status='L' AND on_hand <= 2
+                      AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = sod_inventory.sku)""",
+                tracked,
+            )
+            oos_brink_count = cur.fetchone()[0] or 0
+        else:
+            oos_brink_count = db.execute(
+                f"""SELECT COUNT(*) FROM sod_inventory
+                    WHERE sku IN ({phs}) AND status='L' AND on_hand <= 2
+                      AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory i2 WHERE i2.sku = sod_inventory.sku)""",
+                tracked,
+            ).fetchone()[0] or 0
+
+    # Listings/delistings last 7 days
+    since = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
+    if USE_POSTGRES:
+        cur.execute(
+            "SELECT change_type, COUNT(*) FROM sod_listing_changes WHERE change_date >= %s GROUP BY change_type",
+            (since,),
+        )
+        digest_counts = {r[0]: r[1] for r in cur.fetchall()}
+    else:
+        digest_counts = {r[0]: r[1] for r in db.execute(
+            "SELECT change_type, COUNT(*) FROM sod_listing_changes WHERE change_date >= ?",
+            (since,),
+        ).fetchall()}
+
+    # Territory store counts
+    if USE_POSTGRES:
+        cur.execute("""
+            SELECT t.code, t.name, t.color, COUNT(s.id)
+            FROM territories t LEFT JOIN stores s ON s.territory_id = t.id
+            GROUP BY t.code, t.name, t.color ORDER BY t.name
+        """)
+        terr = [{'code': r[0], 'name': r[1], 'color': r[2], 'store_count': r[3]} for r in cur.fetchall()]
+        cur.close()
+    else:
+        terr = [{'code': r[0], 'name': r[1], 'color': r[2], 'store_count': r[3]} for r in db.execute("""
+            SELECT t.code, t.name, t.color, COUNT(s.id)
+            FROM territories t LEFT JOIN stores s ON s.territory_id = t.id
+            GROUP BY t.code, t.name, t.color ORDER BY t.name
+        """).fetchall()]
+
+    return jsonify({
+        'latest_snapshot': str(latest) if latest else None,
+        'tracked_sku_rollup': sku_rollup,
+        'oos_brink_count': oos_brink_count,
+        'digest_last_7_days': digest_counts,
+        'territories': terr,
+    })
+
+
+# ------- Optional daily lcbo.com scrape (dual-source ingest) -------
+_lcbo_scheduler = None
+
+
+def _lcbo_daily_scrape_worker():
+    """Scrape live LCBO.com inventory for each tracked SKU and log into inventory_history.
+
+    This gives us a second data source alongside SOD — useful for SKUs that LCBO uploads
+    late or that are on a different release schedule. Idempotent: always appends with a
+    fresh recorded_at timestamp (inventory_history is an append-only trend table).
+    """
+    try:
+        scrape = globals().get('scrape_lcbo_inventory')
+        if not callable(scrape):
+            print('[LCBO-live] scrape_lcbo_inventory not available')
+            return
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        total_rows = 0
+        for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
+            sku_clean = sku.lstrip('0')
+            try:
+                rows = scrape(sku_clean) or []
+            except Exception as e:
+                print(f'[LCBO-live] scrape failed for {sku}: {e}')
+                continue
+            # Find/create product row
+            if USE_POSTGRES:
+                cur.execute("SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1", (sku_clean,))
+                prow = cur.fetchone()
+            else:
+                prow = cur.execute("SELECT id FROM products WHERE lcbo_sku=? LIMIT 1", (sku_clean,)).fetchone()
+            if not prow:
+                continue
+            pid = prow[0]
+            for r in rows:
+                if USE_POSTGRES:
+                    cur.execute(
+                        """INSERT INTO inventory_history
+                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                           VALUES (%s,%s,%s,%s,%s,NOW())""",
+                        (pid, str(r.get('store_number', '')), r.get('store_name', ''),
+                         r.get('store_city', ''), r.get('quantity', 0)),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO inventory_history
+                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                           VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                        (pid, str(r.get('store_number', '')), r.get('store_name', ''),
+                         r.get('store_city', ''), r.get('quantity', 0)),
+                    )
+                total_rows += 1
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f'[LCBO-live] scraped {total_rows} store-rows across {len(SOD_TRACKED_SKUS)} SKUs')
+    except Exception as e:
+        print(f'[LCBO-live] daily scrape failed: {e}')
+
+
+def start_lcbo_scheduler():
+    """Start the daily lcbo.com scraper at 04:00 America/Toronto (1 hour after SOD)."""
+    global _lcbo_scheduler
+    if _lcbo_scheduler is not None:
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[LCBO-live] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        sched.add_job(
+            _lcbo_daily_scrape_worker,
+            CronTrigger(hour=4, minute=0),
+            id='lcbo_daily_scrape',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 6,
+        )
+        sched.start()
+        _lcbo_scheduler = sched
+        print(f'[LCBO-live] Daily scraper scheduled for 04:00 ET')
+    except Exception as e:
+        print(f'[LCBO-live] scheduler failed: {e}')
+
+
 # ======== INIT ========
 
 init_db()
 seed_data()
+seed_territories()
+refresh_sod_product_categories()
 start_sod_scheduler()
+start_lcbo_scheduler()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
