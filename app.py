@@ -2178,30 +2178,38 @@ def api_daily_plan():
 
     for day_idx in range(days):
         day_stores = []
-        # Pick a seed city that has unassigned stores
+        # Pick a seed: prefer one with valid coords so haversine clustering works.
+        # Sprint 0 fix: previously could seed on lat=0 store, breaking distance calc.
         seed_store = None
         for s in store_list:
-            if s['id'] not in assigned:
+            if s['id'] not in assigned and s.get('lat') and s.get('lng'):
                 seed_store = s
                 break
+        if seed_store is None:
+            # Fall back to any unassigned store (city-grouping only)
+            for s in store_list:
+                if s['id'] not in assigned:
+                    seed_store = s
+                    break
         if not seed_store:
             break
 
         day_stores.append(seed_store)
         assigned.add(seed_store['id'])
         seed_city = seed_store.get('city', '')
+        seed_has_coords = bool(seed_store.get('lat') and seed_store.get('lng'))
 
-        # Fill rest of day with nearby stores (same city first, then nearby)
+        # Fill rest of day with nearby stores (same city first, then within 15km).
         for s in store_list:
             if len(day_stores) >= stores_per_day:
                 break
             if s['id'] in assigned:
                 continue
-            # Same city or within 15km
+            # Same city is the strongest signal regardless of coords
             if s.get('city') == seed_city:
                 day_stores.append(s)
                 assigned.add(s['id'])
-            elif seed_store['lat'] and s.get('lat'):
+            elif seed_has_coords and s.get('lat') and s.get('lng'):
                 dist = haversine(seed_store['lat'], seed_store['lng'], s['lat'], s['lng'])
                 if dist < 15:
                     day_stores.append(s)
@@ -2361,59 +2369,150 @@ class SODClient:
         if not self._logged_in:
             self.login()
 
-    def latest_filename(self, source):
-        """Infer today's filename from weekday.
+    def _toronto_now(self):
+        """Return current time in America/Toronto. Falls back to UTC-5 if zoneinfo unavailable."""
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo('America/Toronto'))
+        except Exception:
+            # Conservative fallback: UTC-5 (EST). Off by 1h during DST but weekday usually still right.
+            return datetime.utcnow() - timedelta(hours=5)
 
-        LCBO uploads nightly (~02:00 ET). If the current time is before ~02:30 ET,
-        today's file may not yet be present and we fall back to yesterday's.
-        """
-        import calendar
-        # Use today's weekday; caller can fall back to yesterday on 404
-        today = datetime.utcnow()
-        # SOD timezone is America/Toronto; naive handling: use UTC day-of-week
-        wd = today.strftime('%a').upper()  # 'TUE'
+    def _filename_for_weekday(self, source, weekday_abbrev):
+        """Build the SOD filename for a given source and weekday abbrev (MON/TUE/...)."""
+        wd = weekday_abbrev.upper()
         if source == 'daily_a':
             return f'alldlyinventory{wd}.zip'
         elif source == 'daily_b':
             return f'Edlyinventory{self.agent_id}{wd}.zip'
         raise ValueError(f'Unknown source {source!r}')
 
-    def download_option(self, source, filename=None):
-        """Download a specific SOD file. Returns (bytes, filename)."""
-        self._ensure_logged_in()
-        fn = filename or self.latest_filename(source)
+    def latest_filename(self, source):
+        """Today's filename based on America/Toronto weekday.
+
+        LCBO uploads nightly (~02:00 ET). If we're before that, today's file
+        may not be present yet — `download_option` walks back day-by-day to find
+        the freshest available file.
+        """
+        wd = self._toronto_now().strftime('%a').upper()
+        return self._filename_for_weekday(source, wd)
+
+    def _url_for(self, source, fn):
         if source == 'daily_a':
-            url = f'{SOD_BASE}/downloads/general/12/{fn}'
+            return f'{SOD_BASE}/downloads/general/12/{fn}'
         elif source == 'daily_b':
-            url = f'{SOD_BASE}/downloads/agent/{self.agent_id}/13/{fn}'
-        else:
-            raise ValueError(f'Unknown source {source!r}')
-        r = self.session.get(url, timeout=self.timeout, stream=True)
-        if r.status_code == 404:
-            # Try yesterday's file as fallback
-            yd = (datetime.utcnow() - timedelta(days=1)).strftime('%a').upper()
-            if source == 'daily_a':
-                fn = f'alldlyinventory{yd}.zip'
-                url = f'{SOD_BASE}/downloads/general/12/{fn}'
-            else:
-                fn = f'Edlyinventory{self.agent_id}{yd}.zip'
-                url = f'{SOD_BASE}/downloads/agent/{self.agent_id}/13/{fn}'
+            return f'{SOD_BASE}/downloads/agent/{self.agent_id}/13/{fn}'
+        raise ValueError(f'Unknown source {source!r}')
+
+    def _peek_snapshot_date(self, zip_bytes):
+        """Read the FIRST data row of the .dat inside a zip and return its YYYY-MM-DD.
+
+        Used to validate freshness before accepting a candidate file.
+        Returns '' on any error (caller treats as "unknown / accept reluctantly").
+        """
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                members = zf.namelist()
+                if not members:
+                    return ''
+                with zf.open(members[0]) as raw:
+                    head = raw.read(64).decode('latin-1', errors='replace')
+                if len(head) < 8:
+                    return ''
+                d = head[:8]
+                if not d.isdigit():
+                    return ''
+                return f'{d[0:4]}-{d[4:6]}-{d[6:8]}'
+        except Exception:
+            return ''
+
+    def download_option(self, source, filename=None, max_days_back=7, max_age_days=3):
+        """Download a SOD file with multi-day walkback + freshness validation.
+
+        Walks back up to `max_days_back` days from today (Toronto time). For each
+        candidate filename: HTTPs it; if 200 with PK zip bytes, peeks at the first
+        row's date; accepts if (today - snapshot) <= `max_age_days`. If we exhaust
+        the walkback without finding a fresh file, returns the most recent file we
+        DID find (even if older than max_age_days) so the app keeps working — but
+        the caller should surface staleness via /api/sod/status freshness flags.
+
+        Returns (zip_bytes, filename, snapshot_date_str | '').
+        """
+        self._ensure_logged_in()
+        toronto_today = self._toronto_now().date()
+
+        # If caller supplied an explicit filename, honor it (single attempt, no walkback).
+        if filename:
+            url = self._url_for(source, filename)
             r = self.session.get(url, timeout=self.timeout, stream=True)
-        r.raise_for_status()
-        content = r.content
-        if not content or not content.startswith(b'PK'):
-            raise RuntimeError(f"Did not receive zip data from {url} (content-type={r.headers.get('Content-Type')})")
-        return content, fn
+            r.raise_for_status()
+            content = r.content
+            if not content or not content.startswith(b'PK'):
+                raise RuntimeError(f"Did not receive zip data from {url}")
+            snap = self._peek_snapshot_date(content)
+            return content, filename, snap
+
+        # Walk back day-by-day, prefer fresher snapshots.
+        last_resort = None  # (content, fn, snap) — kept in case nothing fresh found
+        tried = []
+        for offset in range(0, max_days_back):
+            d = toronto_today - timedelta(days=offset)
+            wd = d.strftime('%a').upper()
+            fn = self._filename_for_weekday(source, wd)
+            # Avoid duplicate attempts when the same weekday appears twice in 7 days
+            # (it doesn't in 7-day window, but defense in depth).
+            if fn in [t[0] for t in tried]:
+                continue
+            url = self._url_for(source, fn)
+            try:
+                r = self.session.get(url, timeout=self.timeout, stream=True)
+            except Exception as e:
+                tried.append((fn, f'request_error:{type(e).__name__}'))
+                continue
+            if r.status_code == 404:
+                tried.append((fn, '404'))
+                continue
+            try:
+                r.raise_for_status()
+            except Exception:
+                tried.append((fn, f'http_{r.status_code}'))
+                continue
+            content = r.content
+            if not content or not content.startswith(b'PK'):
+                tried.append((fn, 'not_zip'))
+                continue
+            snap = self._peek_snapshot_date(content)
+            tried.append((fn, f'200,snap={snap}'))
+            # Accept if snapshot is fresh
+            if snap:
+                try:
+                    snap_d = datetime.strptime(snap, '%Y-%m-%d').date()
+                    age = (toronto_today - snap_d).days
+                    if age <= max_age_days:
+                        return content, fn, snap
+                except Exception:
+                    pass
+            # Keep as last_resort if we don't find anything fresh
+            if last_resort is None:
+                last_resort = (content, fn, snap)
+
+        if last_resort is not None:
+            print(f'[SOD] WARNING: no fresh file found in {max_days_back}-day walkback. '
+                  f'Returning stale file. Tried: {tried}')
+            return last_resort
+        raise RuntimeError(f'[SOD] No SOD file found in {max_days_back}-day walkback. Tried: {tried}')
 
     def download_zip_bytes(self, source, filename=None):
-        """Download and return the raw zip bytes + final filename.
+        """Download and return the raw zip bytes + final filename + snapshot date.
 
         Kept small in memory (~9MB for Daily A). The .dat inside is ~75MB
         uncompressed — we NEVER materialize that blob; callers must stream
-        the member via open_dat_stream() instead.
+        the member via stream_parse_sod_zip() instead.
+
+        Backward-compatible: returns (bytes, filename) if 2 values are unpacked,
+        but new code can unpack (bytes, filename, snapshot_date).
         """
-        data, fn = self.download_option(source, filename=filename)
-        return data, fn
+        return self.download_option(source, filename=filename)
 
 
 def _parse_sod_line(line):
@@ -2570,8 +2669,15 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         conn.commit()
 
         # 1) Download zip bytes (small — ~9MB for Daily A, ~8KB for Daily B)
+        # download_zip_bytes now walks back up to 7 days and validates freshness.
         client = client or SODClient()
-        zip_bytes, zip_name = client.download_zip_bytes(source, filename=filename)
+        download_result = client.download_zip_bytes(source, filename=filename)
+        # Tolerate both old (2-tuple) and new (3-tuple) signatures
+        if len(download_result) == 3:
+            zip_bytes, zip_name, peeked_snapshot = download_result
+        else:
+            zip_bytes, zip_name = download_result
+            peeked_snapshot = ''
 
         # 2) Stream-parse directly from the zip. NEVER materializes the 75MB .dat text
         #    or the 1.5M-row list. Only keeps small aggregates + tracked rows.
@@ -2864,13 +2970,26 @@ def start_sod_sync_async(sources=None):
 
 @app.route('/api/sod/status', methods=['GET'])
 def api_sod_status():
-    """Last sync runs + counts of ingested data + configuration check."""
+    """Last sync runs + counts of ingested data + configuration check + freshness."""
     configured = bool(SOD_USER and SOD_PASSWORD)
-    rows = db_fetchall(
-        "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
-        "anu_rows, new_listings, new_delistings, duration_seconds, error "
-        "FROM sod_sync_runs ORDER BY run_at DESC LIMIT 20"
-    )
+    # Filter out orphaned 'running' rows older than 6h — they're crashes.
+    if USE_POSTGRES:
+        rows_query = (
+            "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
+            "anu_rows, new_listings, new_delistings, duration_seconds, error "
+            "FROM sod_sync_runs "
+            "WHERE NOT (status='running' AND run_at < NOW() - INTERVAL '6 hours') "
+            "ORDER BY run_at DESC LIMIT 20"
+        )
+    else:
+        rows_query = (
+            "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
+            "anu_rows, new_listings, new_delistings, duration_seconds, error "
+            "FROM sod_sync_runs "
+            "WHERE NOT (status='running' AND datetime(run_at) < datetime('now','-6 hours')) "
+            "ORDER BY run_at DESC LIMIT 20"
+        )
+    rows = db_fetchall(rows_query)
     last_by_source = {}
     for r in rows:
         rd = row_to_dict(r) if not isinstance(r, dict) else r
@@ -2896,8 +3015,34 @@ def api_sod_status():
             **stats,
             'tracked_products': tracked_count,
         },
+        'freshness': _sod_freshness(),
         'scheduler_running': _sod_scheduler_running(),
     })
+
+
+@app.route('/api/sod/refresh-snapshot', methods=['POST'])
+def api_sod_refresh_snapshot():
+    """Force a SOD sync RIGHT NOW with multi-day walkback enabled.
+
+    Use this when you suspect the data is stale. Synchronously triggers a
+    sync (in a thread) and returns 202; check /api/sod/status after ~30s.
+    """
+    if not SOD_USER or not SOD_PASSWORD:
+        return jsonify({'error': 'SOD_USER / SOD_PASSWORD env vars not configured'}), 400
+    if _sod_sync_lock.locked():
+        return jsonify({'status': 'already_running'}), 202
+    sources = ['daily_a', 'daily_b']
+    body = request.get_json(silent=True) or {}
+    if body.get('sources'):
+        sources = [s for s in body['sources'] if s in ('daily_a', 'daily_b')]
+    # Cleanup orphans first
+    _cleanup_orphaned_sod_runs(max_age_hours=1)
+    start_sod_sync_async(sources)
+    return jsonify({
+        'status': 'started',
+        'sources': sources,
+        'note': 'walkback up to 7 days; check /api/sod/status in 60-90s for freshness',
+    }), 202
 
 
 @app.route('/api/sod/sync', methods=['POST'])
@@ -3152,12 +3297,17 @@ def _sod_summary_for_range(start_date, end_date):
     """Return a dict summarising SOD data for a [start, end] date range (inclusive).
 
     If the requested window has no data, automatically shifts the window to end on
-    the latest available snapshot (preserves the window length). This keeps the
-    reports useful on weekends / when today's file hasn't been uploaded yet.
+    the latest available snapshot (preserves the window length) AND surfaces this
+    in the response via `window_shifted: true`, with `requested_window` echoing
+    what the caller asked for. This keeps the API honest — the user knows the
+    data is from a different window than they requested.
     """
     ph = _sod_ph()
-    start = start_date.isoformat() if isinstance(start_date, (datetime,)) else str(start_date)
-    end = end_date.isoformat() if isinstance(end_date, (datetime,)) else str(end_date)
+    requested_start = start_date.isoformat() if isinstance(start_date, (datetime,)) else str(start_date)
+    requested_end = end_date.isoformat() if isinstance(end_date, (datetime,)) else str(end_date)
+    start = requested_start
+    end = requested_end
+    window_shifted = False
 
     # Empty-range fallback: anchor to latest snapshot we actually have
     probe = db_fetchone(
@@ -3177,6 +3327,7 @@ def _sod_summary_for_range(start_date, end_date):
                 new_start = new_end - timedelta(days=window_len)
                 start = new_start.isoformat()
                 end = new_end.isoformat()
+                window_shifted = True
             except Exception:
                 pass
 
@@ -3231,7 +3382,14 @@ def _sod_summary_for_range(start_date, end_date):
         snapshot_metrics = [row_to_dict(r) for r in snapshot_metrics_rows]
 
     return {
-        'window': {'start': start, 'end': end, 'latest_snapshot': str(latest_date) if latest_date else None},
+        'window': {
+            'start': start,
+            'end': end,
+            'latest_snapshot': str(latest_date) if latest_date else None,
+            'window_shifted': window_shifted,
+            'requested_window': {'start': requested_start, 'end': requested_end},
+        },
+        'freshness': _sod_freshness(),
         'per_sku': [row_to_dict(r) for r in per_sku],
         'snapshot_metrics': snapshot_metrics,
         'listing_changes': [row_to_dict(r) for r in changes],
@@ -3245,24 +3403,46 @@ def _sod_summary_for_range(start_date, end_date):
     }
 
 
+def _toronto_today():
+    """Today's date in America/Toronto."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/Toronto')).date()
+    except Exception:
+        return (datetime.utcnow() - timedelta(hours=5)).date()
+
+
 @app.route('/api/reports/daily', methods=['GET'])
 def api_report_daily():
     day_str = request.args.get('date')
     try:
-        day = datetime.strptime(day_str, '%Y-%m-%d').date() if day_str else datetime.utcnow().date()
+        day = datetime.strptime(day_str, '%Y-%m-%d').date() if day_str else _toronto_today()
     except ValueError:
-        day = datetime.utcnow().date()
+        day = _toronto_today()
     return jsonify(_sod_summary_for_range(day, day))
 
 
 @app.route('/api/reports/weekly', methods=['GET'])
 def api_report_weekly():
+    """Mon-Sun week. ?end=YYYY-MM-DD (any day in target week) or omit for current week.
+
+    Mode toggle: ?mode=rolling7 returns the legacy rolling-7-day window for
+    callers that depend on it.
+    """
     end_str = request.args.get('end')
+    mode = request.args.get('mode', 'mon-sun').lower()
     try:
-        end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else datetime.utcnow().date()
+        anchor = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else _toronto_today()
     except ValueError:
-        end = datetime.utcnow().date()
-    start = end - timedelta(days=6)
+        anchor = _toronto_today()
+    if mode == 'rolling7':
+        end = anchor
+        start = end - timedelta(days=6)
+    else:
+        # Mon-Sun aligned week containing the anchor date
+        # weekday(): Mon=0 .. Sun=6
+        start = anchor - timedelta(days=anchor.weekday())  # this Mon
+        end = start + timedelta(days=6)                    # this Sun
     return jsonify(_sod_summary_for_range(start, end))
 
 
@@ -3270,9 +3450,9 @@ def api_report_weekly():
 def api_report_monthly():
     end_str = request.args.get('end')
     try:
-        end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else datetime.utcnow().date()
+        end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else _toronto_today()
     except ValueError:
-        end = datetime.utcnow().date()
+        end = _toronto_today()
     start = end.replace(day=1)
     return jsonify(_sod_summary_for_range(start, end))
 
@@ -3283,30 +3463,39 @@ def api_report_rep():
     latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
     snapshot_date = (latest['d'] if isinstance(latest, dict) else latest[0]) if latest else None
 
-    # All reps (from stores table)
+    # All reps (from stores table) — TRIM + LOWER de-dupe variants of the same name.
+    # Sprint 0 fix: previously case-sensitive → "John Smith" / "JOHN SMITH" / " john smith "
+    # were 3 separate "reps" each with 1 store. Now collapsed.
+    # Display name is "first variant we see" via MIN(rep) per group.
     rep_rows = db_fetchall(
-        "SELECT rep, COUNT(*) AS store_count FROM stores WHERE rep IS NOT NULL AND rep != '' "
-        "GROUP BY rep ORDER BY store_count DESC"
+        "SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count FROM stores "
+        "WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+        "GROUP BY LOWER(TRIM(rep)) ORDER BY store_count DESC"
     )
     out = []
     for rr in rep_rows:
         rd = row_to_dict(rr)
         rep_name = rd['rep']
-        # Per-rep: how many of his stores are carrying each tracked SKU
+        # Per-rep: how many of his stores are carrying each tracked SKU.
+        # FIXED Sprint 0: filter status='L' so delisting/delisted stores are NOT
+        # counted as "carrying" — that bug silently understated gap counts.
+        # Also case/whitespace-insensitive rep match.
         per_sku = []
         if snapshot_date:
             for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
                 carrying = db_fetchone(
                     "SELECT COUNT(*) AS c FROM sod_inventory i "
                     "JOIN stores s ON s.store_number = i.store_number "
-                    "WHERE s.rep = ? AND i.sku = ? AND i.snapshot_date = ?",
+                    "WHERE LOWER(TRIM(s.rep)) = LOWER(TRIM(?)) AND i.sku = ? "
+                    "AND i.snapshot_date = ? AND i.status = 'L'",
                     [rep_name, sku, str(snapshot_date)],
                 )
                 carrying_cnt = (row_to_dict(carrying) or {}).get('c', 0)
                 delisting = db_fetchone(
                     "SELECT COUNT(*) AS c FROM sod_inventory i "
                     "JOIN stores s ON s.store_number = i.store_number "
-                    "WHERE s.rep = ? AND i.sku = ? AND i.snapshot_date = ? AND i.status = 'D'",
+                    "WHERE LOWER(TRIM(s.rep)) = LOWER(TRIM(?)) AND i.sku = ? "
+                    "AND i.snapshot_date = ? AND i.status IN ('D','F')",
                     [rep_name, sku, str(snapshot_date)],
                 )
                 delisting_cnt = (row_to_dict(delisting) or {}).get('c', 0)
@@ -3339,7 +3528,12 @@ def _sod_scheduler_running():
 
 
 def _sod_last_successful_sync_age_hours():
-    """Return hours since last successful sync, or None if never synced."""
+    """Return hours since last successful sync RUN, or None if never synced.
+
+    NOTE: This is the age of the last sync ATTEMPT, NOT the age of the data
+    inside that sync. A sync that successfully ingested 7-day-old data still
+    reports "0 hours" here. For data freshness, use _sod_data_age_days().
+    """
     row = db_fetchone(
         "SELECT run_at FROM sod_sync_runs WHERE status='success' ORDER BY run_at DESC LIMIT 1"
     )
@@ -3358,6 +3552,147 @@ def _sod_last_successful_sync_age_hours():
             except Exception:
                 return None
     return (datetime.utcnow() - val).total_seconds() / 3600.0
+
+
+def _max_snapshot_date():
+    """Get MAX(snapshot_date) from sod_inventory using a dedicated connection.
+
+    Safe to call outside Flask request context (e.g. from startup/scheduler).
+    Returns a date or None.
+    """
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+        r = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not r:
+            return None
+        snap = r[0]
+        if snap is None:
+            return None
+        if isinstance(snap, str):
+            try:
+                return datetime.strptime(snap, '%Y-%m-%d').date()
+            except Exception:
+                return None
+        if hasattr(snap, 'date'):
+            return snap.date()
+        return snap
+    except Exception:
+        return None
+
+
+def _sod_data_age_days():
+    """Return days between today (Toronto) and the freshest snapshot in sod_inventory.
+
+    This is the TRUE freshness — what the user actually cares about.
+    Returns None if no data ingested yet.
+    """
+    snap = _max_snapshot_date()
+    if snap is None:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo('America/Toronto')).date()
+    except Exception:
+        today = (datetime.utcnow() - timedelta(hours=5)).date()
+    return (today - snap).days
+
+
+def _last_successful_run_age_hours_safe():
+    """Same as _sod_last_successful_sync_age_hours but Flask-context-free."""
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT run_at FROM sod_sync_runs WHERE status='success' ORDER BY run_at DESC LIMIT 1")
+        r = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not r:
+            return None
+        val = r[0]
+        if isinstance(val, str):
+            try:
+                val = datetime.fromisoformat(val)
+            except Exception:
+                try:
+                    val = datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    return None
+        # Strip tz if present so subtraction works
+        if hasattr(val, 'tzinfo') and val.tzinfo is not None:
+            val = val.replace(tzinfo=None)
+        return (datetime.utcnow() - val).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _sod_freshness():
+    """Return a freshness summary dict used by every report response.
+
+    Keys:
+      latest_snapshot: 'YYYY-MM-DD' or None
+      snapshot_age_days: int or None
+      is_stale: bool (True if age > 2 days)
+      last_run_age_hours: float or None
+    """
+    snap = _max_snapshot_date()
+    age_days = None
+    if snap is not None:
+        try:
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo('America/Toronto')).date()
+        except Exception:
+            today = (datetime.utcnow() - timedelta(hours=5)).date()
+        age_days = (today - snap).days
+    last_run = _last_successful_run_age_hours_safe()
+    return {
+        'latest_snapshot': snap.isoformat() if snap else None,
+        'snapshot_age_days': age_days,
+        'is_stale': (age_days is not None and age_days > 2),
+        'last_run_age_hours': round(last_run, 2) if last_run is not None else None,
+    }
+
+
+def _cleanup_orphaned_sod_runs(max_age_hours=6):
+    """Mark orphaned 'running' rows as failed if they've been sitting > max_age_hours.
+
+    These are crashes — the process died mid-sync and never updated the row.
+    Without this cleanup, /api/sod/status shows misleading 'running' rows forever.
+    `max_age_hours` is an int we control (no SQL-injection risk via f-string).
+    """
+    try:
+        h = int(max_age_hours)  # defend against type confusion
+        if USE_POSTGRES:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE sod_sync_runs SET status='failed', "
+                f"error=COALESCE(error,'') || ' [auto-cleaned: orphaned > {h}h]' "
+                f"WHERE status='running' AND run_at < NOW() - INTERVAL '{h} hours'"
+            )
+            n = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+        else:
+            db = sqlite3.connect(DB_PATH)
+            cur = db.execute(
+                f"UPDATE sod_sync_runs SET status='failed', "
+                f"error=COALESCE(error,'') || ' [auto-cleaned: orphaned > {h}h]' "
+                f"WHERE status='running' AND datetime(run_at) < datetime('now', '-{h} hours')"
+            )
+            n = cur.rowcount
+            db.commit()
+            db.close()
+        if n:
+            print(f'[SOD] cleaned up {n} orphaned running rows (> {h}h old)')
+        return n
+    except Exception as e:
+        print(f'[SOD] orphan cleanup failed: {e}')
+        return 0
 
 
 def start_sod_scheduler():
@@ -3462,17 +3797,43 @@ def api_sod_cron():
 
 @app.route('/api/sod/health', methods=['GET'])
 def api_sod_health():
-    """Lightweight health check: is the sync fresh? For monitoring."""
-    age = _sod_last_successful_sync_age_hours()
-    if age is None:
-        return jsonify({'status': 'never_synced', 'configured': bool(SOD_USER and SOD_PASSWORD)}), 503
-    fresh = age < 36  # 36h window = one missed day
+    """Lightweight health check: is the DATA fresh? For monitoring.
+
+    Returns:
+      200 + status='healthy' if snapshot is <= 2 days old.
+      503 + status='stale' if snapshot is > 2 days old.
+      503 + status='never_synced' if no data ingested yet.
+    """
+    fresh_info = _sod_freshness()
+    age_days = fresh_info['snapshot_age_days']
+    age_hours = _sod_last_successful_sync_age_hours()
+    if age_days is None:
+        return jsonify({
+            'status': 'never_synced',
+            'configured': bool(SOD_USER and SOD_PASSWORD),
+            'last_run_age_hours': round(age_hours, 2) if age_hours is not None else None,
+        }), 503
+    is_fresh = age_days <= 2
     return jsonify({
-        'status': 'healthy' if fresh else 'stale',
-        'last_sync_age_hours': round(age, 2),
+        'status': 'healthy' if is_fresh else 'stale',
+        'snapshot_date': fresh_info['latest_snapshot'],
+        'snapshot_age_days': age_days,
+        'last_run_age_hours': round(age_hours, 2) if age_hours is not None else None,
         'scheduler_running': _sod_scheduler_running(),
         'configured': bool(SOD_USER and SOD_PASSWORD),
-    }), 200 if fresh else 503
+    }), 200 if is_fresh else 503
+
+
+@app.route('/healthz', methods=['GET'])
+def api_healthz():
+    """Standard health probe used by Render / uptime monitors. 503 if data > 2d stale."""
+    fresh = _sod_freshness()
+    age_days = fresh['snapshot_age_days']
+    healthy = age_days is not None and age_days <= 2
+    return jsonify({
+        'status': 'healthy' if healthy else 'unhealthy',
+        **fresh,
+    }), 200 if healthy else 503
 
 
 # ======================================================================================
@@ -4971,6 +5332,9 @@ init_db()
 seed_data()
 seed_territories()
 refresh_sod_product_categories()
+# Sprint 0: cleanup orphaned 'running' SOD runs from prior crashes (e.g. OOM kills).
+# This makes /api/sod/status accurate and avoids stuck rows polluting the dashboard.
+_cleanup_orphaned_sod_runs(max_age_hours=6)
 start_sod_scheduler()
 start_lcbo_scheduler()
 
