@@ -1,6 +1,7 @@
 import os
 import io
 import csv
+import gc
 import json
 import math
 import re
@@ -2262,52 +2263,124 @@ class SODClient:
             raise RuntimeError(f"Did not receive zip data from {url} (content-type={r.headers.get('Content-Type')})")
         return content, fn
 
-    def download_and_extract(self, source, filename=None):
-        """Download the zip, unzip in memory, return (raw_dat_bytes, member_name, zip_filename)."""
+    def download_zip_bytes(self, source, filename=None):
+        """Download and return the raw zip bytes + final filename.
+
+        Kept small in memory (~9MB for Daily A). The .dat inside is ~75MB
+        uncompressed — we NEVER materialize that blob; callers must stream
+        the member via open_dat_stream() instead.
+        """
         data, fn = self.download_option(source, filename=filename)
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            members = zf.namelist()
-            if not members:
-                raise RuntimeError(f"Zip {fn} is empty")
-            dat_name = members[0]
-            raw = zf.read(dat_name)
-        return raw, dat_name, fn
+        return data, fn
+
+
+def _parse_sod_line(line):
+    """Parse one SOD fixed-width row string. Returns dict or None if invalid."""
+    if len(line) < 47:
+        return None
+    try:
+        date_raw = line[0:8]
+        sku = line[8:15]
+        name = line[15:32].strip()
+        store = line[32:36]
+        status = line[36:37].strip() or 'L'
+        sign = line[37:38]
+        qty_digits = line[38:47].strip()
+        if not date_raw.isdigit() or not sku.isdigit() or not store.isdigit():
+            return None
+        qty = int(qty_digits) if qty_digits.isdigit() else 0
+        if sign == '-':
+            qty = -qty
+        snapshot_date = f'{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}'
+        return {
+            'snapshot_date': snapshot_date,
+            'sku': sku,
+            'product_name': name,
+            'store_number': int(store),
+            'status': status,
+            'on_hand': qty,
+        }
+    except (ValueError, IndexError):
+        return None
 
 
 def parse_sod_dat(raw_bytes):
-    """Parse a SOD fixed-width .dat file. Yields dicts.
+    """Backward-compatible generator. Prefer stream_parse_sod_zip for large files.
 
     Each row is 47 chars (plus newline), latin-1 encoded. See format notes at top.
     """
-    # Use latin-1 to avoid utf-8 decode errors on Croatian/French accented names
     text = raw_bytes.decode('latin-1', errors='replace')
     for line in text.splitlines():
-        if len(line) < 47:
-            continue
-        try:
-            date_raw = line[0:8]
-            sku = line[8:15]
-            name = line[15:32].strip()
-            store = line[32:36]
-            status = line[36:37].strip() or 'L'
-            sign = line[37:38]
-            qty_digits = line[38:47].strip()
-            if not date_raw.isdigit() or not sku.isdigit() or not store.isdigit():
-                continue
-            qty = int(qty_digits) if qty_digits.isdigit() else 0
-            if sign == '-':
-                qty = -qty
-            snapshot_date = f'{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}'
-            yield {
-                'snapshot_date': snapshot_date,
-                'sku': sku,
-                'product_name': name,
-                'store_number': int(store),
-                'status': status,
-                'on_hand': qty,
-            }
-        except (ValueError, IndexError):
-            continue
+        row = _parse_sod_line(line)
+        if row is not None:
+            yield row
+
+
+def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False):
+    """Streaming parser + aggregator for a SOD .zip download.
+
+    Iterates the .dat member line-by-line via zipfile.open() + TextIOWrapper
+    so the 75MB .dat text is NEVER held in RAM. Retains only:
+      - per-sku aggregates keyed by (snapshot_date, sku)  (small: ~700 SKUs)
+      - rows for tracked SKUs (~155 rows for Daily A), or all rows when
+        keep_all_rows is True (~1,400 rows for Daily B)
+
+    Returns dict with: dat_name, total, per_sku_by_date, rows_to_persist,
+    dates_seen, tracked_row_count.
+    """
+    per_sku_by_date = {}   # {date: {sku: {'name', 'status_counts', 'store_count', 'total_on_hand'}}}
+    rows_to_persist = []   # only tracked rows (or all, for Daily B)
+    dates_seen = set()
+    total = 0
+    tracked_row_count = 0
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        members = zf.namelist()
+        if not members:
+            raise RuntimeError("Zip is empty")
+        dat_name = members[0]
+        with zf.open(dat_name) as raw_stream:
+            text_stream = io.TextIOWrapper(raw_stream, encoding='latin-1', errors='replace', newline='')
+            for line in text_stream:
+                # TextIOWrapper keeps the newline; strip trailing CR/LF only
+                if line.endswith('\n'):
+                    line = line[:-1]
+                if line.endswith('\r'):
+                    line = line[:-1]
+                row = _parse_sod_line(line)
+                if row is None:
+                    continue
+                total += 1
+                d = row['snapshot_date']
+                dates_seen.add(d)
+                date_bucket = per_sku_by_date.setdefault(d, {})
+                agg = date_bucket.get(row['sku'])
+                if agg is None:
+                    agg = {
+                        'name': row['product_name'],
+                        'status_counts': {},
+                        'store_count': 0,
+                        'total_on_hand': 0,
+                    }
+                    date_bucket[row['sku']] = agg
+                agg['status_counts'][row['status']] = agg['status_counts'].get(row['status'], 0) + 1
+                agg['store_count'] += 1
+                agg['total_on_hand'] += row['on_hand']
+
+                is_tracked = row['sku'] in tracked_skus
+                if is_tracked:
+                    tracked_row_count += 1
+                if keep_all_rows or is_tracked:
+                    rows_to_persist.append(row)
+
+    return {
+        'dat_name': dat_name,
+        'total': total,
+        'per_sku_by_date': per_sku_by_date,
+        'rows_to_persist': rows_to_persist,
+        'dates_seen': dates_seen,
+        'tracked_row_count': tracked_row_count,
+    }
 
 
 # ------- DB helpers scoped to the sync pipeline (use a dedicated connection) -------
@@ -2354,37 +2427,33 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
             run_id = cur.lastrowid
         conn.commit()
 
-        # 1) Download + unzip
+        # 1) Download zip bytes (small — ~9MB for Daily A, ~8KB for Daily B)
         client = client or SODClient()
-        raw_bytes, dat_name, zip_name = client.download_and_extract(source, filename=filename)
+        zip_bytes, zip_name = client.download_zip_bytes(source, filename=filename)
 
-        # 2) Parse and bucket by snapshot_date
-        by_date = {}
-        total = 0
-        for row in parse_sod_dat(raw_bytes):
-            total += 1
-            by_date.setdefault(row['snapshot_date'], []).append(row)
-        if not by_date:
+        # 2) Stream-parse directly from the zip. NEVER materializes the 75MB .dat text
+        #    or the 1.5M-row list. Only keeps small aggregates + tracked rows.
+        keep_all = (source != 'daily_a')  # Daily B is already agent-filtered (~1,400 rows)
+        parsed = stream_parse_sod_zip(zip_bytes, SOD_TRACKED_SKUS, keep_all_rows=keep_all)
+        # Free the zip bytes ASAP
+        del zip_bytes
+        gc.collect()
+
+        dat_name = parsed['dat_name']
+        total = parsed['total']
+        if not parsed['dates_seen']:
             raise RuntimeError("No rows parsed from .dat file")
-        snapshot_date = max(by_date.keys())  # use the most recent date in the feed
+        snapshot_date = max(parsed['dates_seen'])  # use the most recent date in the feed
 
-        # 3) Compute per-sku aggregates across the newest snapshot
-        latest_rows = by_date[snapshot_date]
-        anu_count = 0
-        per_sku = {}
-        for r in latest_rows:
-            sku = r['sku']
-            if sku in SOD_TRACKED_SKUS:
-                anu_count += 1
-            agg = per_sku.setdefault(sku, {
-                'name': r['product_name'],
-                'status_counts': {},
-                'store_count': 0,
-                'total_on_hand': 0,
-            })
-            agg['status_counts'][r['status']] = agg['status_counts'].get(r['status'], 0) + 1
-            agg['store_count'] += 1
-            agg['total_on_hand'] += r['on_hand']
+        # 3) per_sku aggregates for the newest snapshot (already computed during streaming)
+        per_sku = parsed['per_sku_by_date'].get(snapshot_date, {})
+        # rows_to_persist holds tracked-SKU rows (Daily A) or all rows (Daily B) across
+        # every date in the file — filter to the newest snapshot only.
+        latest_rows = [r for r in parsed['rows_to_persist'] if r['snapshot_date'] == snapshot_date]
+        anu_count = sum(1 for r in latest_rows if r['sku'] in SOD_TRACKED_SKUS)
+        # Release the parsed buffers we no longer need
+        parsed = None
+        gc.collect()
 
         # 4) Pull prior sod_products state to compute listing changes
         cur.execute("SELECT sku, current_status FROM sod_products")
@@ -2420,12 +2489,11 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 else:
                     change_inserts.append((sku, None, snapshot_date, old, status, 'STATUS_FLIP'))
 
-        # 5) Upsert sod_inventory (filter: track everything in Daily B; only Anu SKUs in Daily A to save space)
-        # Rationale: Daily A is 1.5M rows × 30 days = huge. Keep only tracked SKUs.
-        if source == 'daily_a':
-            rows_to_persist = [r for r in latest_rows if r['sku'] in SOD_TRACKED_SKUS]
-        else:
-            rows_to_persist = latest_rows  # Daily B is already agent-filtered
+        # 5) Upsert sod_inventory
+        # latest_rows is already filtered correctly by the streaming parser:
+        #   - Daily A: only tracked-SKU rows (~155)
+        #   - Daily B: all rows (~1,400, already agent-filtered server-side)
+        rows_to_persist = latest_rows
 
         if rows_to_persist:
             if USE_POSTGRES:
