@@ -160,7 +160,11 @@ CITY_COORDS = {
 def get_db():
     if 'db' not in g:
         if USE_POSTGRES:
-            g.db = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+            # DictCursor (not RealDictCursor): rows support BOTH positional (r[0])
+            # and key-based (r['col']) access, AND `dict(r)` still works.
+            # Previously used RealDictCursor which broke the CRM endpoints that
+            # relied on positional row access → 500s in production.
+            g.db = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
             g.db.autocommit = False
         else:
             g.db = sqlite3.connect(DB_PATH)
@@ -5211,25 +5215,28 @@ def api_crm_dashboard():
                 'current_status': r[2], 'store_count': r[3], 'total_on_hand': r[4],
             })
 
-    # OOS brink count (on_hand <= 2, tracked, L)
+    # OOS brink count (on_hand <= 2, tracked, L).
+    # Use an explicit CTE so both Postgres and SQLite parse the correlated sub-lookup
+    # consistently. The previous inline correlated subquery was ambiguous in Postgres
+    # (no alias on outer table) → 500.
     oos_brink_count = 0
     if tracked and latest:
         phs = ','.join([ph] * len(tracked))
-        if USE_POSTGRES:
-            cur.execute(
-                f"""SELECT COUNT(*) FROM sod_inventory
-                    WHERE sku IN ({phs}) AND status='L' AND on_hand <= 2
-                      AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = sod_inventory.sku)""",
-                tracked,
+        q = f"""
+            WITH latest_per_sku AS (
+                SELECT sku, MAX(snapshot_date) AS d
+                FROM sod_inventory WHERE sku IN ({phs})
+                GROUP BY sku
             )
+            SELECT COUNT(*) FROM sod_inventory i
+            JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date
+            WHERE i.status='L' AND i.on_hand <= 2
+        """
+        if USE_POSTGRES:
+            cur.execute(q, tracked)
             oos_brink_count = cur.fetchone()[0] or 0
         else:
-            oos_brink_count = db.execute(
-                f"""SELECT COUNT(*) FROM sod_inventory
-                    WHERE sku IN ({phs}) AND status='L' AND on_hand <= 2
-                      AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory i2 WHERE i2.sku = sod_inventory.sku)""",
-                tracked,
-            ).fetchone()[0] or 0
+            oos_brink_count = db.execute(q, tracked).fetchone()[0] or 0
 
     # Listings/delistings last 7 days
     since = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
