@@ -51,6 +51,151 @@ function showView(view) {
   if (view === 'routes') loadRoutes();
   if (view === 'opportunities') { loadOpportunities(); loadDailyPlan(); }
   if (view === 'followups') loadFollowups();
+  if (view === 'gap') { loadTrackedProductOptions(); loadListingStatus(); loadGapReport(); }
+  if (view === 'reorder') { loadTrackedProductOptions(); loadReorderReport(); }
+  if (view === 'sod') { loadSodStatus(); loadSodProducts(); loadSodListingChanges(); }
+  if (view === 'reports') { loadReport('daily'); }
+}
+
+// === LIVE INVENTORY / GAP / REORDER ===
+let _gapDebounce = null, _reorderDebounce = null;
+function debounceGapReload() { clearTimeout(_gapDebounce); _gapDebounce = setTimeout(loadGapReport, 350); }
+function debounceReorderReload() { clearTimeout(_reorderDebounce); _reorderDebounce = setTimeout(loadReorderReport, 350); }
+
+async function loadTrackedProductOptions() {
+  try {
+    const res = await fetch('/api/products');
+    const products = await res.json();
+    const opts = ['<option value="">All Products</option>'].concat(
+      products.filter(p => p.lcbo_sku).map(p => `<option value="${esc(p.lcbo_sku)}">${esc(p.brand||'')} — ${esc(p.name)} (${esc(p.lcbo_sku)})</option>`)
+    ).join('');
+    ['gapSkuFilter','reorderSkuFilter'].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = opts; });
+  } catch(e) { console.warn('loadTrackedProductOptions', e); }
+}
+
+async function refreshLiveInventoryAll() {
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Refreshing from LCBO.com...'; }
+  try {
+    const res = await fetch('/api/inventory/refresh-all', {method:'POST'});
+    const data = await res.json();
+    alert(`Refreshed ${data.refreshed}/${data.total_tracked} products. Live data from ${data.source||'lcbo.com'}.`);
+    loadListingStatus();
+    loadGapReport();
+  } catch(e) {
+    alert('Refresh failed: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh Live Inventory (All Products)'; }
+  }
+}
+
+async function loadListingStatus() {
+  try {
+    const res = await fetch('/api/inventory/listing-status');
+    const data = await res.json();
+    const bar = document.getElementById('listingStatusBar');
+    if (!bar) return;
+    const statusColor = code => ({1:'#00b894',2:'#00b894',3:'#fdcb6e',4:'#e17055',5:'#d63031'})[code] || '#636e72';
+    bar.innerHTML = (data.products||[]).map(p => `
+      <div class="ls-card" style="border-left:4px solid ${statusColor(p.listing_status_code)}">
+        <div class="ls-name">${esc(p.name)}</div>
+        <div class="ls-meta"><span class="ls-sku">SKU ${esc(p.sku||'')}</span> · <span>${esc(p.price||'')}</span></div>
+        <div class="ls-status" style="color:${statusColor(p.listing_status_code)}">${esc(p.listing_status_label)}</div>
+        <div class="ls-stats"><b>${p.store_count}</b> stores · <b>${p.total_units}</b> units</div>
+      </div>
+    `).join('');
+  } catch(e) { console.warn('loadListingStatus', e); }
+}
+
+async function loadGapReport() {
+  const sku = document.getElementById('gapSkuFilter')?.value || '';
+  const city = document.getElementById('gapCityFilter')?.value || '';
+  const container = document.getElementById('gapReportContent');
+  if (!container) return;
+  container.innerHTML = '<p class="muted">Loading gap report...</p>';
+  try {
+    const qs = new URLSearchParams();
+    if (sku) qs.set('sku', sku);
+    if (city) qs.set('city', city);
+    const res = await fetch('/api/inventory/gap-report?' + qs.toString());
+    const data = await res.json();
+    if (!data.products || !data.products.length) {
+      container.innerHTML = '<p class="muted">No products with live inventory. Click Refresh above.</p>';
+      return;
+    }
+    container.innerHTML = data.products.map(p => `
+      <div class="card gap-card">
+        <div class="gap-header">
+          <div>
+            <h3>${esc(p.product.brand||'')} — ${esc(p.product.name)}</h3>
+            <div class="muted">SKU ${esc(p.product.sku)} · ${esc(p.product.price||'')}</div>
+          </div>
+          <div class="gap-metrics">
+            <div class="gap-metric"><b>${p.carrying_count}</b><span>carrying</span></div>
+            <div class="gap-metric gap-bad"><b>${p.gap_count}</b><span>GAP (no stock)</span></div>
+            <div class="gap-metric"><b>${p.gap_rate_pct}%</b><span>gap rate</span></div>
+          </div>
+        </div>
+        <details>
+          <summary>Show top ${Math.min(p.gap_stores.length, 50)} gap stores</summary>
+          <table class="data-table">
+            <thead><tr><th>Store #</th><th>Account</th><th>City</th><th>Address</th><th>Manager</th><th>Phone</th></tr></thead>
+            <tbody>
+              ${p.gap_stores.slice(0, 50).map(s => `<tr>
+                <td>${esc(s.store_number||'')}</td>
+                <td>${esc(s.account||'')}</td>
+                <td>${esc(s.city||'')}</td>
+                <td>${esc(s.address||'')}</td>
+                <td>${esc(s.manager_name||'')}</td>
+                <td>${esc(s.phone||'')}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </details>
+      </div>
+    `).join('');
+  } catch(e) {
+    container.innerHTML = `<p class="muted">Error loading gap report: ${esc(e.message||'')}</p>`;
+  }
+}
+
+async function loadReorderReport() {
+  const threshold = document.getElementById('reorderThreshold')?.value || 5;
+  const sku = document.getElementById('reorderSkuFilter')?.value || '';
+  const city = document.getElementById('reorderCityFilter')?.value || '';
+  try {
+    const qs = new URLSearchParams({threshold});
+    if (sku) qs.set('sku', sku);
+    if (city) qs.set('city', city);
+    const res = await fetch('/api/inventory/reorder-needed?' + qs.toString());
+    const data = await res.json();
+    const stats = document.getElementById('reorderStats');
+    if (stats) stats.innerHTML = `
+      <div class="stat-card red"><div class="label">Critical (0 units)</div><div class="value">${data.critical_count||0}</div></div>
+      <div class="stat-card orange"><div class="label">High (≤ 2 units)</div><div class="value">${data.high_count||0}</div></div>
+      <div class="stat-card" style="border-left:3px solid #fdcb6e"><div class="label">Medium (< ${threshold})</div><div class="value" style="color:#fdcb6e">${data.medium_count||0}</div></div>
+      <div class="stat-card accent"><div class="label">Total Alerts</div><div class="value">${data.total_reorder_alerts||0}</div></div>
+    `;
+    const tbody = document.querySelector('#reorderTable tbody');
+    const cnt = document.getElementById('reorderCount');
+    if (cnt) cnt.textContent = data.total_reorder_alerts || 0;
+    if (!tbody) return;
+    const urgencyBadge = u => `<span class="urgency urgency-${u}">${u.toUpperCase()}</span>`;
+    tbody.innerHTML = (data.alerts||[]).map(a => `
+      <tr>
+        <td>${urgencyBadge(a.urgency)}</td>
+        <td>${esc(a.store_number||'')}</td>
+        <td>${esc(a.store_name||'')}</td>
+        <td>${esc(a.city||'')}</td>
+        <td>${esc((a.product&&a.product.name)||'')}<br><span class="muted">SKU ${esc((a.product&&a.product.sku)||'')}</span></td>
+        <td><b>${a.quantity}</b></td>
+        <td>${esc(a.manager||'')}</td>
+        <td>${esc(a.phone||'')}</td>
+      </tr>
+    `).join('') || '<tr><td colspan="8" class="muted">No low-stock alerts. Click "Refresh Live Inventory" in Gap Report first.</td></tr>';
+  } catch(e) {
+    console.warn('loadReorderReport', e);
+  }
 }
 
 // === REPS ===
@@ -898,4 +1043,287 @@ function esc(s) {
 function escAttr(s) {
   if (!s) return '';
   return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+// ======== SOD (Sale of Data) ========
+const _statusLabels = { 'L': 'Listed', 'D': 'Delisting', 'F': 'Delisted' };
+const _statusClass = { 'L': 'status-listed', 'D': 'status-delisting', 'F': 'status-delisted' };
+
+async function loadSodStatus() {
+  try {
+    const res = await fetch('/api/sod/status');
+    const d = await res.json();
+    const grid = document.getElementById('sodStatusGrid');
+    if (!grid) return;
+    const a = (d.last_by_source && d.last_by_source.daily_a) || null;
+    const b = (d.last_by_source && d.last_by_source.daily_b) || null;
+    const lastWhen = a ? a.run_at : (b ? b.run_at : '—');
+    const snap = (a && a.snapshot_date) || (b && b.snapshot_date) || '—';
+    const inv = d.stats && d.stats.inv_rows || 0;
+    const tracked = d.stats && d.stats.tracked_products || 0;
+    const days = d.stats && d.stats.snapshot_days || 0;
+    grid.innerHTML = `
+      <div class="stat-card ${d.configured ? '' : 'stat-warn'}">
+        <div class="stat-label">SOD Connection</div>
+        <div class="stat-value">${d.configured ? '&#9989; Connected' : '&#9888; Not configured'}</div>
+        <div class="stat-sub">Agent ${d.agent_id || '—'} &middot; Scheduler ${d.scheduler_running ? 'ON' : 'OFF'}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Latest Snapshot</div>
+        <div class="stat-value">${esc(snap)}</div>
+        <div class="stat-sub">Last sync: ${esc(lastWhen)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Inventory Rows</div>
+        <div class="stat-value">${inv.toLocaleString()}</div>
+        <div class="stat-sub">${days} day${days===1?'':'s'} of history</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Tracked Products</div>
+        <div class="stat-value">${tracked}</div>
+        <div class="stat-sub">Anu &amp; NB Distillers</div>
+      </div>
+    `;
+    // Recent runs table
+    const runsBody = document.querySelector('#sodRunsTable tbody');
+    if (runsBody) {
+      const rows = d.recent_runs || [];
+      runsBody.innerHTML = rows.length === 0
+        ? '<tr><td colspan="10" class="muted">No sync runs yet.</td></tr>'
+        : rows.map(r => `
+          <tr>
+            <td>${esc(r.run_at)}</td>
+            <td>${esc(r.source)}</td>
+            <td>${esc(r.file_name || '—')}</td>
+            <td>${esc(r.snapshot_date || '—')}</td>
+            <td><span class="status-badge status-${esc(r.status)}">${esc(r.status)}</span></td>
+            <td>${(r.total_rows||0).toLocaleString()}</td>
+            <td>${(r.anu_rows||0).toLocaleString()}</td>
+            <td>${r.new_listings||0}</td>
+            <td>${r.new_delistings||0}</td>
+            <td>${Number(r.duration_seconds||0).toFixed(1)}s</td>
+          </tr>`).join('');
+    }
+  } catch (e) { console.warn('loadSodStatus', e); }
+}
+
+async function loadSodProducts() {
+  try {
+    const res = await fetch('/api/sod/products?tracked_only=1');
+    const d = await res.json();
+    const body = document.querySelector('#sodProductsTable tbody');
+    if (!body) return;
+    const cnt = document.getElementById('sodProdCount');
+    if (cnt) cnt.textContent = d.count;
+    body.innerHTML = (d.rows || []).length === 0
+      ? '<tr><td colspan="7" class="muted">No SOD data yet — click Sync Now.</td></tr>'
+      : d.rows.map(r => `
+        <tr>
+          <td>${esc(r.brand || '—')}</td>
+          <td>${esc(r.product_name || '—')}</td>
+          <td><code>${esc(r.sku)}</code></td>
+          <td><span class="status-badge ${_statusClass[r.current_status]||''}">${esc(_statusLabels[r.current_status]||r.current_status||'?')}</span></td>
+          <td>${r.store_count||0}</td>
+          <td>${(r.total_on_hand||0).toLocaleString()}</td>
+          <td><button class="btn-link" onclick="showSodTrend('${esc(r.sku)}')">View trend</button></td>
+        </tr>
+      `).join('');
+  } catch (e) { console.warn('loadSodProducts', e); }
+}
+
+async function loadSodListingChanges() {
+  try {
+    const days = document.getElementById('sodChangeDays').value || '30';
+    const type = document.getElementById('sodChangeType').value || '';
+    const qs = new URLSearchParams({ days, tracked_only: '1' });
+    if (type) qs.set('type', type);
+    const res = await fetch('/api/sod/listing-changes?' + qs.toString());
+    const d = await res.json();
+    const body = document.querySelector('#sodChangesTable tbody');
+    const cnt = document.getElementById('sodChangeCount');
+    if (cnt) cnt.textContent = d.count;
+    if (!body) return;
+    body.innerHTML = (d.rows || []).length === 0
+      ? '<tr><td colspan="6" class="muted">No listing changes in this window.</td></tr>'
+      : d.rows.map(r => `
+        <tr>
+          <td>${esc(r.change_date)}</td>
+          <td><span class="change-badge change-${esc(r.change_type)}">${esc(r.change_type)}</span></td>
+          <td>${esc(r.brand||'—')}</td>
+          <td>${esc(r.product_name||'—')}</td>
+          <td>${esc(r.old_status||'—')}</td>
+          <td>${esc(r.new_status||'—')}</td>
+        </tr>
+      `).join('');
+  } catch (e) { console.warn('loadSodListingChanges', e); }
+}
+
+async function triggerSodSync() {
+  const btn = document.getElementById('sodSyncBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  try {
+    const res = await fetch('/api/sod/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sources: ['daily_a', 'daily_b'] }),
+    });
+    const d = await res.json();
+    if (res.ok || res.status === 202) {
+      // Poll status every 3s until both sources are no longer 'running'
+      let attempts = 0;
+      const poll = async () => {
+        attempts++;
+        const s = await (await fetch('/api/sod/status')).json();
+        const a = (s.last_by_source && s.last_by_source.daily_a) || {};
+        const b = (s.last_by_source && s.last_by_source.daily_b) || {};
+        const done = a.status === 'success' && b.status === 'success';
+        const failed = a.status === 'failed' || b.status === 'failed';
+        if (done || failed || attempts > 60) {
+          await loadSodStatus();
+          await loadSodProducts();
+          await loadSodListingChanges();
+          if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Sync Now (Daily A + B)'; }
+          if (failed) alert('Sync failed — check server logs / SOD credentials.');
+        } else {
+          setTimeout(poll, 3000);
+        }
+      };
+      setTimeout(poll, 2000);
+    } else {
+      alert('Error: ' + (d.error || res.statusText));
+      if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Sync Now (Daily A + B)'; }
+    }
+  } catch (e) {
+    console.warn('triggerSodSync', e);
+    alert('Sync failed: ' + e.message);
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Sync Now (Daily A + B)'; }
+  }
+}
+
+async function showSodTrend(sku) {
+  try {
+    const res = await fetch(`/api/sod/trend/${encodeURIComponent(sku)}?days=60`);
+    const d = await res.json();
+    const modal = document.createElement('div');
+    modal.className = 'sod-modal';
+    modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+    const rows = d.rows || [];
+    const content = rows.length === 0
+      ? '<p class="muted">No trend data yet — need at least 2 snapshots.</p>'
+      : `<table class="data-table"><thead><tr><th>Date</th><th>Stores</th><th>On-Hand</th><th>Listed</th><th>Delisting</th></tr></thead><tbody>`
+        + rows.map(r => `<tr><td>${esc(r.snapshot_date)}</td><td>${r.store_count}</td><td>${(r.total_on_hand||0).toLocaleString()}</td><td>${r.listed_stores}</td><td>${r.delisting_stores}</td></tr>`).join('')
+        + '</tbody></table>';
+    modal.innerHTML = `
+      <div class="sod-modal-content">
+        <h2>SKU ${esc(sku)} &mdash; 60-day Trend</h2>
+        <button class="btn-close" onclick="this.closest('.sod-modal').remove()">&times;</button>
+        ${content}
+      </div>`;
+    document.body.appendChild(modal);
+  } catch (e) { console.warn('showSodTrend', e); }
+}
+
+// ======== REPORTS (Daily / Weekly / Monthly / Rep) ========
+async function loadReport(kind, btn) {
+  if (btn) {
+    btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  const container = document.getElementById('reportContent');
+  if (!container) return;
+  container.innerHTML = '<p class="muted">Loading&hellip;</p>';
+  try {
+    const res = await fetch(`/api/reports/${kind}`);
+    const d = await res.json();
+    const title = kind === 'daily' ? 'Daily Summary' : kind === 'weekly' ? 'Weekly Summary (7 days)' : 'Monthly Summary (MTD)';
+    const w = d.window || {};
+    const t = d.totals || {};
+    container.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Window</div><div class="stat-value">${esc(w.start)} &rarr; ${esc(w.end)}</div><div class="stat-sub">Latest snapshot: ${esc(w.latest_snapshot || '—')}</div></div>
+        <div class="stat-card"><div class="stat-label">Products Tracked</div><div class="stat-value">${t.products_tracked||0}</div></div>
+        <div class="stat-card stat-good"><div class="stat-label">New Listings</div><div class="stat-value">${t.new_listings||0}</div></div>
+        <div class="stat-card stat-bad"><div class="stat-label">Delistings</div><div class="stat-value">${t.delistings||0}</div></div>
+        <div class="stat-card"><div class="stat-label">Re-listings</div><div class="stat-value">${t.relistings||0}</div></div>
+        <div class="stat-card"><div class="stat-label">Total Status Events</div><div class="stat-value">${t.changes_in_window||0}</div></div>
+      </div>
+      <div class="dashboard-grid" style="margin-top:16px">
+        <div class="card">
+          <h3>${esc(title)} &mdash; Snapshot Metrics</h3>
+          <table class="data-table">
+            <thead><tr><th>Brand</th><th>Product</th><th>Stores</th><th>On-Hand</th><th>Listed</th><th>Delisting</th><th>Fully Delisted</th></tr></thead>
+            <tbody>
+              ${(d.snapshot_metrics||[]).map(m => `<tr>
+                <td>${esc(m.brand||'—')}</td>
+                <td>${esc(m.product_name||'—')}</td>
+                <td>${m.store_count||0}</td>
+                <td>${(m.total_on_hand||0).toLocaleString()}</td>
+                <td>${m.listed_stores||0}</td>
+                <td>${m.delisting_stores||0}</td>
+                <td>${m.fully_delisted_stores||0}</td>
+              </tr>`).join('') || '<tr><td colspan="7" class="muted">No data — run /api/sod/sync.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Listing Events in Window</h3>
+          <table class="data-table">
+            <thead><tr><th>Date</th><th>Type</th><th>Product</th><th>Old&rarr;New</th></tr></thead>
+            <tbody>
+              ${(d.listing_changes||[]).map(c => `<tr>
+                <td>${esc(c.change_date)}</td>
+                <td><span class="change-badge change-${esc(c.change_type)}">${esc(c.change_type)}</span></td>
+                <td>${esc(c.product_name||'—')}</td>
+                <td>${esc(c.old_status||'—')} &rarr; ${esc(c.new_status||'—')}</td>
+              </tr>`).join('') || '<tr><td colspan="4" class="muted">No listing events in this window.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    container.innerHTML = `<p class="muted">Failed to load report: ${esc(e.message)}</p>`;
+  }
+}
+
+async function loadRepReport(btn) {
+  if (btn) {
+    btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  const container = document.getElementById('reportContent');
+  if (!container) return;
+  container.innerHTML = '<p class="muted">Loading per-rep report&hellip;</p>';
+  try {
+    const res = await fetch('/api/reports/rep');
+    const d = await res.json();
+    const reps = d.reps || [];
+    const anuProducts = reps[0] && reps[0].per_product || [];
+    const productHeaders = anuProducts.map(p => `<th colspan="2">${esc(p.brand)}<br><small>${esc(p.product_name)}</small></th>`).join('');
+    const subHeaders = anuProducts.map(() => '<th>Carrying</th><th>Delisting</th>').join('');
+    container.innerHTML = `
+      <div class="card">
+        <h3>Per-Rep Performance &mdash; Snapshot ${esc(d.snapshot_date || '—')}</h3>
+        <p class="view-desc">Stores carrying each tracked SKU, by rep. "Delisting" = stores where SOD flags the product for removal.</p>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead>
+              <tr><th rowspan="2">Rep</th><th rowspan="2">Total Stores</th>${productHeaders}</tr>
+              <tr>${subHeaders}</tr>
+            </thead>
+            <tbody>
+              ${reps.map(r => `
+                <tr>
+                  <td><strong>${esc(r.rep)}</strong></td>
+                  <td>${r.total_stores}</td>
+                  ${(r.per_product||[]).map(p => `<td>${p.stores_carrying}</td><td class="${p.stores_delisting>0?'text-bad':''}">${p.stores_delisting}</td>`).join('')}
+                </tr>`).join('') || '<tr><td colspan="20" class="muted">No rep data.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    container.innerHTML = `<p class="muted">Failed to load rep report: ${esc(e.message)}</p>`;
+  }
 }

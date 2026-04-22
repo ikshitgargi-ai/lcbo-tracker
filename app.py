@@ -55,16 +55,26 @@ DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
 # Rep home base for route planning
 REP_HOME = {'lat': 43.6558, 'lng': -79.3628, 'address': '181 Dundas St E, Toronto, ON'}
 
-# Our tracked products on LCBO.com
+# Our tracked products on LCBO.com — verified SKUs (April 2026)
+# Source: live LCBO.com pages + lcbo.dev GraphQL API introspection
 TRACKED_PRODUCTS = [
-    ('NB Distillers', 'Red Admiral Vodka', '20187', 'https://www.lcbo.com/en/red-admiral-vodka-20187', '', 'Spirits'),
-    ('NB Distillers', 'Chak De Canadian Whisky', '22246', 'https://www.lcbo.com/en/chak-de-canadian-whisky-22246', '', 'Spirits'),
-    ('Anu Portfolio', 'Goenchi Cashew Feni', '46340', 'https://www.lcbo.com/en/goenchi-cashew-feni-46340', '$93.95', 'Spirits'),
-    ('Anu Portfolio', 'Goenchi Coconut Feni', '46343', 'https://www.lcbo.com/en/goenchi-coconut-feni-46343', '$93.95', 'Spirits'),
-    ('Anu Portfolio', 'Fratelli Classic Shiraz', '46282', 'https://www.lcbo.com/en/fratelli-classic-shiraz-46282', '', 'Wine'),
-    ('Anu Portfolio', 'Fratelli Cabernet Sauvignon', '46287', 'https://www.lcbo.com/en/fratelli-cabernet-sauvignon-46287', '$28.95', 'Wine'),
-    ('Anu Portfolio', 'Rutland Square Chai Spiced Gin', '', '', '', 'Spirits'),
+    # NB Distillers (Anu-owned brand)
+    ('NB Distillers', 'Red Admiral Vodka', '20187', 'https://www.lcbo.com/en/red-admiral-vodka-20187', '$29.75', 'Spirits'),
+    ('NB Distillers', 'Chak De Canadian Whisky', '22246', 'https://www.lcbo.com/en/chak-de-canadian-whisky-22246', '$34.95', 'Spirits'),
+    # Anu portfolio — Goenchi Feni (India)
+    ('Goenchi', 'Goenchi Cashew Feni', '46340', 'https://www.lcbo.com/en/goenchi-cashew-feni-46340', '$93.95', 'Spirits'),
+    ('Goenchi', 'Goenchi Coconut Feni', '46343', 'https://www.lcbo.com/en/goenchi-coconut-feni-46343', '$93.95', 'Spirits'),
+    # Fratelli wines (India)
+    ('Fratelli', 'Fratelli Classic Shiraz', '46282', 'https://www.lcbo.com/en/fratelli-classic-shiraz-46282', '$22.95', 'Wine'),
+    ('Fratelli', 'Fratelli Sauvignon Blanc', '46286', 'https://www.lcbo.com/en/fratelli-sauvignon-blanc-46286', '$24.95', 'Wine'),
+    ('Fratelli', 'Fratelli Chenin Blanc', '46285', 'https://www.lcbo.com/en/fratelli-chenin-blanc-46285', '$25.95', 'Wine'),
+    ('Fratelli', 'Fratelli Cabernet Sauvignon', '46287', 'https://www.lcbo.com/en/fratelli-cabernet-sauvignon-46287', '$28.95', 'Wine'),
+    # Rutland Square (Scotland) — pending LCBO listing
+    ('Rutland Square', 'Rutland Square Chai Spiced Gin', '', 'https://rutlandsquare.com/products/chai-spiced-scottish-gin', '', 'Spirits'),
 ]
+
+# Brand-level grouping for gap/opportunity reports
+ANU_BRANDS = {'NB Distillers', 'Goenchi', 'Fratelli', 'Rutland Square', 'Anu Portfolio'}
 
 # Ontario city coordinates for route planning
 CITY_COORDS = {
@@ -296,11 +306,124 @@ def init_db():
             ('activities', 'producer', 'TEXT DEFAULT \'\''), ('activities', 'venue_type', 'TEXT DEFAULT \'\''),
             ('activities', 'follow_up_date', 'TEXT DEFAULT \'\''),
         ]
+        migrate_cols.extend([
+            ('products', 'listing_status', "INTEGER DEFAULT 2"),
+            ('products', 'listing_date', "TEXT DEFAULT ''"),
+            ('products', 'delisting_date', "TEXT DEFAULT ''"),
+            ('activities', 'status_code', "INTEGER DEFAULT 0"),
+            ('stores', 'lcbo_store_id', "TEXT DEFAULT ''"),
+        ])
         for table, col, coltype in migrate_cols:
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
             except Exception:
                 pass  # Column already exists, safe to ignore with autocommit=True
+
+        # Create weekly_reports table for persistent report storage
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS weekly_reports (
+                id SERIAL PRIMARY KEY,
+                week_start DATE NOT NULL,
+                week_end DATE NOT NULL,
+                report_data JSONB,
+                generated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(week_start)
+            )
+        ''')
+        # Create inventory_history table for tracking stock changes over time
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS inventory_history (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                store_number TEXT,
+                store_name TEXT,
+                store_city TEXT,
+                quantity INTEGER DEFAULT 0,
+                recorded_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_inv_history_product ON inventory_history(product_id)",
+            "CREATE INDEX IF NOT EXISTS idx_inv_history_date ON inventory_history(recorded_at)",
+            "CREATE INDEX IF NOT EXISTS idx_weekly_reports_week ON weekly_reports(week_start)",
+        ]:
+            try:
+                cur.execute(idx)
+            except Exception:
+                pass
+
+        # ======== SOD (Sale of Data) tables — daily inventory feed ========
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sod_sync_runs (
+                id SERIAL PRIMARY KEY,
+                run_at TIMESTAMP DEFAULT NOW(),
+                source TEXT NOT NULL,
+                file_name TEXT,
+                snapshot_date DATE,
+                status TEXT DEFAULT 'running',
+                total_rows INTEGER DEFAULT 0,
+                anu_rows INTEGER DEFAULT 0,
+                new_listings INTEGER DEFAULT 0,
+                new_delistings INTEGER DEFAULT 0,
+                error TEXT,
+                duration_seconds REAL DEFAULT 0
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sod_inventory (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                snapshot_date DATE NOT NULL,
+                status TEXT,
+                on_hand INTEGER DEFAULT 0,
+                product_name TEXT DEFAULT '',
+                source TEXT DEFAULT 'daily_a',
+                ingested_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(sku, store_number, snapshot_date)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sod_products (
+                sku TEXT PRIMARY KEY,
+                product_name TEXT DEFAULT '',
+                first_seen DATE,
+                last_seen DATE,
+                current_status TEXT DEFAULT 'L',
+                store_count INTEGER DEFAULT 0,
+                total_on_hand INTEGER DEFAULT 0,
+                is_tracked BOOLEAN DEFAULT FALSE,
+                brand TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sod_listing_changes (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER,
+                change_date DATE NOT NULL,
+                old_status TEXT,
+                new_status TEXT,
+                change_type TEXT,
+                detected_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_sod_inv_sku ON sod_inventory(sku)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_inv_date ON sod_inventory(snapshot_date)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_inv_sku_date ON sod_inventory(sku, snapshot_date)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_inv_store ON sod_inventory(store_number)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_runs_at ON sod_sync_runs(run_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_changes_sku ON sod_listing_changes(sku)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_changes_date ON sod_listing_changes(change_date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sod_products_tracked ON sod_products(is_tracked)",
+        ]:
+            try:
+                cur.execute(idx)
+            except Exception:
+                pass
+
         cur.close()
         conn.close()
         print("[DB] PostgreSQL tables initialized successfully")
@@ -369,14 +492,97 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_followups_store ON followups(store_id);
             CREATE INDEX IF NOT EXISTS idx_followups_status ON followups(status);
             CREATE INDEX IF NOT EXISTS idx_followups_due ON followups(due_date);
+            CREATE TABLE IF NOT EXISTS weekly_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start TEXT NOT NULL UNIQUE,
+                week_end TEXT NOT NULL,
+                report_data TEXT,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS inventory_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                store_number TEXT,
+                store_name TEXT,
+                store_city TEXT,
+                quantity INTEGER DEFAULT 0,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (product_id) REFERENCES products(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_inv_history_product ON inventory_history(product_id);
+            CREATE INDEX IF NOT EXISTS idx_inv_history_date ON inventory_history(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_weekly_reports_week ON weekly_reports(week_start);
+
+            -- ======== SOD (Sale of Data) tables ========
+            CREATE TABLE IF NOT EXISTS sod_sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source TEXT NOT NULL,
+                file_name TEXT,
+                snapshot_date TEXT,
+                status TEXT DEFAULT 'running',
+                total_rows INTEGER DEFAULT 0,
+                anu_rows INTEGER DEFAULT 0,
+                new_listings INTEGER DEFAULT 0,
+                new_delistings INTEGER DEFAULT 0,
+                error TEXT,
+                duration_seconds REAL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sod_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                status TEXT,
+                on_hand INTEGER DEFAULT 0,
+                product_name TEXT DEFAULT '',
+                source TEXT DEFAULT 'daily_a',
+                ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(sku, store_number, snapshot_date)
+            );
+            CREATE TABLE IF NOT EXISTS sod_products (
+                sku TEXT PRIMARY KEY,
+                product_name TEXT DEFAULT '',
+                first_seen TEXT,
+                last_seen TEXT,
+                current_status TEXT DEFAULT 'L',
+                store_count INTEGER DEFAULT 0,
+                total_on_hand INTEGER DEFAULT 0,
+                is_tracked INTEGER DEFAULT 0,
+                brand TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS sod_listing_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER,
+                change_date TEXT NOT NULL,
+                old_status TEXT,
+                new_status TEXT,
+                change_type TEXT,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_sod_inv_sku ON sod_inventory(sku);
+            CREATE INDEX IF NOT EXISTS idx_sod_inv_date ON sod_inventory(snapshot_date);
+            CREATE INDEX IF NOT EXISTS idx_sod_inv_sku_date ON sod_inventory(sku, snapshot_date);
+            CREATE INDEX IF NOT EXISTS idx_sod_inv_store ON sod_inventory(store_number);
+            CREATE INDEX IF NOT EXISTS idx_sod_runs_at ON sod_sync_runs(run_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sod_changes_sku ON sod_listing_changes(sku);
+            CREATE INDEX IF NOT EXISTS idx_sod_changes_date ON sod_listing_changes(change_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_sod_products_tracked ON sod_products(is_tracked);
         ''')
         migrate_cols = [
             ('stores', 'manager_name', "TEXT DEFAULT ''"), ('stores', 'asst_manager_name', "TEXT DEFAULT ''"),
             ('stores', 'manager_phone', "TEXT DEFAULT ''"), ('stores', 'store_email', "TEXT DEFAULT ''"),
             ('stores', 'producer', "TEXT DEFAULT ''"), ('stores', 'lat', "REAL DEFAULT 0"),
             ('stores', 'lng', "REAL DEFAULT 0"),
+            ('stores', 'lcbo_store_id', "TEXT DEFAULT ''"),
             ('activities', 'producer', "TEXT DEFAULT ''"), ('activities', 'venue_type', "TEXT DEFAULT ''"),
             ('activities', 'follow_up_date', "TEXT DEFAULT ''"),
+            ('activities', 'status_code', "INTEGER DEFAULT 0"),
+            ('products', 'listing_status', "INTEGER DEFAULT 2"),
+            ('products', 'listing_date', "TEXT DEFAULT ''"),
+            ('products', 'delisting_date', "TEXT DEFAULT ''"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -910,60 +1116,417 @@ def api_product_create():
         return jsonify({'id': last['id'] if isinstance(last, dict) else last[0], 'success': True})
 
 
+LCBO_GRAPHQL = 'https://api.lcbo.dev/graphql'
+LCBO_STORE_INVENTORY_URL = 'https://www.lcbo.com/en/storeinventory/'
+LCBO_PRODUCT_URL = 'https://www.lcbo.com/en/product/'
+INVENTORY_QUERY = """
+query GetProductInventory($sku: String!) {
+  product(sku: $sku) {
+    sku name priceInCents producerName isBuyable updatedAt
+    alcoholPercent unitVolumeMl sellRankMonthly sellRankYearly
+    inventories {
+      totalCount
+      edges {
+        node {
+          quantity updatedAt
+          store {
+            externalId name city address latitude longitude
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_STORELIST_RE = re.compile(r'"storeList"\s*:\s*(\[\[.*?\]\])\s*[,}]', re.DOTALL)
+_PRICE_RE = re.compile(r'"price"\s*:\s*"?([\d.]+)"?')
+_BUYABLE_RE = re.compile(r'"is[_ ]?buyable"\s*:\s*(true|false)', re.IGNORECASE)
+
+
+def scrape_lcbo_inventory(sku):
+    """Scrape LIVE store-level inventory from LCBO.com storeinventory page.
+    Returns list of dicts with store_number, city, intersection, address, phone, qty.
+    Works for EVERY listed SKU on LCBO.com (including products missing from lcbo.dev)."""
+    if not http_requests or not sku:
+        return [], 'no http/sku'
+    try:
+        resp = http_requests.get(
+            f'{LCBO_STORE_INVENTORY_URL}?sku={sku}',
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-CA,en;q=0.9',
+            },
+            timeout=25,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return [], f'http {resp.status_code}'
+        html = resp.text
+        m = _STORELIST_RE.search(html)
+        if not m:
+            return [], 'storeList not found — product may be delisted or not stocked'
+        raw = m.group(1)
+        try:
+            rows = json.loads(raw)
+        except Exception:
+            # storeList is in [["a","b",...],...] shape — should parse as JSON
+            return [], 'storeList parse error'
+        stores = []
+        # first row is header
+        for row in rows[1:]:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            city, intersection, addr1, addr2, phone, store_num, qty = row[:7]
+            try:
+                qty_int = int(qty)
+            except (TypeError, ValueError):
+                qty_int = 0
+            stores.append({
+                'store_number': str(store_num).strip(),
+                'city': (city or '').strip(),
+                'intersection': (intersection or '').strip(),
+                'address': (addr1 or '').strip() + ((' ' + addr2) if addr2 else ''),
+                'phone': (phone or '').strip(),
+                'quantity': qty_int,
+                'store_name': f"{(city or '').strip()} — {(intersection or '').strip()}".strip(' —'),
+            })
+        return stores, None
+    except Exception as e:
+        return [], f'scrape error: {e}'
+
+
+def fetch_lcbo_graphql_inventory(sku):
+    """Fetch live inventory + metadata from LCBO.dev GraphQL — used for price/listing-status enrichment.
+    Does NOT cover all SKUs (e.g. 20187 Red Admiral is missing) so always combine with scrape_lcbo_inventory."""
+    if not http_requests or not sku:
+        return None, 'no http/sku'
+    try:
+        resp = http_requests.post(
+            LCBO_GRAPHQL,
+            json={'query': INVENTORY_QUERY, 'variables': {'sku': str(sku)}},
+            headers={'Content-Type': 'application/json', 'User-Agent': 'AnuSpirits-CRM/2.0'},
+            timeout=20
+        )
+        if resp.status_code != 200:
+            return None, f'API returned {resp.status_code}'
+        data = resp.json()
+        if 'errors' in data:
+            return None, str(data['errors'])
+        product_data = data.get('data', {}).get('product')
+        return product_data, None
+    except Exception as e:
+        return None, str(e)
+
+
+def live_inventory_for_sku(sku):
+    """Combine LCBO.com scrape (comprehensive) with lcbo.dev GraphQL (metadata).
+    Returns (stores_list, meta_dict) where meta has price_cents, is_buyable, updated_at etc."""
+    scraped, scrape_err = scrape_lcbo_inventory(sku)
+    meta = {
+        'source': 'lcbo.com',
+        'scrape_error': scrape_err,
+        'price_cents': None,
+        'is_buyable': None,
+        'updated_at': None,
+        'sell_rank_yearly': None,
+        'alcohol_percent': None,
+        'unit_volume_ml': None,
+    }
+    gql, _gql_err = fetch_lcbo_graphql_inventory(sku)
+    if gql:
+        meta['price_cents'] = gql.get('priceInCents')
+        meta['is_buyable'] = gql.get('isBuyable')
+        meta['updated_at'] = gql.get('updatedAt')
+        meta['sell_rank_yearly'] = gql.get('sellRankYearly')
+        meta['alcohol_percent'] = gql.get('alcoholPercent')
+        meta['unit_volume_ml'] = gql.get('unitVolumeMl')
+    # Listing status heuristic:
+    # - scraped has stores + is_buyable true  => Active (2)
+    # - scraped has stores + is_buyable false => Delisting (3)
+    # - no scraped stores + is_buyable false  => Delisted/warehouse-only (4-5)
+    # - no scraped stores + gql returns null  => Not in LCBO.dev index (but may be on LCBO.com)
+    if scraped:
+        if meta['is_buyable'] is False:
+            meta['listing_status'] = 3  # to be delisted
+        else:
+            meta['listing_status'] = 2  # active
+    else:
+        if meta['is_buyable'] is False:
+            meta['listing_status'] = 5  # fully delisted
+        else:
+            meta['listing_status'] = 4  # warehouse only / no retail stock
+    return scraped, meta
+
+
+def _persist_live_inventory(product_id, sku, stores, meta):
+    """Write scraped inventory to inventory_cache + inventory_history, update product listing status."""
+    # Replace inventory cache for this product
+    db_execute("DELETE FROM inventory_cache WHERE product_id=?", [product_id])
+    for s in stores:
+        db_execute(
+            "INSERT INTO inventory_cache (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
+            [product_id, s['store_number'], s['store_name'], s['city'], s['quantity']]
+        )
+    # Append aggregate snapshot row to inventory_history for trend reporting
+    try:
+        db_execute(
+            "INSERT INTO inventory_history (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
+            [product_id, 'SUMMARY', f'{len(stores)} stores', 'TOTAL', sum(s['quantity'] for s in stores)]
+        )
+    except Exception:
+        pass
+    # Update price and listing status
+    if meta.get('price_cents'):
+        db_execute("UPDATE products SET price=? WHERE id=?", [f"${meta['price_cents']/100:.2f}", product_id])
+    if meta.get('listing_status'):
+        db_execute("UPDATE products SET listing_status=? WHERE id=?", [meta['listing_status'], product_id])
+    db_commit()
+
+
 @app.route('/api/inventory/check/<sku>')
 def api_inventory_check(sku):
-    if not http_requests:
-        return jsonify({'error': 'requests not available', 'stores': []})
-
+    """LIVE inventory check — scrapes LCBO.com storeList + enriches via lcbo.dev.
+    Works for ALL listed SKUs. Persists to inventory_cache and inventory_history."""
     product = db_fetchone("SELECT * FROM products WHERE lcbo_sku=?", [sku])
     if not product:
-        return jsonify({'error': 'Product not found', 'stores': []})
+        return jsonify({'error': 'Product not found in CRM', 'stores': []})
     product = dict(product)
     for k, v in product.items():
         if isinstance(v, datetime):
             product[k] = v.isoformat()
 
-    try:
-        resp = http_requests.get(
-            f'https://www.lcbo.com/en/storeinventory/?sku={sku}',
-            headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', 'Accept': '*/*'},
-            timeout=15
-        )
-        stores = []
-        if resp.status_code == 200:
-            text = resp.text
-            json_match = re.search(r'var\s+storeData\s*=\s*(\[.*?\]);', text, re.DOTALL)
-            if json_match:
-                try:
-                    store_data = json.loads(json_match.group(1))
-                    for sd in store_data:
-                        stores.append({'store_name': sd.get('name', ''), 'store_number': str(sd.get('store_id', '')),
-                                       'city': sd.get('city', ''), 'quantity': sd.get('quantity', 0)})
-                except Exception:
-                    pass
-            if not stores:
-                store_blocks = re.findall(r'class="store-name[^"]*"[^>]*>([^<]+)<', text)
-                qty_blocks = re.findall(r'class="store-stock[^"]*"[^>]*>([^<]+)<', text)
-                for i, name in enumerate(store_blocks):
-                    qty = qty_blocks[i].strip() if i < len(qty_blocks) else '0'
-                    q = 0
-                    try:
-                        q = int(re.sub(r'[^0-9]', '', qty))
-                    except Exception:
-                        pass
-                    stores.append({'store_name': name.strip(), 'city': '', 'quantity': q, 'store_number': ''})
-            if stores:
-                db_execute("DELETE FROM inventory_cache WHERE product_id=?", [product['id']])
-                for s in stores:
-                    db_execute(
-                        "INSERT INTO inventory_cache (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
-                        [product['id'], s.get('store_number', 0), s['store_name'], s.get('city', ''), s['quantity']]
-                    )
-                db_commit()
-        return jsonify({'product': product, 'stores': stores, 'checked_at': datetime.now().isoformat(), 'source': 'lcbo.com'})
-    except Exception as e:
+    stores, meta = live_inventory_for_sku(sku)
+    if stores:
+        _persist_live_inventory(product['id'], sku, stores, meta)
+        product['listing_status'] = meta.get('listing_status', 2)
+        if meta.get('price_cents'):
+            product['price'] = f"${meta['price_cents']/100:.2f}"
+        return jsonify({
+            'product': product,
+            'stores': stores,
+            'total_units': sum(s['quantity'] for s in stores),
+            'store_count': len(stores),
+            'meta': meta,
+            'checked_at': datetime.now().isoformat(),
+            'source': 'lcbo.com (live scrape) + lcbo.dev enrichment'
+        })
+    else:
+        # Fall back to cached data
         cached = db_fetchall("SELECT * FROM inventory_cache WHERE product_id=? ORDER BY store_city", [product['id']])
-        return jsonify({'product': product, 'stores': [dict(c) for c in cached], 'checked_at': None, 'source': 'cache', 'error': str(e)})
+        return jsonify({
+            'product': product,
+            'stores': [dict(c) for c in cached],
+            'total_units': sum(c['quantity'] for c in cached),
+            'store_count': len(cached),
+            'meta': meta,
+            'checked_at': None,
+            'source': 'cache',
+            'error': meta.get('scrape_error') or 'No live stock available'
+        })
+
+
+@app.route('/api/inventory/refresh-all', methods=['POST'])
+def api_inventory_refresh_all():
+    """Refresh inventories for ALL tracked products from live LCBO.com — run daily via cron."""
+    if not http_requests:
+        return jsonify({'error': 'requests library not available'})
+    products = db_fetchall("SELECT * FROM products WHERE lcbo_sku != ''")
+    results = []
+    total_refreshed = 0
+    for p in products:
+        p = dict(p)
+        sku = p.get('lcbo_sku', '')
+        if not sku:
+            continue
+        stores, meta = live_inventory_for_sku(sku)
+        if stores:
+            _persist_live_inventory(p['id'], sku, stores, meta)
+            total_refreshed += 1
+            results.append({
+                'sku': sku, 'name': p['name'],
+                'stores': len(stores),
+                'total_units': sum(s['quantity'] for s in stores),
+                'price': (f"${meta['price_cents']/100:.2f}" if meta.get('price_cents') else p.get('price', '')),
+                'listing_status': meta.get('listing_status'),
+                'status': 'refreshed'
+            })
+        else:
+            results.append({'sku': sku, 'name': p['name'], 'stores': 0, 'status': 'no_stock_or_delisted', 'error': meta.get('scrape_error')})
+    return jsonify({
+        'refreshed': total_refreshed,
+        'total_tracked': len(results),
+        'products': results,
+        'timestamp': datetime.now().isoformat(),
+        'source': 'lcbo.com live + lcbo.dev'
+    })
+
+
+@app.route('/api/inventory/gap-report')
+def api_gap_report():
+    """GAP REPORT: for each tracked product, list LCBO stores NOT carrying it.
+    These are the rep's top listing-opportunity stores."""
+    sku_filter = request.args.get('sku', '').strip()
+    city_filter = request.args.get('city', '').strip()
+
+    # Get all CRM stores
+    all_stores = db_fetchall("SELECT id, store_number, account, city, address, postal, manager_name, phone, priority, lat, lng FROM stores")
+    all_stores = [dict(s) for s in all_stores]
+    stores_by_num = {str(s['store_number']): s for s in all_stores}
+    total_crm_stores = len(all_stores)
+
+    # Products to scan
+    if sku_filter:
+        products = db_fetchall("SELECT * FROM products WHERE lcbo_sku=?", [sku_filter])
+    else:
+        products = db_fetchall("SELECT * FROM products WHERE lcbo_sku != ''")
+
+    gap_results = []
+    for p in products:
+        p = dict(p)
+        sku = p.get('lcbo_sku', '')
+        if not sku:
+            continue
+        # Get stores carrying this product (from cache, most recent refresh)
+        carrying = db_fetchall(
+            "SELECT store_number, quantity FROM inventory_cache WHERE product_id=?",
+            [p['id']]
+        )
+        carrying_nums = {str(c['store_number']): int(c['quantity'] or 0) for c in carrying}
+
+        # Gap stores = CRM stores NOT in carrying
+        gap_stores = []
+        for s in all_stores:
+            num = str(s['store_number'])
+            if num not in carrying_nums:
+                if not city_filter or city_filter.lower() in (s.get('city') or '').lower():
+                    gap_stores.append({
+                        **s,
+                        'full_address': f"{s.get('address','')}, {s.get('city','')}, ON {s.get('postal','')}".strip(', '),
+                    })
+        gap_results.append({
+            'product': {'id': p['id'], 'name': p['name'], 'sku': sku, 'brand': p.get('brand'), 'price': p.get('price')},
+            'carrying_count': len(carrying_nums),
+            'gap_count': len(gap_stores),
+            'gap_rate_pct': round(100.0 * len(gap_stores) / max(total_crm_stores, 1), 1),
+            'gap_stores': gap_stores[:500],  # cap for payload size
+        })
+
+    return jsonify({
+        'generated_at': datetime.now().isoformat(),
+        'total_crm_stores': total_crm_stores,
+        'products': gap_results,
+    })
+
+
+@app.route('/api/inventory/reorder-needed')
+def api_reorder_needed():
+    """REORDER NEEDED: stores with low stock (below threshold) on any tracked product.
+    Query params: threshold (default 5), sku (optional), city (optional)."""
+    threshold = int(request.args.get('threshold', 5))
+    sku_filter = request.args.get('sku', '').strip()
+    city_filter = request.args.get('city', '').strip()
+
+    # Find low-stock inventory entries
+    query = """
+        SELECT ic.store_number, ic.store_name, ic.store_city, ic.quantity,
+               p.id as product_id, p.lcbo_sku, p.name as product_name, p.brand, p.price,
+               s.id as store_id, s.address, s.postal, s.manager_name, s.phone, s.lat, s.lng
+        FROM inventory_cache ic
+        JOIN products p ON ic.product_id = p.id
+        LEFT JOIN stores s ON CAST(s.store_number AS TEXT) = ic.store_number
+        WHERE ic.quantity < ?
+    """
+    params = [threshold]
+    if sku_filter:
+        query += " AND p.lcbo_sku=?"
+        params.append(sku_filter)
+    if city_filter:
+        query += " AND LOWER(ic.store_city) LIKE ?"
+        params.append(f"%{city_filter.lower()}%")
+    query += " ORDER BY ic.quantity ASC, ic.store_city"
+
+    rows = db_fetchall(query, params)
+    results = []
+    for r in rows:
+        r = dict(r)
+        results.append({
+            'store_number': r.get('store_number'),
+            'store_name': r.get('store_name'),
+            'city': r.get('store_city'),
+            'address': r.get('address'),
+            'phone': r.get('phone'),
+            'manager': r.get('manager_name'),
+            'quantity': int(r.get('quantity') or 0),
+            'product': {'id': r.get('product_id'), 'sku': r.get('lcbo_sku'), 'name': r.get('product_name'), 'brand': r.get('brand'), 'price': r.get('price')},
+            'urgency': 'critical' if (r.get('quantity') or 0) == 0 else ('high' if (r.get('quantity') or 0) <= 2 else 'medium'),
+            'in_crm': r.get('store_id') is not None,
+        })
+
+    return jsonify({
+        'threshold': threshold,
+        'total_reorder_alerts': len(results),
+        'critical_count': sum(1 for x in results if x['urgency'] == 'critical'),
+        'high_count': sum(1 for x in results if x['urgency'] == 'high'),
+        'medium_count': sum(1 for x in results if x['urgency'] == 'medium'),
+        'alerts': results,
+        'generated_at': datetime.now().isoformat(),
+    })
+
+
+@app.route('/api/inventory/listing-status')
+def api_listing_status():
+    """LISTING STATUS report: current live status + total distribution for every tracked product."""
+    products = db_fetchall("SELECT * FROM products WHERE lcbo_sku != '' ORDER BY brand, name")
+    status_map = {
+        1: 'New Listing',
+        2: 'Active',
+        3: 'Delisting (to be removed)',
+        4: 'Warehouse Only',
+        5: 'Fully Delisted',
+    }
+    out = []
+    for p in products:
+        p = dict(p)
+        cache = db_fetchone(
+            "SELECT COUNT(*) as store_count, COALESCE(SUM(quantity),0) as total_units FROM inventory_cache WHERE product_id=?",
+            [p['id']]
+        )
+        cache = dict(cache) if cache else {'store_count': 0, 'total_units': 0}
+        # Last 14 aggregate snapshots (summary rows only)
+        history = db_fetchall(
+            "SELECT recorded_at, store_name, quantity as total_units FROM inventory_history WHERE product_id=? AND store_number='SUMMARY' ORDER BY recorded_at DESC LIMIT 14",
+            [p['id']]
+        )
+        history = []
+        for h in db_fetchall(
+            "SELECT recorded_at, store_name, quantity FROM inventory_history WHERE product_id=? AND store_number=? ORDER BY recorded_at DESC LIMIT 14",
+            [p['id'], 'SUMMARY']
+        ):
+            h = dict(h)
+            rec = h.get('recorded_at')
+            if isinstance(rec, datetime):
+                rec = rec.isoformat()
+            history.append({
+                'date': rec,
+                'store_count_text': h.get('store_name'),
+                'total_units': int(h.get('quantity') or 0),
+            })
+        status_code = int(p.get('listing_status') or 2)
+        out.append({
+            'sku': p.get('lcbo_sku'),
+            'name': p.get('name'),
+            'brand': p.get('brand'),
+            'price': p.get('price'),
+            'listing_status_code': status_code,
+            'listing_status_label': status_map.get(status_code, 'Unknown'),
+            'store_count': int(cache.get('store_count') or 0),
+            'total_units': int(cache.get('total_units') or 0),
+            'trend_14d': history,
+            'lcbo_url': f"https://www.lcbo.com/en/product/{p.get('lcbo_sku')}" if p.get('lcbo_sku') else None,
+        })
+    return jsonify({'products': out, 'generated_at': datetime.now().isoformat()})
 
 
 # === ROUTE PLANNING ===
@@ -1547,10 +2110,1166 @@ def api_opportunity():
     return jsonify([dict(r) for r in rows])
 
 
+# =================================================================
+# ============= LCBO SALE-OF-DATA (SOD) INTEGRATION ===============
+# =================================================================
+# Source:   https://sod.lcbo.com  (authenticated subscriber portal)
+# Options:  12 = Daily Inventory A (all SKUs, ~75 MB/day, every store)
+#           13 = Daily Inventory B (agent-specific, smaller)
+# Format:   Fixed-width .dat, 47 chars per row, latin-1 encoding
+#   [0:8]   date YYYYMMDD
+#   [8:15]  SKU (7 digits, zero-padded)
+#   [15:32] product name (17 chars, space-padded)
+#   [32:36] store number (4 digits)
+#   [36:37] status (L=listed / D=to-be-delisted / F=fully-delisted)
+#   [37:38] qty sign (space=+, '-'=negative)
+#   [38:47] qty (9 digits)
+# Daily rotation: files named by weekday (MON/TUE/WED/...); overwritten each week.
+# =================================================================
+
+import threading
+import zipfile
+import tempfile
+import traceback
+from urllib.parse import urljoin
+
+SOD_BASE = 'https://sod.lcbo.com'
+SOD_USER = os.environ.get('SOD_USER', '').strip()
+SOD_PASSWORD = os.environ.get('SOD_PASSWORD', '').strip()
+SOD_AGENT_ID = os.environ.get('SOD_AGENT_ID', '1113').strip()  # default: VINETER/XTVTR
+
+# ------- SKU → brand mapping (only Anu/NB Distillers products tracked in reports) -------
+# Keys are 7-char zero-padded SKUs (matches what SOD emits)
+SOD_TRACKED_SKUS = {
+    # NB Distillers (Anu-owned)
+    '0020187': ('NB Distillers', 'Red Admiral Vodka'),
+    '0022246': ('NB Distillers', 'Chak De Canadian Whisky'),
+    # Goenchi (Anu portfolio)
+    '0046340': ('Goenchi', 'Goenchi Cashew Feni'),
+    '0046343': ('Goenchi', 'Goenchi Coconut Feni'),
+    # Fratelli (Anu portfolio)
+    '0046282': ('Fratelli', 'Fratelli Classic Shiraz'),
+    '0046285': ('Fratelli', 'Fratelli Chenin Blanc'),
+    '0046286': ('Fratelli', 'Fratelli Sauvignon Blanc'),
+    '0046287': ('Fratelli', 'Fratelli Cabernet Sauvignon'),
+}
+
+_SOD_CSRF_RE = re.compile(
+    r'<input[^>]*name="csrf_token"[^>]*value="([^"]+)"', re.IGNORECASE
+)
+
+
+class SODClient:
+    """Authenticated client for https://sod.lcbo.com/."""
+
+    def __init__(self, user=None, password=None, agent_id=None, timeout=60):
+        self.user = user or SOD_USER
+        self.password = password or SOD_PASSWORD
+        self.agent_id = agent_id or SOD_AGENT_ID
+        self.timeout = timeout
+        if http_requests is None:
+            raise RuntimeError("'requests' library not available")
+        self.session = http_requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+        })
+        self._logged_in = False
+
+    def _extract_csrf(self, html):
+        m = _SOD_CSRF_RE.search(html)
+        return m.group(1) if m else None
+
+    def login(self):
+        if not self.user or not self.password:
+            raise RuntimeError("SOD credentials not configured (SOD_USER / SOD_PASSWORD env vars)")
+        # 1) GET sign-in page to obtain CSRF token
+        r = self.session.get(f'{SOD_BASE}/user/sign-in', timeout=self.timeout)
+        r.raise_for_status()
+        csrf = self._extract_csrf(r.text)
+        if not csrf:
+            raise RuntimeError("Could not extract csrf_token from /user/sign-in")
+        # 2) POST credentials
+        r = self.session.post(
+            f'{SOD_BASE}/user/sign-in',
+            data={
+                'csrf_token': csrf,
+                'next': '/',
+                'reg_next': '/',
+                'username': self.user,
+                'password': self.password,
+                'remember_me': 'y',
+            },
+            headers={'Referer': f'{SOD_BASE}/user/sign-in'},
+            allow_redirects=False,
+            timeout=self.timeout,
+        )
+        if r.status_code not in (302, 303):
+            raise RuntimeError(f"SOD login failed (HTTP {r.status_code}) — check credentials")
+        if 'remember_token' not in self.session.cookies.get_dict():
+            # Session cookie alone might suffice; verify by fetching subscribers page
+            test = self.session.get(f'{SOD_BASE}/subscribers', timeout=self.timeout)
+            if 'Sign out' not in test.text:
+                raise RuntimeError("SOD login failed: no remember_token and /subscribers missing Sign-out link")
+        self._logged_in = True
+        return True
+
+    def _ensure_logged_in(self):
+        if not self._logged_in:
+            self.login()
+
+    def latest_filename(self, source):
+        """Infer today's filename from weekday.
+
+        LCBO uploads nightly (~02:00 ET). If the current time is before ~02:30 ET,
+        today's file may not yet be present and we fall back to yesterday's.
+        """
+        import calendar
+        # Use today's weekday; caller can fall back to yesterday on 404
+        today = datetime.utcnow()
+        # SOD timezone is America/Toronto; naive handling: use UTC day-of-week
+        wd = today.strftime('%a').upper()  # 'TUE'
+        if source == 'daily_a':
+            return f'alldlyinventory{wd}.zip'
+        elif source == 'daily_b':
+            return f'Edlyinventory{self.agent_id}{wd}.zip'
+        raise ValueError(f'Unknown source {source!r}')
+
+    def download_option(self, source, filename=None):
+        """Download a specific SOD file. Returns (bytes, filename)."""
+        self._ensure_logged_in()
+        fn = filename or self.latest_filename(source)
+        if source == 'daily_a':
+            url = f'{SOD_BASE}/downloads/general/12/{fn}'
+        elif source == 'daily_b':
+            url = f'{SOD_BASE}/downloads/agent/{self.agent_id}/13/{fn}'
+        else:
+            raise ValueError(f'Unknown source {source!r}')
+        r = self.session.get(url, timeout=self.timeout, stream=True)
+        if r.status_code == 404:
+            # Try yesterday's file as fallback
+            yd = (datetime.utcnow() - timedelta(days=1)).strftime('%a').upper()
+            if source == 'daily_a':
+                fn = f'alldlyinventory{yd}.zip'
+                url = f'{SOD_BASE}/downloads/general/12/{fn}'
+            else:
+                fn = f'Edlyinventory{self.agent_id}{yd}.zip'
+                url = f'{SOD_BASE}/downloads/agent/{self.agent_id}/13/{fn}'
+            r = self.session.get(url, timeout=self.timeout, stream=True)
+        r.raise_for_status()
+        content = r.content
+        if not content or not content.startswith(b'PK'):
+            raise RuntimeError(f"Did not receive zip data from {url} (content-type={r.headers.get('Content-Type')})")
+        return content, fn
+
+    def download_and_extract(self, source, filename=None):
+        """Download the zip, unzip in memory, return (raw_dat_bytes, member_name, zip_filename)."""
+        data, fn = self.download_option(source, filename=filename)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            members = zf.namelist()
+            if not members:
+                raise RuntimeError(f"Zip {fn} is empty")
+            dat_name = members[0]
+            raw = zf.read(dat_name)
+        return raw, dat_name, fn
+
+
+def parse_sod_dat(raw_bytes):
+    """Parse a SOD fixed-width .dat file. Yields dicts.
+
+    Each row is 47 chars (plus newline), latin-1 encoded. See format notes at top.
+    """
+    # Use latin-1 to avoid utf-8 decode errors on Croatian/French accented names
+    text = raw_bytes.decode('latin-1', errors='replace')
+    for line in text.splitlines():
+        if len(line) < 47:
+            continue
+        try:
+            date_raw = line[0:8]
+            sku = line[8:15]
+            name = line[15:32].strip()
+            store = line[32:36]
+            status = line[36:37].strip() or 'L'
+            sign = line[37:38]
+            qty_digits = line[38:47].strip()
+            if not date_raw.isdigit() or not sku.isdigit() or not store.isdigit():
+                continue
+            qty = int(qty_digits) if qty_digits.isdigit() else 0
+            if sign == '-':
+                qty = -qty
+            snapshot_date = f'{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}'
+            yield {
+                'snapshot_date': snapshot_date,
+                'sku': sku,
+                'product_name': name,
+                'store_number': int(store),
+                'status': status,
+                'on_hand': qty,
+            }
+        except (ValueError, IndexError):
+            continue
+
+
+# ------- DB helpers scoped to the sync pipeline (use a dedicated connection) -------
+def _sod_get_conn():
+    """Dedicated connection for the sync (not the request-scoped `g.db`).
+
+    Syncs run in background threads and from schedulers, so must not reuse Flask's g.
+    """
+    if USE_POSTGRES:
+        return psycopg2.connect(DATABASE_URL)
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+
+def _sod_ph():
+    """Return the placeholder token for the current DB."""
+    return '%s' if USE_POSTGRES else '?'
+
+
+def run_sod_sync(source='daily_a', filename=None, client=None):
+    """Download + parse + ingest one SOD file. Idempotent per (sku, store, date).
+
+    Returns a dict summary of the run.
+    """
+    start = datetime.utcnow()
+    ph = _sod_ph()
+    conn = _sod_get_conn()
+    try:
+        cur = conn.cursor()
+        # Record the run as 'running' up front for observability
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO sod_sync_runs (source, status) VALUES (%s, 'running') RETURNING id",
+                (source,),
+            )
+            run_id = cur.fetchone()[0]
+        else:
+            cur.execute(
+                "INSERT INTO sod_sync_runs (source, status) VALUES (?, 'running')",
+                (source,),
+            )
+            run_id = cur.lastrowid
+        conn.commit()
+
+        # 1) Download + unzip
+        client = client or SODClient()
+        raw_bytes, dat_name, zip_name = client.download_and_extract(source, filename=filename)
+
+        # 2) Parse and bucket by snapshot_date
+        by_date = {}
+        total = 0
+        for row in parse_sod_dat(raw_bytes):
+            total += 1
+            by_date.setdefault(row['snapshot_date'], []).append(row)
+        if not by_date:
+            raise RuntimeError("No rows parsed from .dat file")
+        snapshot_date = max(by_date.keys())  # use the most recent date in the feed
+
+        # 3) Compute per-sku aggregates across the newest snapshot
+        latest_rows = by_date[snapshot_date]
+        anu_count = 0
+        per_sku = {}
+        for r in latest_rows:
+            sku = r['sku']
+            if sku in SOD_TRACKED_SKUS:
+                anu_count += 1
+            agg = per_sku.setdefault(sku, {
+                'name': r['product_name'],
+                'status_counts': {},
+                'store_count': 0,
+                'total_on_hand': 0,
+            })
+            agg['status_counts'][r['status']] = agg['status_counts'].get(r['status'], 0) + 1
+            agg['store_count'] += 1
+            agg['total_on_hand'] += r['on_hand']
+
+        # 4) Pull prior sod_products state to compute listing changes
+        cur.execute("SELECT sku, current_status FROM sod_products")
+        prior = {row[0]: row[1] for row in cur.fetchall()}
+        new_listings = 0
+        new_delistings = 0
+        change_inserts = []
+        is_cold_start = len(prior) == 0
+        for sku, agg in per_sku.items():
+            # Majority status wins for product-level status
+            status = max(agg['status_counts'].items(), key=lambda x: x[1])[0]
+            old = prior.get(sku)
+            # On cold start, only record NEW_LISTING events for tracked SKUs to avoid noise
+            # (the full catalog doesn't belong in the change-log on first ingest).
+            if old is None:
+                if sku in SOD_TRACKED_SKUS and not is_cold_start:
+                    change_inserts.append((sku, None, snapshot_date, None, status, 'NEW_LISTING'))
+                    if status == 'L':
+                        new_listings += 1
+                elif sku in SOD_TRACKED_SKUS and is_cold_start:
+                    # Record a BASELINE event so the timeline has a starting point
+                    change_inserts.append((sku, None, snapshot_date, None, status, 'BASELINE'))
+            elif old != status:
+                # Status flips are always interesting, not only for tracked SKUs
+                if status in ('D', 'F') and old == 'L':
+                    change_inserts.append((sku, None, snapshot_date, old, status, 'DELISTED'))
+                    if sku in SOD_TRACKED_SKUS:
+                        new_delistings += 1
+                elif status == 'L' and old in ('D', 'F'):
+                    change_inserts.append((sku, None, snapshot_date, old, status, 'RELISTED'))
+                    if sku in SOD_TRACKED_SKUS:
+                        new_listings += 1
+                else:
+                    change_inserts.append((sku, None, snapshot_date, old, status, 'STATUS_FLIP'))
+
+        # 5) Upsert sod_inventory (filter: track everything in Daily B; only Anu SKUs in Daily A to save space)
+        # Rationale: Daily A is 1.5M rows × 30 days = huge. Keep only tracked SKUs.
+        if source == 'daily_a':
+            rows_to_persist = [r for r in latest_rows if r['sku'] in SOD_TRACKED_SKUS]
+        else:
+            rows_to_persist = latest_rows  # Daily B is already agent-filtered
+
+        if rows_to_persist:
+            if USE_POSTGRES:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO sod_inventory
+                        (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                    VALUES %s
+                    ON CONFLICT (sku, store_number, snapshot_date) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        on_hand = EXCLUDED.on_hand,
+                        product_name = EXCLUDED.product_name,
+                        source = EXCLUDED.source,
+                        ingested_at = NOW()
+                    """,
+                    [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
+                      r['on_hand'], r['product_name'], source) for r in rows_to_persist],
+                    page_size=1000,
+                )
+            else:
+                cur.executemany(
+                    """INSERT INTO sod_inventory
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                       VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(sku, store_number, snapshot_date) DO UPDATE SET
+                         status=excluded.status, on_hand=excluded.on_hand,
+                         product_name=excluded.product_name, source=excluded.source,
+                         ingested_at=CURRENT_TIMESTAMP""",
+                    [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
+                      r['on_hand'], r['product_name'], source) for r in rows_to_persist],
+                )
+
+        # 6) Upsert sod_products rollup
+        for sku, agg in per_sku.items():
+            brand, display_name = SOD_TRACKED_SKUS.get(sku, ('', agg['name']))
+            is_tracked = sku in SOD_TRACKED_SKUS
+            status = max(agg['status_counts'].items(), key=lambda x: x[1])[0]
+            if USE_POSTGRES:
+                cur.execute(
+                    """INSERT INTO sod_products
+                        (sku, product_name, first_seen, last_seen, current_status,
+                         store_count, total_on_hand, is_tracked, brand, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                       ON CONFLICT (sku) DO UPDATE SET
+                         product_name = EXCLUDED.product_name,
+                         last_seen = EXCLUDED.last_seen,
+                         current_status = EXCLUDED.current_status,
+                         store_count = EXCLUDED.store_count,
+                         total_on_hand = EXCLUDED.total_on_hand,
+                         is_tracked = EXCLUDED.is_tracked,
+                         brand = EXCLUDED.brand,
+                         updated_at = NOW()""",
+                    (sku, display_name or agg['name'], snapshot_date, snapshot_date, status,
+                     agg['store_count'], agg['total_on_hand'], is_tracked, brand),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO sod_products
+                        (sku, product_name, first_seen, last_seen, current_status,
+                         store_count, total_on_hand, is_tracked, brand, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP)
+                       ON CONFLICT(sku) DO UPDATE SET
+                         product_name=excluded.product_name,
+                         last_seen=excluded.last_seen,
+                         current_status=excluded.current_status,
+                         store_count=excluded.store_count,
+                         total_on_hand=excluded.total_on_hand,
+                         is_tracked=excluded.is_tracked,
+                         brand=excluded.brand,
+                         updated_at=CURRENT_TIMESTAMP""",
+                    (sku, display_name or agg['name'], snapshot_date, snapshot_date, status,
+                     agg['store_count'], agg['total_on_hand'], 1 if is_tracked else 0, brand),
+                )
+
+        # 7) Insert detected listing changes
+        if change_inserts:
+            if USE_POSTGRES:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO sod_listing_changes
+                       (sku, store_number, change_date, old_status, new_status, change_type)
+                       VALUES %s""",
+                    change_inserts,
+                )
+            else:
+                cur.executemany(
+                    """INSERT INTO sod_listing_changes
+                       (sku, store_number, change_date, old_status, new_status, change_type)
+                       VALUES (?,?,?,?,?,?)""",
+                    change_inserts,
+                )
+
+        # 8) Also stamp a summary inventory_history row per tracked SKU (for legacy views)
+        for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
+            agg = per_sku.get(sku)
+            if not agg:
+                continue
+            # find product_id from products table
+            if USE_POSTGRES:
+                cur.execute("SELECT id FROM products WHERE lcbo_sku = %s LIMIT 1", (sku.lstrip('0'),))
+            else:
+                cur.execute("SELECT id FROM products WHERE lcbo_sku = ? LIMIT 1", (sku.lstrip('0'),))
+            prow = cur.fetchone()
+            if prow:
+                pid = prow[0]
+                if USE_POSTGRES:
+                    cur.execute(
+                        """INSERT INTO inventory_history
+                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                           VALUES (%s, 'SUMMARY', %s, 'SOD', %s, %s)""",
+                        (pid, f"{agg['store_count']} stores (SOD)", agg['total_on_hand'], snapshot_date),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO inventory_history
+                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                           VALUES (?, 'SUMMARY', ?, 'SOD', ?, ?)""",
+                        (pid, f"{agg['store_count']} stores (SOD)", agg['total_on_hand'], snapshot_date),
+                    )
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        if USE_POSTGRES:
+            cur.execute(
+                """UPDATE sod_sync_runs SET
+                    status='success', file_name=%s, snapshot_date=%s,
+                    total_rows=%s, anu_rows=%s, new_listings=%s, new_delistings=%s,
+                    duration_seconds=%s
+                   WHERE id=%s""",
+                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration, run_id),
+            )
+        else:
+            cur.execute(
+                """UPDATE sod_sync_runs SET
+                    status='success', file_name=?, snapshot_date=?,
+                    total_rows=?, anu_rows=?, new_listings=?, new_delistings=?,
+                    duration_seconds=?
+                   WHERE id=?""",
+                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration, run_id),
+            )
+        conn.commit()
+        cur.close()
+        return {
+            'status': 'success',
+            'run_id': run_id,
+            'source': source,
+            'file_name': zip_name,
+            'snapshot_date': snapshot_date,
+            'total_rows': total,
+            'anu_rows': anu_count,
+            'new_listings': new_listings,
+            'new_delistings': new_delistings,
+            'duration_seconds': round(duration, 1),
+        }
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}"
+        print(f"[SOD] sync failed: {err}")
+        try:
+            duration = (datetime.utcnow() - start).total_seconds()
+            if USE_POSTGRES:
+                conn.rollback()
+                cur2 = conn.cursor()
+                cur2.execute(
+                    "UPDATE sod_sync_runs SET status='failed', error=%s, duration_seconds=%s WHERE id=%s",
+                    (err[:2000], duration, run_id),
+                )
+                conn.commit()
+                cur2.close()
+            else:
+                conn.rollback()
+                conn.execute(
+                    "UPDATE sod_sync_runs SET status='failed', error=?, duration_seconds=? WHERE id=?",
+                    (err[:2000], duration, run_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
+        return {'status': 'failed', 'source': source, 'error': err}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# --------- Async trigger + scheduler ---------
+
+_sod_sync_lock = threading.Lock()
+_sod_last_result = {'daily_a': None, 'daily_b': None}
+
+
+def _sod_sync_worker(sources):
+    """Run the sync in a background thread (used for manual trigger)."""
+    if not _sod_sync_lock.acquire(blocking=False):
+        print('[SOD] sync already running, skipping')
+        return
+    try:
+        client = SODClient()
+        try:
+            client.login()
+        except Exception as e:
+            print(f'[SOD] login failed: {e}')
+            for s in sources:
+                _sod_last_result[s] = {'status': 'failed', 'error': str(e), 'source': s}
+            return
+        for src in sources:
+            result = run_sod_sync(src, client=client)
+            _sod_last_result[src] = result
+            print(f'[SOD] {src}: {result.get("status")} '
+                  f'rows={result.get("total_rows",0)} '
+                  f'anu={result.get("anu_rows",0)} '
+                  f'new_listings={result.get("new_listings",0)} '
+                  f'new_delistings={result.get("new_delistings",0)}')
+    finally:
+        _sod_sync_lock.release()
+
+
+def start_sod_sync_async(sources=None):
+    sources = sources or ['daily_a', 'daily_b']
+    t = threading.Thread(target=_sod_sync_worker, args=(sources,), daemon=True)
+    t.start()
+    return t
+
+
+# --------- Endpoints ---------
+
+@app.route('/api/sod/status', methods=['GET'])
+def api_sod_status():
+    """Last sync runs + counts of ingested data + configuration check."""
+    configured = bool(SOD_USER and SOD_PASSWORD)
+    rows = db_fetchall(
+        "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
+        "anu_rows, new_listings, new_delistings, duration_seconds, error "
+        "FROM sod_sync_runs ORDER BY run_at DESC LIMIT 20"
+    )
+    last_by_source = {}
+    for r in rows:
+        rd = row_to_dict(r) if not isinstance(r, dict) else r
+        src = rd['source']
+        if src not in last_by_source or rd.get('status') == 'success':
+            last_by_source.setdefault(src, rd)
+    # Snapshot stats
+    stats = row_to_dict(db_fetchone(
+        "SELECT COUNT(*) AS inv_rows, COUNT(DISTINCT sku) AS sku_count, "
+        "COUNT(DISTINCT snapshot_date) AS snapshot_days, "
+        "MAX(snapshot_date) AS latest_snapshot "
+        "FROM sod_inventory"
+    ) or {})
+    tracked_count = (row_to_dict(db_fetchone(
+        "SELECT COUNT(*) AS c FROM sod_products WHERE is_tracked = " + ("TRUE" if USE_POSTGRES else "1")
+    )) or {}).get('c', 0)
+    return jsonify({
+        'configured': configured,
+        'agent_id': SOD_AGENT_ID if configured else None,
+        'recent_runs': [row_to_dict(r) for r in rows],
+        'last_by_source': last_by_source,
+        'stats': {
+            **stats,
+            'tracked_products': tracked_count,
+        },
+        'scheduler_running': _sod_scheduler_running(),
+    })
+
+
+@app.route('/api/sod/sync', methods=['POST'])
+def api_sod_sync():
+    """Kick off an async sync for one or both sources."""
+    if not SOD_USER or not SOD_PASSWORD:
+        return jsonify({'error': 'SOD_USER / SOD_PASSWORD env vars not configured'}), 400
+    body = request.get_json(silent=True) or {}
+    sources = body.get('sources') or ['daily_a', 'daily_b']
+    sources = [s for s in sources if s in ('daily_a', 'daily_b')]
+    if not sources:
+        return jsonify({'error': 'no valid sources provided'}), 400
+    if _sod_sync_lock.locked():
+        return jsonify({'status': 'already_running', 'sources': sources}), 202
+    start_sod_sync_async(sources)
+    return jsonify({'status': 'started', 'sources': sources}), 202
+
+
+@app.route('/api/sod/inventory', methods=['GET'])
+def api_sod_inventory():
+    """Per-store inventory from SOD. Filter by sku, store, or brand.
+
+    Defaults to the latest snapshot across all tracked SKUs.
+    """
+    sku = request.args.get('sku', '').strip()
+    brand = request.args.get('brand', '').strip()
+    snapshot_date = request.args.get('date', '').strip()
+    tracked_only = request.args.get('tracked_only', '1') == '1'
+
+    if not snapshot_date:
+        latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+        if latest:
+            snapshot_date = (latest['d'] if isinstance(latest, dict) else latest[0])
+        if not snapshot_date:
+            return jsonify({'rows': [], 'snapshot_date': None, 'message': 'no SOD data ingested yet'})
+    snapshot_date = str(snapshot_date)
+
+    query = (
+        "SELECT i.sku, i.store_number, i.status, i.on_hand, i.product_name, "
+        "i.snapshot_date, p.brand AS brand "
+        "FROM sod_inventory i "
+        "LEFT JOIN sod_products p ON p.sku = i.sku "
+        "WHERE i.snapshot_date = ?"
+    )
+    params = [snapshot_date]
+    if sku:
+        # Zero-pad user input to match stored format
+        padded = sku.zfill(7)
+        query += " AND i.sku = ?"
+        params.append(padded)
+    if brand:
+        query += " AND p.brand = ?"
+        params.append(brand)
+    if tracked_only and not sku:
+        query += " AND (p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1") + ")"
+    query += " ORDER BY i.sku, i.store_number"
+    rows = db_fetchall(query, params)
+    return jsonify({
+        'snapshot_date': snapshot_date,
+        'count': len(rows),
+        'rows': [row_to_dict(r) for r in rows],
+    })
+
+
+@app.route('/api/sod/products', methods=['GET'])
+def api_sod_products():
+    """Product-level rollup. Shows every Anu/NB SKU with store count + total on-hand + status."""
+    tracked_only = request.args.get('tracked_only', '1') == '1'
+    query = (
+        "SELECT sku, product_name, brand, current_status, store_count, total_on_hand, "
+        "first_seen, last_seen, is_tracked, updated_at "
+        "FROM sod_products"
+    )
+    if tracked_only:
+        query += " WHERE is_tracked = " + ("TRUE" if USE_POSTGRES else "1")
+    query += " ORDER BY is_tracked DESC, brand, product_name"
+    rows = db_fetchall(query)
+    return jsonify({'count': len(rows), 'rows': [row_to_dict(r) for r in rows]})
+
+
+@app.route('/api/sod/listing-changes', methods=['GET'])
+def api_sod_listing_changes():
+    """Listing status changes detected by the sync. Default window: 90 days.
+
+    Filters: ?days=30, ?type=DELISTED|NEW_LISTING|RELISTED|STATUS_FLIP, ?tracked_only=1
+    """
+    try:
+        days = int(request.args.get('days', '90'))
+    except ValueError:
+        days = 90
+    change_type = request.args.get('type', '').strip().upper()
+    tracked_only = request.args.get('tracked_only', '1') == '1'
+    cutoff = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+    query = (
+        "SELECT c.id, c.sku, c.store_number, c.change_date, c.old_status, c.new_status, "
+        "c.change_type, c.detected_at, p.product_name AS product_name, p.brand AS brand, "
+        "p.is_tracked AS is_tracked "
+        "FROM sod_listing_changes c "
+        "LEFT JOIN sod_products p ON p.sku = c.sku "
+        "WHERE c.change_date >= ?"
+    )
+    params = [cutoff]
+    if change_type:
+        query += " AND c.change_type = ?"
+        params.append(change_type)
+    if tracked_only:
+        query += " AND p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1")
+    query += " ORDER BY c.change_date DESC, c.id DESC LIMIT 500"
+    rows = db_fetchall(query, params)
+    return jsonify({
+        'window_days': days,
+        'count': len(rows),
+        'rows': [row_to_dict(r) for r in rows],
+    })
+
+
+@app.route('/api/sod/gap-report', methods=['GET'])
+def api_sod_gap_report():
+    """For each tracked SKU, list stores in the master store table that are NOT carrying it
+    according to the most recent SOD snapshot. Source of truth: SOD Daily Inventory A.
+    """
+    latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+    snapshot_date = (latest['d'] if isinstance(latest, dict) else latest[0]) if latest else None
+    if not snapshot_date:
+        return jsonify({'snapshot_date': None, 'products': [], 'message': 'no SOD data yet — run /api/sod/sync first'})
+    snapshot_date = str(snapshot_date)
+
+    # All active LCBO stores
+    store_rows = db_fetchall(
+        "SELECT store_number, account, address, city, rep FROM stores WHERE store_number > 0"
+    )
+    all_stores = [row_to_dict(r) for r in store_rows]
+    store_by_num = {int(s['store_number']): s for s in all_stores}
+
+    # For each tracked SKU, pull carrying stores from SOD
+    report = []
+    for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
+        carrying = db_fetchall(
+            "SELECT store_number, status, on_hand FROM sod_inventory "
+            "WHERE sku = ? AND snapshot_date = ?",
+            [sku, snapshot_date],
+        )
+        carrying_map = {int(row_to_dict(r)['store_number']): row_to_dict(r) for r in carrying}
+        gap_stores = []
+        for s in all_stores:
+            if int(s['store_number']) not in carrying_map:
+                gap_stores.append(s)
+        # Segment carrying by status
+        listed = [c for c in carrying_map.values() if c.get('status') == 'L']
+        delisting = [c for c in carrying_map.values() if c.get('status') == 'D']
+        fully_delisted = [c for c in carrying_map.values() if c.get('status') == 'F']
+        report.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': pname,
+            'total_stores_in_system': len(all_stores),
+            'carrying_count': len(carrying_map),
+            'listed_count': len(listed),
+            'delisting_count': len(delisting),
+            'fully_delisted_count': len(fully_delisted),
+            'gap_count': len(gap_stores),
+            'coverage_pct': round(100 * len(carrying_map) / max(1, len(all_stores)), 1),
+            'gap_stores': gap_stores[:200],  # cap for payload size
+        })
+    return jsonify({
+        'snapshot_date': snapshot_date,
+        'total_stores': len(all_stores),
+        'products': report,
+    })
+
+
+@app.route('/api/sod/reorder', methods=['GET'])
+def api_sod_reorder():
+    """Stores carrying each tracked SKU with low on-hand. Bucketed by urgency."""
+    try:
+        threshold = int(request.args.get('threshold', '6'))
+    except ValueError:
+        threshold = 6
+    latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+    snapshot_date = (latest['d'] if isinstance(latest, dict) else latest[0]) if latest else None
+    if not snapshot_date:
+        return jsonify({'snapshot_date': None, 'rows': [], 'message': 'no SOD data yet'})
+    snapshot_date = str(snapshot_date)
+
+    # Map store_number → store info
+    store_rows = db_fetchall("SELECT store_number, account, address, city, rep FROM stores")
+    store_map = {int(row_to_dict(r)['store_number']): row_to_dict(r) for r in store_rows}
+
+    query = (
+        "SELECT i.sku, i.store_number, i.status, i.on_hand, i.product_name, p.brand AS brand "
+        "FROM sod_inventory i LEFT JOIN sod_products p ON p.sku = i.sku "
+        "WHERE i.snapshot_date = ? AND p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1") +
+        " AND i.status = 'L' AND i.on_hand <= ? "
+        "ORDER BY i.on_hand ASC, i.sku"
+    )
+    rows = db_fetchall(query, [snapshot_date, threshold])
+    output = []
+    for r in rows:
+        d = row_to_dict(r)
+        snum = int(d['store_number'])
+        s = store_map.get(snum, {})
+        oh = d.get('on_hand') or 0
+        if oh <= 1:
+            urgency = 'critical'
+        elif oh <= 3:
+            urgency = 'high'
+        else:
+            urgency = 'medium'
+        output.append({
+            **d,
+            'store_account': s.get('account', f'LCBO #{snum}'),
+            'store_city': s.get('city', ''),
+            'store_rep': s.get('rep', ''),
+            'urgency': urgency,
+        })
+    counts = {'critical': 0, 'high': 0, 'medium': 0}
+    for r in output:
+        counts[r['urgency']] += 1
+    return jsonify({
+        'snapshot_date': snapshot_date,
+        'threshold': threshold,
+        'count': len(output),
+        'urgency_counts': counts,
+        'rows': output,
+    })
+
+
+@app.route('/api/sod/trend/<sku>', methods=['GET'])
+def api_sod_trend(sku):
+    """Daily history of store_count + total_on_hand for a SKU (line chart)."""
+    padded = sku.zfill(7)
+    try:
+        days = int(request.args.get('days', '60'))
+    except ValueError:
+        days = 60
+    cutoff = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+    rows = db_fetchall(
+        "SELECT snapshot_date, COUNT(*) AS store_count, "
+        "SUM(on_hand) AS total_on_hand, "
+        "SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed_stores, "
+        "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END) AS delisting_stores "
+        "FROM sod_inventory WHERE sku = ? AND snapshot_date >= ? "
+        "GROUP BY snapshot_date ORDER BY snapshot_date",
+        [padded, cutoff],
+    )
+    return jsonify({'sku': padded, 'days': days, 'rows': [row_to_dict(r) for r in rows]})
+
+
+# --------- Daily / Weekly / Monthly summary reports ---------
+
+def _sod_summary_for_range(start_date, end_date):
+    """Return a dict summarising SOD data for a [start, end] date range (inclusive).
+
+    If the requested window has no data, automatically shifts the window to end on
+    the latest available snapshot (preserves the window length). This keeps the
+    reports useful on weekends / when today's file hasn't been uploaded yet.
+    """
+    ph = _sod_ph()
+    start = start_date.isoformat() if isinstance(start_date, (datetime,)) else str(start_date)
+    end = end_date.isoformat() if isinstance(end_date, (datetime,)) else str(end_date)
+
+    # Empty-range fallback: anchor to latest snapshot we actually have
+    probe = db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory WHERE snapshot_date BETWEEN ? AND ?",
+        [start, end],
+    )
+    probe_d = (probe['d'] if isinstance(probe, dict) else probe[0]) if probe else None
+    if probe_d is None:
+        latest_any = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+        latest_d = (latest_any['d'] if isinstance(latest_any, dict) else latest_any[0]) if latest_any else None
+        if latest_d:
+            try:
+                s_d = datetime.strptime(start, '%Y-%m-%d').date()
+                e_d = datetime.strptime(end, '%Y-%m-%d').date()
+                window_len = (e_d - s_d).days
+                new_end = datetime.strptime(str(latest_d), '%Y-%m-%d').date()
+                new_start = new_end - timedelta(days=window_len)
+                start = new_start.isoformat()
+                end = new_end.isoformat()
+            except Exception:
+                pass
+
+    # Per-SKU totals over the window
+    per_sku = db_fetchall(
+        "SELECT i.sku, p.product_name AS product_name, p.brand AS brand, "
+        "COUNT(DISTINCT i.snapshot_date) AS day_count, "
+        "AVG(i.on_hand * 1.0) AS avg_on_hand, "
+        "MAX(i.snapshot_date) AS latest_date, "
+        "SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END) AS listed_store_days, "
+        "SUM(CASE WHEN i.status='D' THEN 1 ELSE 0 END) AS delisting_store_days "
+        "FROM sod_inventory i LEFT JOIN sod_products p ON p.sku = i.sku "
+        "WHERE p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1") +
+        " AND i.snapshot_date BETWEEN ? AND ? "
+        "GROUP BY i.sku, p.product_name, p.brand "
+        "ORDER BY p.brand, p.product_name",
+        [start, end],
+    )
+    # Listing changes in window
+    changes = db_fetchall(
+        "SELECT c.sku, p.product_name AS product_name, p.brand AS brand, "
+        "c.change_type, c.change_date, c.old_status, c.new_status "
+        "FROM sod_listing_changes c LEFT JOIN sod_products p ON p.sku = c.sku "
+        "WHERE p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1") +
+        " AND c.change_date BETWEEN ? AND ? "
+        "ORDER BY c.change_date DESC, c.id DESC",
+        [start, end],
+    )
+    # Latest snapshot metrics
+    latest_date_row = db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory WHERE snapshot_date BETWEEN ? AND ?",
+        [start, end],
+    )
+    latest_date = (latest_date_row['d'] if isinstance(latest_date_row, dict) else latest_date_row[0]) if latest_date_row else None
+
+    snapshot_metrics = []
+    if latest_date:
+        snapshot_metrics_rows = db_fetchall(
+            "SELECT i.sku, p.product_name AS product_name, p.brand AS brand, "
+            "COUNT(*) AS store_count, "
+            "SUM(i.on_hand) AS total_on_hand, "
+            "SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END) AS listed_stores, "
+            "SUM(CASE WHEN i.status='D' THEN 1 ELSE 0 END) AS delisting_stores, "
+            "SUM(CASE WHEN i.status='F' THEN 1 ELSE 0 END) AS fully_delisted_stores "
+            "FROM sod_inventory i LEFT JOIN sod_products p ON p.sku = i.sku "
+            "WHERE p.is_tracked = " + ("TRUE" if USE_POSTGRES else "1") +
+            " AND i.snapshot_date = ? "
+            "GROUP BY i.sku, p.product_name, p.brand "
+            "ORDER BY p.brand, p.product_name",
+            [str(latest_date)],
+        )
+        snapshot_metrics = [row_to_dict(r) for r in snapshot_metrics_rows]
+
+    return {
+        'window': {'start': start, 'end': end, 'latest_snapshot': str(latest_date) if latest_date else None},
+        'per_sku': [row_to_dict(r) for r in per_sku],
+        'snapshot_metrics': snapshot_metrics,
+        'listing_changes': [row_to_dict(r) for r in changes],
+        'totals': {
+            'products_tracked': len(per_sku),
+            'changes_in_window': len(changes),
+            'new_listings': sum(1 for r in changes if row_to_dict(r)['change_type'] == 'NEW_LISTING'),
+            'delistings': sum(1 for r in changes if row_to_dict(r)['change_type'] == 'DELISTED'),
+            'relistings': sum(1 for r in changes if row_to_dict(r)['change_type'] == 'RELISTED'),
+        },
+    }
+
+
+@app.route('/api/reports/daily', methods=['GET'])
+def api_report_daily():
+    day_str = request.args.get('date')
+    try:
+        day = datetime.strptime(day_str, '%Y-%m-%d').date() if day_str else datetime.utcnow().date()
+    except ValueError:
+        day = datetime.utcnow().date()
+    return jsonify(_sod_summary_for_range(day, day))
+
+
+@app.route('/api/reports/weekly', methods=['GET'])
+def api_report_weekly():
+    end_str = request.args.get('end')
+    try:
+        end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else datetime.utcnow().date()
+    except ValueError:
+        end = datetime.utcnow().date()
+    start = end - timedelta(days=6)
+    return jsonify(_sod_summary_for_range(start, end))
+
+
+@app.route('/api/reports/monthly', methods=['GET'])
+def api_report_monthly():
+    end_str = request.args.get('end')
+    try:
+        end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else datetime.utcnow().date()
+    except ValueError:
+        end = datetime.utcnow().date()
+    start = end.replace(day=1)
+    return jsonify(_sod_summary_for_range(start, end))
+
+
+@app.route('/api/reports/rep', methods=['GET'])
+def api_report_rep():
+    """Per-rep performance: stores assigned, products carried, gap count, delisting risk."""
+    latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+    snapshot_date = (latest['d'] if isinstance(latest, dict) else latest[0]) if latest else None
+
+    # All reps (from stores table)
+    rep_rows = db_fetchall(
+        "SELECT rep, COUNT(*) AS store_count FROM stores WHERE rep IS NOT NULL AND rep != '' "
+        "GROUP BY rep ORDER BY store_count DESC"
+    )
+    out = []
+    for rr in rep_rows:
+        rd = row_to_dict(rr)
+        rep_name = rd['rep']
+        # Per-rep: how many of his stores are carrying each tracked SKU
+        per_sku = []
+        if snapshot_date:
+            for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
+                carrying = db_fetchone(
+                    "SELECT COUNT(*) AS c FROM sod_inventory i "
+                    "JOIN stores s ON s.store_number = i.store_number "
+                    "WHERE s.rep = ? AND i.sku = ? AND i.snapshot_date = ?",
+                    [rep_name, sku, str(snapshot_date)],
+                )
+                carrying_cnt = (row_to_dict(carrying) or {}).get('c', 0)
+                delisting = db_fetchone(
+                    "SELECT COUNT(*) AS c FROM sod_inventory i "
+                    "JOIN stores s ON s.store_number = i.store_number "
+                    "WHERE s.rep = ? AND i.sku = ? AND i.snapshot_date = ? AND i.status = 'D'",
+                    [rep_name, sku, str(snapshot_date)],
+                )
+                delisting_cnt = (row_to_dict(delisting) or {}).get('c', 0)
+                per_sku.append({
+                    'sku': sku,
+                    'brand': brand,
+                    'product_name': pname,
+                    'stores_carrying': carrying_cnt,
+                    'stores_delisting': delisting_cnt,
+                    'gap_count': rd['store_count'] - carrying_cnt,
+                })
+        out.append({
+            'rep': rep_name,
+            'total_stores': rd['store_count'],
+            'per_product': per_sku,
+        })
+    return jsonify({'snapshot_date': str(snapshot_date) if snapshot_date else None, 'reps': out})
+
+
+# --------- Scheduler ---------
+
+_sod_scheduler = None
+
+
+def _sod_scheduler_running():
+    try:
+        return _sod_scheduler is not None and _sod_scheduler.running
+    except Exception:
+        return False
+
+
+def _sod_last_successful_sync_age_hours():
+    """Return hours since last successful sync, or None if never synced."""
+    row = db_fetchone(
+        "SELECT run_at FROM sod_sync_runs WHERE status='success' ORDER BY run_at DESC LIMIT 1"
+    )
+    if not row:
+        return None
+    d = row_to_dict(row) if not isinstance(row, dict) else row
+    val = d.get('run_at')
+    if not val:
+        return None
+    if isinstance(val, str):
+        try:
+            val = datetime.fromisoformat(val)
+        except Exception:
+            try:
+                val = datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
+            except Exception:
+                return None
+    return (datetime.utcnow() - val).total_seconds() / 3600.0
+
+
+def start_sod_scheduler():
+    """Start an APScheduler BackgroundScheduler that runs the sync daily at 03:00 America/Toronto.
+
+    Schedule rationale: LCBO uploads the daily file between ~01:30 and ~02:30 ET. We run at
+    03:00 ET to guarantee the file is present.
+
+    Also kicks off a catch-up sync at startup if the last successful sync is > 24h old.
+
+    Safe to call multiple times — only one scheduler is ever started per process.
+    """
+    global _sod_scheduler
+    if _sod_scheduler is not None:
+        return
+    if not (SOD_USER and SOD_PASSWORD):
+        print('[SOD] scheduler NOT started — SOD_USER/SOD_PASSWORD not configured')
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[SOD] apscheduler not installed — skipping scheduler. pip install apscheduler')
+        return
+    try:
+        # America/Toronto (EST/EDT) — fall back to UTC if tzdata missing
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        sched.add_job(
+            lambda: _sod_sync_worker(['daily_a', 'daily_b']),
+            CronTrigger(hour=3, minute=0),  # 03:00 ET — after LCBO finishes uploading
+            id='sod_daily_sync',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 6,  # tolerate up to 6h delay (e.g. Render cold boot)
+        )
+        sched.start()
+        _sod_scheduler = sched
+        print(f'[SOD] Daily scheduler started — next run: {sched.get_job("sod_daily_sync").next_run_time}')
+
+        # --- Startup catch-up: if last successful sync is > 24h old, fire immediately (delayed) ---
+        def _catchup_if_stale():
+            try:
+                # Defer briefly so the DB is ready and the app is serving
+                import time as _t
+                _t.sleep(30)
+                with app.app_context():
+                    age = _sod_last_successful_sync_age_hours()
+                if age is None:
+                    print('[SOD] no prior successful sync — running initial catch-up')
+                    _sod_sync_worker(['daily_a', 'daily_b'])
+                elif age > 24:
+                    print(f'[SOD] last sync was {age:.1f}h ago — running catch-up')
+                    _sod_sync_worker(['daily_a', 'daily_b'])
+                else:
+                    print(f'[SOD] last sync {age:.1f}h ago — no catch-up needed')
+            except Exception as e:
+                print(f'[SOD] catch-up check failed: {e}')
+        threading.Thread(target=_catchup_if_stale, daemon=True).start()
+    except Exception as e:
+        print(f'[SOD] scheduler failed to start: {e}')
+
+
+# --------- External cron trigger (for Render Cron Job as a redundant trigger) ---------
+
+SOD_CRON_TOKEN = os.environ.get('SOD_CRON_TOKEN', '').strip()
+
+
+@app.route('/api/sod/cron', methods=['POST', 'GET'])
+def api_sod_cron():
+    """Endpoint for Render Cron Job to hit daily.
+
+    Protected by SOD_CRON_TOKEN env var: requests must pass ?token=... or
+    Authorization: Bearer <token>. Set SOD_CRON_TOKEN on Render and configure the
+    cron service to curl this URL daily.
+
+    This runs alongside the in-process APScheduler as belt-and-suspenders: if the
+    Render web worker is sleeping or has crashed, the cron call wakes it up and
+    triggers the sync.
+    """
+    provided = request.args.get('token', '').strip()
+    if not provided:
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            provided = auth[7:].strip()
+    if not SOD_CRON_TOKEN:
+        return jsonify({'error': 'SOD_CRON_TOKEN env var not set — cron endpoint disabled'}), 503
+    if provided != SOD_CRON_TOKEN:
+        return jsonify({'error': 'invalid token'}), 401
+    # Only fire if last sync is > 6h old — avoids duplicate work if scheduler already ran
+    age = _sod_last_successful_sync_age_hours()
+    if age is not None and age < 6:
+        return jsonify({'status': 'skipped', 'reason': f'last sync {age:.1f}h ago (< 6h)'}), 200
+    if _sod_sync_lock.locked():
+        return jsonify({'status': 'already_running'}), 202
+    start_sod_sync_async(['daily_a', 'daily_b'])
+    return jsonify({'status': 'started', 'reason': f'last sync {age}h ago' if age is not None else 'no prior sync'}), 202
+
+
+@app.route('/api/sod/health', methods=['GET'])
+def api_sod_health():
+    """Lightweight health check: is the sync fresh? For monitoring."""
+    age = _sod_last_successful_sync_age_hours()
+    if age is None:
+        return jsonify({'status': 'never_synced', 'configured': bool(SOD_USER and SOD_PASSWORD)}), 503
+    fresh = age < 36  # 36h window = one missed day
+    return jsonify({
+        'status': 'healthy' if fresh else 'stale',
+        'last_sync_age_hours': round(age, 2),
+        'scheduler_running': _sod_scheduler_running(),
+        'configured': bool(SOD_USER and SOD_PASSWORD),
+    }), 200 if fresh else 503
+
+
 # ======== INIT ========
 
 init_db()
 seed_data()
+start_sod_scheduler()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
