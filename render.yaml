@@ -1,12 +1,45 @@
 services:
+  # Main Flask backend (Anu LCBO Tracker)
   - type: web
     name: lcbo-tracker
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    # Long timeout for the Daily A SOD sync (1.5M rows can take ~22 min on free tier)
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1
+    plan: starter  # $7/mo: always-on (no cold starts), faster builds. 512MB RAM (sufficient w/ streaming parser).
+    healthCheckPath: /healthz
     envVars:
       - key: FLASK_DEBUG
         value: "false"
       - key: DATABASE_URL
+        sync: false  # set in Render dashboard
+      - key: SOD_USER
         sync: false
-    plan: free
+      - key: SOD_PASSWORD
+        sync: false
+      - key: SOD_AGENT_ID
+        sync: false
+      - key: SOD_CRON_TOKEN
+        sync: false  # used by the Cron Job below
+      - key: SENTRY_DSN
+        sync: false  # optional
+      - key: CORS_ORIGINS
+        sync: false  # comma-separated; defaults work for Vercel + localhost
+
+  # Daily SOD refresh cron — belt-and-suspenders to in-process APScheduler.
+  # Runs at 03:05 ET (05:05 UTC fall, 04:05 UTC summer — Render uses UTC for cron).
+  # Curls the protected /api/sod/cron endpoint; if the in-process scheduler already
+  # ran (last sync < 6h ago) the endpoint no-ops.
+  - type: cron
+    name: lcbo-sod-daily-cron
+    runtime: image
+    image:
+      url: docker.io/curlimages/curl:latest
+    schedule: "5 7 * * *"  # 07:05 UTC = 02:05 ET (winter) / 03:05 ET (summer-ish)
+    plan: starter
+    envVars:
+      - key: SOD_CRON_TOKEN
+        sync: false  # MUST match the SOD_CRON_TOKEN on the web service
+    dockerCommand: >
+      curl -fsS -X POST -H "Authorization: Bearer $SOD_CRON_TOKEN"
+      https://lcbo-tracker.onrender.com/api/sod/cron

@@ -50,6 +50,43 @@ app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),
 app.json_provider_class = PgJSONProvider
 app.json = PgJSONProvider(app)
 
+# CORS — allow the Vercel-hosted Next.js frontend to call this backend.
+# Default origins: localhost dev + lcbo-tracker-web.vercel.app + Anu domain.
+# Override via env var CORS_ORIGINS (comma-separated).
+try:
+    from flask_cors import CORS
+    _cors_origins = os.environ.get(
+        'CORS_ORIGINS',
+        'http://localhost:3000,http://localhost:3001,'
+        'https://lcbo-tracker-web.vercel.app,'
+        'https://lcbo.anu-spirits.com'
+    ).split(',')
+    CORS(app, resources={r'/api/*': {'origins': _cors_origins},
+                         r'/healthz': {'origins': _cors_origins}}, supports_credentials=False)
+    print(f'[CORS] enabled for: {_cors_origins}')
+except ImportError:
+    print('[CORS] flask-cors not installed — frontend on different domain will be blocked')
+
+# Sentry (optional, no-op if SENTRY_DSN unset)
+_sentry_dsn = os.environ.get('SENTRY_DSN', '').strip()
+if _sentry_dsn:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            integrations=[FlaskIntegration()],
+            traces_sample_rate=0.1,  # 10% of requests
+            profiles_sample_rate=0.0,
+            environment=os.environ.get('SENTRY_ENV', 'production'),
+            release=os.environ.get('GIT_COMMIT_SHA', 'unknown')[:7],
+        )
+        print(f'[Sentry] initialized (env={os.environ.get("SENTRY_ENV", "production")})')
+    except ImportError:
+        print('[Sentry] sentry-sdk not installed; skipping')
+    except Exception as e:
+        print(f'[Sentry] init failed: {e}')
+
 DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
 DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
 
