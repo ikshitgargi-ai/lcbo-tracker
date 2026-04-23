@@ -535,11 +535,112 @@ def init_db():
             except Exception:
                 pass
 
+        # ======== SPRINT 3: CRM SYSTEM-OF-ACTION TABLES ========
+        # deals: pipeline tracking per (store, sku) — the heart of the CRM
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS deals (
+                id SERIAL PRIMARY KEY,
+                store_number INTEGER,
+                horeca_account_id INTEGER REFERENCES horeca_accounts(id),
+                sku TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'prospecting',
+                probability INTEGER DEFAULT 10,
+                expected_close_date DATE,
+                expected_units INTEGER DEFAULT 0,
+                expected_revenue NUMERIC(12,2) DEFAULT 0,
+                owner_rep TEXT DEFAULT '',
+                next_action TEXT DEFAULT '',
+                next_action_date DATE,
+                notes TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                closed_at TIMESTAMP,
+                closed_reason TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # rep_quotas: quarterly targets per rep
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS rep_quotas (
+                id SERIAL PRIMARY KEY,
+                rep TEXT NOT NULL,
+                quarter TEXT NOT NULL,
+                target_activities INTEGER DEFAULT 0,
+                target_visits INTEGER DEFAULT 0,
+                target_new_listings INTEGER DEFAULT 0,
+                target_units INTEGER DEFAULT 0,
+                target_revenue NUMERIC(12,2) DEFAULT 0,
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(rep, quarter)
+            )
+        ''')
+        # visit_photos: photo URLs linked to activities (storage in R2/S3 later)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS visit_photos (
+                id SERIAL PRIMARY KEY,
+                activity_id INTEGER REFERENCES activities(id) ON DELETE CASCADE,
+                photo_url TEXT NOT NULL,
+                caption TEXT DEFAULT '',
+                photo_type TEXT DEFAULT 'shelf',
+                uploaded_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # activity_sku_outcomes: per-SKU outcome for a visit (listed/discussed/sampled/declined)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS activity_sku_outcomes (
+                id SERIAL PRIMARY KEY,
+                activity_id INTEGER REFERENCES activities(id) ON DELETE CASCADE,
+                sku TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                facings INTEGER DEFAULT 0,
+                competitor_notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # daily_plan_cache: materialized rep daily plan (for mobile instant load)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS daily_plan_cache (
+                id SERIAL PRIMARY KEY,
+                rep TEXT NOT NULL,
+                plan_date DATE NOT NULL,
+                stops_json TEXT NOT NULL,
+                generated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(rep, plan_date)
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_deals_store ON deals(store_number)",
+            "CREATE INDEX IF NOT EXISTS idx_deals_sku ON deals(sku)",
+            "CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage)",
+            "CREATE INDEX IF NOT EXISTS idx_deals_owner ON deals(owner_rep)",
+            "CREATE INDEX IF NOT EXISTS idx_deals_next_action ON deals(next_action_date)",
+            "CREATE INDEX IF NOT EXISTS idx_quotas_rep ON rep_quotas(rep, quarter)",
+            "CREATE INDEX IF NOT EXISTS idx_vp_activity ON visit_photos(activity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_aso_activity ON activity_sku_outcomes(activity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_aso_sku ON activity_sku_outcomes(sku)",
+            "CREATE INDEX IF NOT EXISTS idx_dp_rep_date ON daily_plan_cache(rep, plan_date)",
+        ]:
+            try:
+                cur.execute(idx)
+            except Exception:
+                pass
+
         # Add new columns on existing tables (upgrade-safe)
         crm_migrate_cols = [
             ('stores', 'territory_id', 'INTEGER'),
             ('sod_products', 'category', "TEXT DEFAULT ''"),
             ('sod_products', 'category_group', "TEXT DEFAULT ''"),
+            # Activity enrichment for Sprint 3
+            ('activities', 'outcome', "TEXT DEFAULT ''"),
+            ('activities', 'duration_minutes', "INTEGER DEFAULT 0"),
+            ('activities', 'rating', "INTEGER DEFAULT 0"),  # 1-5 store visit rating
+            ('activities', 'next_action', "TEXT DEFAULT ''"),
+            ('activities', 'next_action_date', "DATE"),
+            ('activities', 'rep', "TEXT DEFAULT ''"),  # denormalized for fast queries
+            ('activities', 'horeca_account_id', "INTEGER"),
+            ('activities', 'lat', "REAL DEFAULT 0"),  # GPS where visit was logged
+            ('activities', 'lng', "REAL DEFAULT 0"),
         ]
         for table, col, coltype in crm_migrate_cols:
             try:
@@ -751,6 +852,78 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_horeca_territory ON horeca_accounts(territory_id);
             CREATE INDEX IF NOT EXISTS idx_horeca_status ON horeca_accounts(status);
             CREATE INDEX IF NOT EXISTS idx_horeca_city ON horeca_accounts(city);
+
+            -- ======== SPRINT 3: CRM SYSTEM-OF-ACTION TABLES ========
+            CREATE TABLE IF NOT EXISTS deals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_number INTEGER,
+                horeca_account_id INTEGER,
+                sku TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'prospecting',
+                probability INTEGER DEFAULT 10,
+                expected_close_date TEXT,
+                expected_units INTEGER DEFAULT 0,
+                expected_revenue REAL DEFAULT 0,
+                owner_rep TEXT DEFAULT '',
+                next_action TEXT DEFAULT '',
+                next_action_date TEXT,
+                notes TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                closed_at TIMESTAMP,
+                closed_reason TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS rep_quotas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rep TEXT NOT NULL,
+                quarter TEXT NOT NULL,
+                target_activities INTEGER DEFAULT 0,
+                target_visits INTEGER DEFAULT 0,
+                target_new_listings INTEGER DEFAULT 0,
+                target_units INTEGER DEFAULT 0,
+                target_revenue REAL DEFAULT 0,
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(rep, quarter)
+            );
+            CREATE TABLE IF NOT EXISTS visit_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER,
+                photo_url TEXT NOT NULL,
+                caption TEXT DEFAULT '',
+                photo_type TEXT DEFAULT 'shelf',
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS activity_sku_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER,
+                sku TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                facings INTEGER DEFAULT 0,
+                competitor_notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS daily_plan_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rep TEXT NOT NULL,
+                plan_date TEXT NOT NULL,
+                stops_json TEXT NOT NULL,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(rep, plan_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_deals_store ON deals(store_number);
+            CREATE INDEX IF NOT EXISTS idx_deals_sku ON deals(sku);
+            CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage);
+            CREATE INDEX IF NOT EXISTS idx_deals_owner ON deals(owner_rep);
+            CREATE INDEX IF NOT EXISTS idx_deals_next_action ON deals(next_action_date);
+            CREATE INDEX IF NOT EXISTS idx_quotas_rep ON rep_quotas(rep, quarter);
+            CREATE INDEX IF NOT EXISTS idx_vp_activity ON visit_photos(activity_id);
+            CREATE INDEX IF NOT EXISTS idx_aso_activity ON activity_sku_outcomes(activity_id);
+            CREATE INDEX IF NOT EXISTS idx_aso_sku ON activity_sku_outcomes(sku);
+            CREATE INDEX IF NOT EXISTS idx_dp_rep_date ON daily_plan_cache(rep, plan_date);
         ''')
         migrate_cols = [
             ('stores', 'manager_name', "TEXT DEFAULT ''"), ('stores', 'asst_manager_name', "TEXT DEFAULT ''"),
@@ -767,6 +940,16 @@ def init_db():
             ('products', 'delisting_date', "TEXT DEFAULT ''"),
             ('sod_products', 'category', "TEXT DEFAULT ''"),
             ('sod_products', 'category_group', "TEXT DEFAULT ''"),
+            # Sprint 3 activity enrichment
+            ('activities', 'outcome', "TEXT DEFAULT ''"),
+            ('activities', 'duration_minutes', "INTEGER DEFAULT 0"),
+            ('activities', 'rating', "INTEGER DEFAULT 0"),
+            ('activities', 'next_action', "TEXT DEFAULT ''"),
+            ('activities', 'next_action_date', "TEXT"),
+            ('activities', 'rep', "TEXT DEFAULT ''"),
+            ('activities', 'horeca_account_id', "INTEGER"),
+            ('activities', 'lat', "REAL DEFAULT 0"),
+            ('activities', 'lng', "REAL DEFAULT 0"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -5821,6 +6004,1051 @@ def api_ai_ask():
         'answer': answer,
         'model': AI_MODEL,
     })
+
+
+# ======================================================================================
+# =========================== SPRINT 3: SYSTEM-OF-ACTION CRM ===========================
+#
+# The heart of a real commercial CRM. Everything above was analytics; now we let reps
+# DO things — log visits, move deals through pipeline, hit quotas, get told what to
+# do next. This is what separates LCBO Tracker from a dashboard.
+# ======================================================================================
+
+# Pipeline stages (ordered). Moving forward = deal progressing. "listed" and "lost"
+# are terminal.
+DEAL_STAGES = [
+    ('prospecting', 'Prospecting', 10),
+    ('pitched', 'Pitched', 25),
+    ('tasting_scheduled', 'Tasting Scheduled', 40),
+    ('tasting_done', 'Tasting Done', 55),
+    ('samples_left', 'Samples Left', 65),
+    ('in_review', 'In Review (LCBO)', 80),
+    ('listed', 'Listed (Won)', 100),
+    ('lost', 'Lost', 0),
+]
+
+
+def _current_quarter(date_obj=None):
+    """Return a quarter label like '2026-Q2' for the given date (defaults to today)."""
+    d = date_obj or _toronto_today()
+    q = (d.month - 1) // 3 + 1
+    return f'{d.year}-Q{q}'
+
+
+def _sod_velocity_for(sku, store_number=None, days=30):
+    """Compute units-per-week velocity for a SKU (optionally one store).
+
+    We use the CURRENT snapshot vs the snapshot N days ago at the same store.
+    on_hand DECREASES = units sold ≈ velocity. If on_hand increases, that's a
+    restock — we floor at 0 (conservative).
+    Returns dict: {week_velocity, days_to_oos, current_on_hand, prior_on_hand, prior_date}.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    sku_norm = str(sku).zfill(7)
+    params = [sku_norm]
+    where_store = ''
+    if store_number is not None:
+        where_store = f' AND store_number = {ph}'
+        params.append(store_number)
+
+    # Latest snapshot
+    q_latest = (
+        f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = {ph}{where_store}"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q_latest, params)
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(q_latest, params).fetchone()[0]
+    if not latest:
+        return {'week_velocity': None, 'days_to_oos': None, 'current_on_hand': 0, 'prior_on_hand': 0, 'prior_date': None}
+
+    # Prior snapshot (~days ago)
+    target_prior = (latest if isinstance(latest, str) else latest.isoformat())
+    try:
+        ld = datetime.strptime(str(latest), '%Y-%m-%d').date() if isinstance(latest, str) else latest
+    except Exception:
+        ld = _toronto_today()
+    prior_target = (ld - timedelta(days=days)).isoformat()
+    q_prior = (
+        f"SELECT MAX(snapshot_date) FROM sod_inventory "
+        f"WHERE sku = {ph}{where_store} AND snapshot_date <= {ph}"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q_prior, params + [prior_target])
+        prior = cur.fetchone()[0]
+        cur.close()
+    else:
+        prior = db.execute(q_prior, params + [prior_target]).fetchone()[0]
+
+    # Sum on_hand at latest + prior
+    def _sum_oh(snap):
+        if not snap:
+            return 0
+        q = (
+            f"SELECT COALESCE(SUM(on_hand), 0) FROM sod_inventory "
+            f"WHERE sku = {ph}{where_store} AND snapshot_date = {ph}"
+        )
+        if USE_POSTGRES:
+            c = db.cursor()
+            c.execute(q, params + [snap])
+            r = c.fetchone()[0]
+            c.close()
+        else:
+            r = db.execute(q, params + [snap]).fetchone()[0]
+        return int(r or 0)
+
+    current_oh = _sum_oh(latest)
+    prior_oh = _sum_oh(prior)
+
+    # Days elapsed between snapshots
+    if not prior or prior == latest:
+        return {
+            'week_velocity': None, 'days_to_oos': None,
+            'current_on_hand': current_oh, 'prior_on_hand': prior_oh,
+            'prior_date': str(prior) if prior else None,
+        }
+    try:
+        latest_d = datetime.strptime(str(latest), '%Y-%m-%d').date()
+        prior_d = datetime.strptime(str(prior), '%Y-%m-%d').date()
+        elapsed = (latest_d - prior_d).days
+    except Exception:
+        elapsed = days
+
+    sold = max(prior_oh - current_oh, 0)
+    week_velocity = round(sold * 7 / max(elapsed, 1), 1) if elapsed > 0 else 0
+    days_to_oos = round(current_oh / (week_velocity / 7), 1) if week_velocity > 0 else None
+
+    return {
+        'week_velocity': week_velocity,
+        'days_to_oos': days_to_oos,
+        'current_on_hand': current_oh,
+        'prior_on_hand': prior_oh,
+        'prior_date': str(prior),
+    }
+
+
+@app.route('/api/crm/velocity/<sku>', methods=['GET'])
+def api_crm_velocity(sku):
+    """Units-per-week velocity for a SKU (aggregated across all stores).
+
+    Also returns per-store velocity for the top-N highest-velocity stores.
+    """
+    days = int(request.args.get('days', 30))
+    top = int(request.args.get('top', 20))
+
+    overall = _sod_velocity_for(sku, days=days)
+
+    # Per-store velocity — only at stores currently listing (status='L')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    sku_norm = str(sku).zfill(7)
+
+    # Latest snapshot overall for this sku
+    latest_q = f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = {ph}"
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(latest_q, (sku_norm,))
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(latest_q, (sku_norm,)).fetchone()[0]
+
+    by_store = []
+    if latest:
+        # Find all stores listing this SKU
+        stores_q = (
+            f"SELECT store_number FROM sod_inventory "
+            f"WHERE sku = {ph} AND snapshot_date = {ph} AND status = 'L'"
+        )
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(stores_q, (sku_norm, latest))
+            store_nums = [r[0] for r in cur.fetchall()]
+            cur.close()
+        else:
+            store_nums = [r[0] for r in db.execute(stores_q, (sku_norm, latest)).fetchall()]
+
+        for sn in store_nums:
+            v = _sod_velocity_for(sku_norm, store_number=sn, days=days)
+            if v['week_velocity'] is None:
+                continue
+            by_store.append({'store_number': sn, **v})
+
+    by_store.sort(key=lambda x: -(x.get('week_velocity') or 0))
+    brand, pname = SOD_TRACKED_SKUS.get(sku_norm, ('', ''))
+    return jsonify({
+        'sku': sku_norm,
+        'brand': brand,
+        'product_name': pname,
+        'window_days': days,
+        'overall': overall,
+        'per_store_top': by_store[:top],
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/shelf-share/<int:store_number>', methods=['GET'])
+def api_crm_shelf_share(store_number):
+    """For one store: our share of each tracked SKU's category at the latest snapshot.
+
+    Example output per category:
+      { category: 'Vodka', our_facings: 12, total_facings: 180,
+        our_on_hand: 240, total_on_hand: 5600,
+        share_by_facings_pct: 6.7, share_by_on_hand_pct: 4.3 }
+    Where "facings" is approximated by store_count for each SKU in this store's
+    category at the latest snapshot.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    latest_q = f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE store_number = {ph}"
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(latest_q, (store_number,))
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(latest_q, (store_number,)).fetchone()[0]
+
+    if not latest:
+        return jsonify({
+            'store_number': store_number,
+            'snapshot_date': None,
+            'categories': [],
+        })
+
+    # What categories are our tracked SKUs in?
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    our_cats = set()
+    if USE_POSTGRES:
+        phs = ','.join(['%s'] * len(tracked))
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT DISTINCT category FROM sod_products "
+            f"WHERE sku IN ({phs}) AND COALESCE(category,'') <> ''",
+            tracked,
+        )
+        our_cats = {r[0] for r in cur.fetchall()}
+        cur.close()
+    else:
+        phs = ','.join(['?'] * len(tracked))
+        our_cats = {r[0] for r in db.execute(
+            f"SELECT DISTINCT category FROM sod_products "
+            f"WHERE sku IN ({phs}) AND COALESCE(category,'') <> ''",
+            tracked,
+        ).fetchall()}
+
+    out = []
+    for cat in sorted(our_cats):
+        # Total: every SKU in this category at this store+snapshot
+        cat_q = (
+            f"SELECT COUNT(*) AS facings, COALESCE(SUM(i.on_hand), 0) AS oh "
+            f"FROM sod_inventory i JOIN sod_products p ON p.sku = i.sku "
+            f"WHERE i.store_number = {ph} AND i.snapshot_date = {ph} "
+            f"AND p.category = {ph} AND i.status IN ('L','D')"
+        )
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(cat_q, (store_number, latest, cat))
+            r = cur.fetchone()
+            total_facings, total_oh = int(r[0] or 0), int(r[1] or 0)
+            # Ours
+            cur.execute(cat_q + f" AND i.sku IN ({phs})",
+                        (store_number, latest, cat) + tuple(tracked))
+            r = cur.fetchone()
+            our_facings, our_oh = int(r[0] or 0), int(r[1] or 0)
+            cur.close()
+        else:
+            r = db.execute(cat_q, (store_number, latest, cat)).fetchone()
+            total_facings, total_oh = int(r[0] or 0), int(r[1] or 0)
+            r = db.execute(cat_q + f" AND i.sku IN ({phs})",
+                           (store_number, latest, cat) + tuple(tracked)).fetchone()
+            our_facings, our_oh = int(r[0] or 0), int(r[1] or 0)
+
+        out.append({
+            'category': cat,
+            'our_facings': our_facings,
+            'total_facings': total_facings,
+            'our_on_hand': our_oh,
+            'total_on_hand': total_oh,
+            'share_by_facings_pct': round(100 * our_facings / total_facings, 1) if total_facings else 0,
+            'share_by_on_hand_pct': round(100 * our_oh / total_oh, 1) if total_oh else 0,
+        })
+
+    return jsonify({
+        'store_number': store_number,
+        'snapshot_date': str(latest),
+        'categories': out,
+    })
+
+
+# =========================== Deal pipeline CRUD ===========================
+
+@app.route('/api/crm/deals', methods=['GET'])
+def api_crm_deals_list():
+    """List all deals, with optional filters."""
+    rep = request.args.get('rep', '').strip()
+    stage = request.args.get('stage', '').strip()
+    sku = request.args.get('sku', '').strip()
+    store = request.args.get('store_number', type=int)
+    include_closed = request.args.get('include_closed', '').lower() in ('1', 'true')
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = ['1=1']
+    params = []
+    if rep:
+        where.append(f'LOWER(TRIM(d.owner_rep)) = LOWER(TRIM({ph}))')
+        params.append(rep)
+    if stage:
+        where.append(f'd.stage = {ph}')
+        params.append(stage)
+    if sku:
+        where.append(f'd.sku = {ph}')
+        params.append(sku.zfill(7))
+    if store:
+        where.append(f'd.store_number = {ph}')
+        params.append(store)
+    if not include_closed:
+        where.append("d.stage NOT IN ('listed','lost')")
+
+    q = f"""
+        SELECT d.id, d.store_number, d.horeca_account_id, d.sku, d.stage,
+               d.probability, d.expected_close_date, d.expected_units, d.expected_revenue,
+               d.owner_rep, d.next_action, d.next_action_date, d.notes,
+               d.source, d.closed_at, d.closed_reason, d.created_at, d.updated_at,
+               s.account, s.city, s.territory_id, COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+               h.name AS horeca_name
+        FROM deals d
+        LEFT JOIN stores s ON s.store_number = d.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        LEFT JOIN horeca_accounts h ON h.id = d.horeca_account_id
+        WHERE {' AND '.join(where)}
+        ORDER BY
+            CASE d.stage
+              WHEN 'prospecting' THEN 1 WHEN 'pitched' THEN 2
+              WHEN 'tasting_scheduled' THEN 3 WHEN 'tasting_done' THEN 4
+              WHEN 'samples_left' THEN 5 WHEN 'in_review' THEN 6
+              WHEN 'listed' THEN 7 WHEN 'lost' THEN 8 ELSE 9
+            END,
+            d.next_action_date NULLS LAST, d.updated_at DESC
+    """ if USE_POSTGRES else f"""
+        SELECT d.id, d.store_number, d.horeca_account_id, d.sku, d.stage,
+               d.probability, d.expected_close_date, d.expected_units, d.expected_revenue,
+               d.owner_rep, d.next_action, d.next_action_date, d.notes,
+               d.source, d.closed_at, d.closed_reason, d.created_at, d.updated_at,
+               s.account, s.city, s.territory_id, COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+               h.name AS horeca_name
+        FROM deals d
+        LEFT JOIN stores s ON s.store_number = d.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        LEFT JOIN horeca_accounts h ON h.id = d.horeca_account_id
+        WHERE {' AND '.join(where)}
+        ORDER BY d.stage, d.next_action_date, d.updated_at DESC
+    """
+
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+
+    out = []
+    for r in rows:
+        sku_norm = r[3]
+        brand, pname = SOD_TRACKED_SKUS.get(sku_norm, ('', sku_norm))
+        out.append({
+            'id': r[0], 'store_number': r[1], 'horeca_account_id': r[2], 'sku': sku_norm,
+            'brand': brand, 'product_name': pname,
+            'stage': r[4], 'probability': r[5],
+            'expected_close_date': str(r[6]) if r[6] else None,
+            'expected_units': r[7], 'expected_revenue': float(r[8] or 0),
+            'owner_rep': r[9], 'next_action': r[10],
+            'next_action_date': str(r[11]) if r[11] else None,
+            'notes': r[12], 'source': r[13],
+            'closed_at': str(r[14]) if r[14] else None, 'closed_reason': r[15],
+            'created_at': str(r[16]) if r[16] else None,
+            'updated_at': str(r[17]) if r[17] else None,
+            'account': r[18], 'city': r[19], 'territory_id': r[20],
+            'territory_name': r[21], 'territory_color': r[22],
+            'horeca_name': r[23],
+        })
+    # Pipeline summary — deals per stage
+    summary = {}
+    for d in out:
+        summary[d['stage']] = summary.get(d['stage'], 0) + 1
+    return jsonify({'deals': out, 'stage_counts': summary, 'stages': [
+        {'key': k, 'label': l, 'probability': p} for k, l, p in DEAL_STAGES
+    ]})
+
+
+@app.route('/api/crm/deals', methods=['POST'])
+def api_crm_deals_create():
+    d = request.get_json() or {}
+    if not d.get('sku'):
+        return jsonify({'error': 'sku required'}), 400
+    if not (d.get('store_number') or d.get('horeca_account_id')):
+        return jsonify({'error': 'store_number or horeca_account_id required'}), 400
+    sku_norm = str(d['sku']).zfill(7)
+    stage = d.get('stage', 'prospecting')
+    db = get_db()
+    cols = ['store_number', 'horeca_account_id', 'sku', 'stage', 'probability',
+            'expected_close_date', 'expected_units', 'expected_revenue',
+            'owner_rep', 'next_action', 'next_action_date', 'notes', 'source']
+    vals = (
+        d.get('store_number'), d.get('horeca_account_id'), sku_norm, stage,
+        int(d.get('probability') or next((p for k, _, p in DEAL_STAGES if k == stage), 10)),
+        d.get('expected_close_date') or None,
+        int(d.get('expected_units') or 0), float(d.get('expected_revenue') or 0),
+        d.get('owner_rep', ''), d.get('next_action', ''),
+        d.get('next_action_date') or None,
+        d.get('notes', ''), d.get('source', 'manual'),
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"INSERT INTO deals ({','.join(cols)}) VALUES ({','.join(['%s']*len(cols))}) RETURNING id",
+            vals,
+        )
+        new_id = cur.fetchone()[0]
+        db.commit()
+        cur.close()
+    else:
+        c = db.execute(
+            f"INSERT INTO deals ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            vals,
+        )
+        new_id = c.lastrowid
+        db.commit()
+    return jsonify({'status': 'ok', 'id': new_id})
+
+
+@app.route('/api/crm/deals/<int:deal_id>', methods=['PUT', 'PATCH'])
+def api_crm_deals_update(deal_id):
+    d = request.get_json() or {}
+    allowed = ('stage', 'probability', 'expected_close_date', 'expected_units',
+               'expected_revenue', 'owner_rep', 'next_action', 'next_action_date',
+               'notes', 'closed_reason')
+    sets = []
+    params = []
+    ph = '%s' if USE_POSTGRES else '?'
+    for c in allowed:
+        if c in d:
+            sets.append(f'{c}={ph}')
+            v = d[c]
+            if c in ('expected_close_date', 'next_action_date') and v == '':
+                v = None
+            params.append(v)
+    # Auto-update probability from stage if stage changed but prob didn't
+    if 'stage' in d and 'probability' not in d:
+        st = d['stage']
+        prob = next((p for k, _, p in DEAL_STAGES if k == st), None)
+        if prob is not None:
+            sets.append(f'probability={ph}')
+            params.append(prob)
+    # Auto-stamp closed_at if moving to a terminal stage
+    if d.get('stage') in ('listed', 'lost'):
+        sets.append(f'closed_at={"NOW()" if USE_POSTGRES else "CURRENT_TIMESTAMP"}')
+    if not sets:
+        return jsonify({'error': 'no updatable fields'}), 400
+    sets.append(f'updated_at={"NOW()" if USE_POSTGRES else "CURRENT_TIMESTAMP"}')
+    params.append(deal_id)
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"UPDATE deals SET {', '.join(sets)} WHERE id={ph}", params)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"UPDATE deals SET {', '.join(sets)} WHERE id={ph}", params)
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/crm/deals/<int:deal_id>', methods=['DELETE'])
+def api_crm_deals_delete(deal_id):
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(f"DELETE FROM deals WHERE id={ph}", (deal_id,))
+        db.commit()
+        cur.close()
+    else:
+        db.execute(f"DELETE FROM deals WHERE id={ph}", (deal_id,))
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+# =========================== Activity logging ===========================
+
+@app.route('/api/crm/activities', methods=['GET'])
+def api_crm_activities_list():
+    """Recent activity feed."""
+    days = int(request.args.get('days', 30))
+    rep = request.args.get('rep', '').strip()
+    store = request.args.get('store_number', type=int)
+    horeca_id = request.args.get('horeca_account_id', type=int)
+    limit = int(request.args.get('limit', 200))
+
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = [f'a.created_at >= {ph}']
+    params = [since]
+    if rep:
+        where.append(f'LOWER(TRIM(a.rep)) = LOWER(TRIM({ph}))')
+        params.append(rep)
+    if store:
+        where.append(f's.store_number = {ph}')
+        params.append(store)
+    if horeca_id:
+        where.append(f'a.horeca_account_id = {ph}')
+        params.append(horeca_id)
+
+    q = f"""
+        SELECT a.id, a.created_at, a.activity_type, a.rep, a.outcome, a.notes,
+               a.rating, a.duration_minutes, a.next_action, a.next_action_date,
+               a.store_id, s.store_number, s.account, s.city,
+               a.horeca_account_id, h.name AS horeca_name
+        FROM activities a
+        LEFT JOIN stores s ON s.id = a.store_id
+        LEFT JOIN horeca_accounts h ON h.id = a.horeca_account_id
+        WHERE {' AND '.join(where)}
+        ORDER BY a.created_at DESC
+        LIMIT {ph}
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params + [limit])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params + [limit]).fetchall()
+
+    out = [{
+        'id': r[0], 'created_at': str(r[1]) if r[1] else None,
+        'activity_type': r[2], 'rep': r[3], 'outcome': r[4], 'notes': r[5],
+        'rating': r[6], 'duration_minutes': r[7],
+        'next_action': r[8], 'next_action_date': str(r[9]) if r[9] else None,
+        'store_id': r[10], 'store_number': r[11], 'account': r[12], 'city': r[13],
+        'horeca_account_id': r[14], 'horeca_name': r[15],
+    } for r in rows]
+    return jsonify({'activities': out, 'window_days': days, 'total': len(out)})
+
+
+@app.route('/api/crm/activities', methods=['POST'])
+def api_crm_activities_create():
+    """Log an activity (visit, call, email, tasting, sample-drop, POSM).
+
+    Accepts optional sku_outcomes array [{sku, outcome, facings, competitor_notes}]
+    which creates activity_sku_outcomes rows + optionally advances the deal pipeline.
+    """
+    d = request.get_json() or {}
+    activity_type = (d.get('activity_type') or '').strip()
+    if not activity_type:
+        return jsonify({'error': 'activity_type required'}), 400
+
+    # Resolve store_id (if store_number provided)
+    store_id = d.get('store_id')
+    store_number = d.get('store_number')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if not store_id and store_number:
+        q = f"SELECT id FROM stores WHERE store_number = {ph} LIMIT 1"
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(q, (store_number,))
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(q, (store_number,)).fetchone()
+        if r:
+            store_id = r[0]
+
+    # Resolve rep_id (we require a non-null rep_id due to FK in the original schema)
+    rep_name = (d.get('rep') or '').strip()
+    rep_id = None
+    if rep_name:
+        q = f"SELECT id FROM reps WHERE LOWER(TRIM(name)) = LOWER(TRIM({ph})) LIMIT 1"
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(q, (rep_name,))
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(q, (rep_name,)).fetchone()
+        if r:
+            rep_id = r[0]
+        else:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute("INSERT INTO reps (name) VALUES (%s) RETURNING id", (rep_name,))
+                rep_id = cur.fetchone()[0]
+                db.commit()
+                cur.close()
+            else:
+                c = db.execute("INSERT INTO reps (name) VALUES (?)", (rep_name,))
+                rep_id = c.lastrowid
+                db.commit()
+
+    if not (store_id or d.get('horeca_account_id')):
+        return jsonify({'error': 'store_number or horeca_account_id required'}), 400
+    if not rep_id:
+        return jsonify({'error': 'rep required'}), 400
+
+    insert_cols = ['store_id', 'rep_id', 'activity_type', 'notes', 'rep',
+                   'outcome', 'duration_minutes', 'rating',
+                   'next_action', 'next_action_date', 'horeca_account_id',
+                   'lat', 'lng']
+    vals = (
+        store_id, rep_id, activity_type, d.get('notes', ''), rep_name,
+        d.get('outcome', ''), int(d.get('duration_minutes') or 0), int(d.get('rating') or 0),
+        d.get('next_action', ''), d.get('next_action_date') or None,
+        d.get('horeca_account_id'),
+        float(d.get('lat') or 0), float(d.get('lng') or 0),
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"INSERT INTO activities ({','.join(insert_cols)}) VALUES ({','.join(['%s']*len(insert_cols))}) RETURNING id",
+            vals,
+        )
+        activity_id = cur.fetchone()[0]
+        db.commit()
+        cur.close()
+    else:
+        c = db.execute(
+            f"INSERT INTO activities ({','.join(insert_cols)}) VALUES ({','.join(['?']*len(insert_cols))})",
+            vals,
+        )
+        activity_id = c.lastrowid
+        db.commit()
+
+    # Per-SKU outcomes → activity_sku_outcomes rows
+    sku_outcomes = d.get('sku_outcomes') or []
+    for so in sku_outcomes:
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    "INSERT INTO activity_sku_outcomes "
+                    "(activity_id, sku, outcome, facings, competitor_notes) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (activity_id, str(so['sku']).zfill(7), so.get('outcome', ''),
+                     int(so.get('facings') or 0), so.get('competitor_notes', '')),
+                )
+                db.commit()
+                cur.close()
+            else:
+                db.execute(
+                    "INSERT INTO activity_sku_outcomes "
+                    "(activity_id, sku, outcome, facings, competitor_notes) "
+                    "VALUES (?,?,?,?,?)",
+                    (activity_id, str(so['sku']).zfill(7), so.get('outcome', ''),
+                     int(so.get('facings') or 0), so.get('competitor_notes', '')),
+                )
+                db.commit()
+        except Exception as e:
+            print(f'[activity-log] sku outcome insert failed: {e}')
+
+    # Optional: if outcome suggests pipeline advancement, upsert a deal row
+    # (e.g., "samples_left" → create/update deal with stage='samples_left')
+    suggested_stage = d.get('advance_pipeline_stage')
+    if suggested_stage and store_number and sku_outcomes:
+        for so in sku_outcomes:
+            sku_z = str(so['sku']).zfill(7)
+            try:
+                # Upsert style for deals — find existing open deal or create
+                if USE_POSTGRES:
+                    cur = db.cursor()
+                    cur.execute(
+                        "SELECT id FROM deals WHERE store_number=%s AND sku=%s "
+                        "AND stage NOT IN ('listed','lost') LIMIT 1",
+                        (store_number, sku_z),
+                    )
+                    r = cur.fetchone()
+                    if r:
+                        cur.execute(
+                            "UPDATE deals SET stage=%s, owner_rep=%s, updated_at=NOW() WHERE id=%s",
+                            (suggested_stage, rep_name, r[0]),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO deals (store_number, sku, stage, owner_rep, source) "
+                            "VALUES (%s,%s,%s,%s,'activity_log')",
+                            (store_number, sku_z, suggested_stage, rep_name),
+                        )
+                    db.commit()
+                    cur.close()
+                else:
+                    r = db.execute(
+                        "SELECT id FROM deals WHERE store_number=? AND sku=? "
+                        "AND stage NOT IN ('listed','lost') LIMIT 1",
+                        (store_number, sku_z),
+                    ).fetchone()
+                    if r:
+                        db.execute(
+                            "UPDATE deals SET stage=?, owner_rep=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (suggested_stage, rep_name, r[0]),
+                        )
+                    else:
+                        db.execute(
+                            "INSERT INTO deals (store_number, sku, stage, owner_rep, source) "
+                            "VALUES (?,?,?,?,'activity_log')",
+                            (store_number, sku_z, suggested_stage, rep_name),
+                        )
+                    db.commit()
+            except Exception as e:
+                print(f'[activity-log] pipeline advance failed: {e}')
+
+    return jsonify({'status': 'ok', 'id': activity_id})
+
+
+# =========================== Rep quotas ===========================
+
+@app.route('/api/crm/quotas', methods=['GET'])
+def api_crm_quotas_list():
+    """List all quotas with live progress."""
+    rep = request.args.get('rep', '').strip()
+    quarter = request.args.get('quarter', '').strip() or _current_quarter()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = [f'quarter = {ph}']
+    params = [quarter]
+    if rep:
+        where.append(f'LOWER(TRIM(rep)) = LOWER(TRIM({ph}))')
+        params.append(rep)
+    q = (f"SELECT id, rep, quarter, target_activities, target_visits, "
+         f"target_new_listings, target_units, target_revenue, notes "
+         f"FROM rep_quotas WHERE {' AND '.join(where)}")
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+
+    # Parse quarter -> date range
+    try:
+        y, qn = quarter.split('-Q')
+        qstart_month = (int(qn) - 1) * 3 + 1
+        qstart = datetime(int(y), qstart_month, 1).date()
+        if qstart_month + 3 > 12:
+            qend = datetime(int(y) + 1, 1, 1).date() - timedelta(days=1)
+        else:
+            qend = datetime(int(y), qstart_month + 3, 1).date() - timedelta(days=1)
+    except Exception:
+        qstart = _toronto_today().replace(day=1)
+        qend = _toronto_today()
+
+    out = []
+    for r in rows:
+        rep_name = r[1]
+        # Activities count
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COUNT(*), COUNT(CASE WHEN LOWER(activity_type) LIKE '%%visit%%' THEN 1 END) "
+                "FROM activities WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s)) "
+                "AND created_at BETWEEN %s AND %s",
+                (rep_name, qstart, qend),
+            )
+            ar = cur.fetchone()
+            cur.close()
+        else:
+            ar = db.execute(
+                "SELECT COUNT(*), COUNT(CASE WHEN LOWER(activity_type) LIKE '%visit%' THEN 1 END) "
+                "FROM activities WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?)) "
+                "AND datetime(created_at) BETWEEN ? AND ?",
+                (rep_name, qstart.isoformat(), qend.isoformat() + ' 23:59:59'),
+            ).fetchone()
+        activities_done = int(ar[0] or 0) if ar else 0
+        visits_done = int(ar[1] or 0) if ar else 0
+
+        # New listings = deals that moved to 'listed' this quarter
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM deals WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(%s)) "
+                "AND stage='listed' AND closed_at BETWEEN %s AND %s",
+                (rep_name, qstart, qend),
+            )
+            new_listings = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            new_listings = int(db.execute(
+                "SELECT COUNT(*) FROM deals WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(?)) "
+                "AND stage='listed' AND datetime(closed_at) BETWEEN ? AND ?",
+                (rep_name, qstart.isoformat(), qend.isoformat() + ' 23:59:59'),
+            ).fetchone()[0] or 0)
+
+        def pct(done, target):
+            return round(100 * done / target, 1) if target > 0 else None
+
+        out.append({
+            'id': r[0], 'rep': rep_name, 'quarter': r[2],
+            'period_start': qstart.isoformat(), 'period_end': qend.isoformat(),
+            'targets': {
+                'activities': r[3], 'visits': r[4],
+                'new_listings': r[5], 'units': r[6],
+                'revenue': float(r[7] or 0),
+            },
+            'achieved': {
+                'activities': activities_done, 'visits': visits_done,
+                'new_listings': new_listings,
+                'units': 0, 'revenue': 0,  # require sales data integration
+            },
+            'pct': {
+                'activities': pct(activities_done, r[3]),
+                'visits': pct(visits_done, r[4]),
+                'new_listings': pct(new_listings, r[5]),
+            },
+            'notes': r[8],
+        })
+    return jsonify({'quarter': quarter, 'quotas': out})
+
+
+@app.route('/api/crm/quotas', methods=['POST'])
+def api_crm_quotas_upsert():
+    d = request.get_json() or {}
+    rep = (d.get('rep') or '').strip()
+    quarter = (d.get('quarter') or _current_quarter()).strip()
+    if not rep:
+        return jsonify({'error': 'rep required'}), 400
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            """INSERT INTO rep_quotas
+               (rep, quarter, target_activities, target_visits, target_new_listings,
+                target_units, target_revenue, notes)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (rep, quarter) DO UPDATE SET
+                   target_activities=EXCLUDED.target_activities,
+                   target_visits=EXCLUDED.target_visits,
+                   target_new_listings=EXCLUDED.target_new_listings,
+                   target_units=EXCLUDED.target_units,
+                   target_revenue=EXCLUDED.target_revenue,
+                   notes=EXCLUDED.notes""",
+            (rep, quarter,
+             int(d.get('target_activities') or 0),
+             int(d.get('target_visits') or 0),
+             int(d.get('target_new_listings') or 0),
+             int(d.get('target_units') or 0),
+             float(d.get('target_revenue') or 0),
+             d.get('notes', '')),
+        )
+        db.commit()
+        cur.close()
+    else:
+        db.execute(
+            """INSERT INTO rep_quotas
+               (rep, quarter, target_activities, target_visits, target_new_listings,
+                target_units, target_revenue, notes)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(rep, quarter) DO UPDATE SET
+                   target_activities=excluded.target_activities,
+                   target_visits=excluded.target_visits,
+                   target_new_listings=excluded.target_new_listings,
+                   target_units=excluded.target_units,
+                   target_revenue=excluded.target_revenue,
+                   notes=excluded.notes""",
+            (rep, quarter,
+             int(d.get('target_activities') or 0),
+             int(d.get('target_visits') or 0),
+             int(d.get('target_new_listings') or 0),
+             int(d.get('target_units') or 0),
+             float(d.get('target_revenue') or 0),
+             d.get('notes', '')),
+        )
+        db.commit()
+    return jsonify({'status': 'ok'})
+
+
+# =========================== Daily plan: today's stops ===========================
+
+@app.route('/api/crm/today/<path:rep>', methods=['GET'])
+def api_crm_today(rep):
+    """Compute today's plan for a rep.
+
+    Algorithm:
+      1. Pull stores in rep's territory (or assigned to them via stores.rep).
+      2. Score each by: days_since_last_visit (weighted x2), OOS-risk count,
+         open-deal-stage priority, store priority (High/Top = +2).
+      3. Also pull deals with next_action_date <= today (overdue/due actions).
+      4. Order by score desc; return top 8 stops with short-TSP ordering by proximity.
+    """
+    rep_trimmed = rep.strip()
+    limit = int(request.args.get('limit', 8))
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Stores assigned to this rep (match LOWER(TRIM))
+    q = f"""
+        SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+               s.priority, s.lat, s.lng, s.territory_id,
+               COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+               (SELECT MAX(a.created_at) FROM activities a WHERE a.store_id = s.id) AS last_visit,
+               (SELECT COUNT(*) FROM activities a WHERE a.store_id = s.id) AS visit_count
+        FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE LOWER(TRIM(s.rep)) = LOWER(TRIM({ph}))
+        AND s.lat <> 0 AND s.lng <> 0
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, (rep_trimmed,))
+        stores = cur.fetchall()
+        cur.close()
+    else:
+        stores = db.execute(q, (rep_trimmed,)).fetchall()
+
+    # Deals with next_action_date <= today
+    today_str = _toronto_today().isoformat()
+    dq = f"""
+        SELECT store_number, sku, stage, next_action, next_action_date
+        FROM deals
+        WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM({ph}))
+        AND stage NOT IN ('listed','lost')
+        AND (next_action_date IS NULL OR next_action_date <= {ph})
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(dq, (rep_trimmed, today_str))
+        deal_rows = cur.fetchall()
+        cur.close()
+    else:
+        deal_rows = db.execute(dq, (rep_trimmed, today_str)).fetchall()
+
+    # Build deal lookup per store
+    deals_by_store = {}
+    for dr in deal_rows:
+        deals_by_store.setdefault(dr[0], []).append({
+            'sku': dr[1], 'stage': dr[2],
+            'next_action': dr[3], 'next_action_date': str(dr[4]) if dr[4] else None,
+        })
+
+    # OOS brink lookup per store
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    oos_by_store = {}
+    if tracked:
+        phs = ','.join([ph] * len(tracked))
+        oosq = f"""
+            WITH latest AS (
+                SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+                WHERE sku IN ({phs}) GROUP BY sku
+            )
+            SELECT i.store_number, COUNT(*)
+            FROM sod_inventory i JOIN latest l ON l.sku = i.sku AND l.d = i.snapshot_date
+            WHERE i.status = 'L' AND i.on_hand <= 2
+            GROUP BY i.store_number
+        """
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(oosq, tracked)
+            for r in cur.fetchall():
+                oos_by_store[r[0]] = int(r[1])
+            cur.close()
+        else:
+            for r in db.execute(oosq, tracked).fetchall():
+                oos_by_store[r[0]] = int(r[1])
+
+    # Score each store
+    scored = []
+    for s in stores:
+        sid, sn, account, address, city, postal, priority, lat, lng, tid, tname, tcolor, last_visit, visit_count = s
+        days_since = 999
+        if last_visit:
+            try:
+                lv = last_visit if isinstance(last_visit, datetime) else datetime.fromisoformat(str(last_visit).split('+')[0])
+                days_since = (datetime.now() - lv.replace(tzinfo=None)).days
+            except Exception:
+                pass
+
+        score = 0
+        score += min(days_since, 60) * 2  # recency weight
+        score += (oos_by_store.get(sn, 0)) * 15  # OOS urgency
+        score += len(deals_by_store.get(sn, [])) * 10  # open actions
+        if (priority or '').lower() in ('top', 'high'):
+            score += 20
+        if visit_count == 0:
+            score += 25  # never-visited bonus
+
+        scored.append({
+            'store_id': sid, 'store_number': sn, 'account': account,
+            'address': address, 'city': city, 'postal': postal,
+            'priority': priority, 'lat': lat, 'lng': lng,
+            'territory_id': tid, 'territory_name': tname, 'territory_color': tcolor,
+            'days_since_visit': days_since if days_since < 999 else None,
+            'visit_count': visit_count,
+            'oos_count': oos_by_store.get(sn, 0),
+            'deals': deals_by_store.get(sn, []),
+            'score': score,
+        })
+    scored.sort(key=lambda x: -x['score'])
+
+    # Take top `limit*2` and nearest-neighbor TSP them starting from the highest-scored
+    pool = scored[: max(limit * 2, 4)]
+    if len(pool) <= 1:
+        ordered = pool
+    else:
+        ordered = [pool.pop(0)]
+        while pool and len(ordered) < limit:
+            last = ordered[-1]
+            def d(a, b):
+                try:
+                    return haversine(a['lat'], a['lng'], b['lat'], b['lng'])
+                except Exception:
+                    return 1e6
+            next_idx = min(range(len(pool)), key=lambda i: d(last, pool[i]))
+            ordered.append(pool.pop(next_idx))
+
+    # Total driving distance
+    total_km = 0.0
+    for i in range(1, len(ordered)):
+        try:
+            total_km += haversine(
+                ordered[i-1]['lat'], ordered[i-1]['lng'],
+                ordered[i]['lat'], ordered[i]['lng'],
+            )
+        except Exception:
+            pass
+
+    return jsonify({
+        'rep': rep_trimmed,
+        'plan_date': today_str,
+        'stops': ordered[:limit],
+        'total_distance_km': round(total_km, 1),
+        'total_stops': len(ordered[:limit]),
+        'overdue_deal_actions': sum(len(v) for v in deals_by_store.values()),
+        'total_candidate_stores': len(stores),
+    })
+
+
+@app.route('/api/crm/reps-with-stores', methods=['GET'])
+def api_crm_reps_with_stores():
+    """List reps from stores table + how many stores they cover."""
+    db = get_db()
+    q = (
+        "SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count "
+        "FROM stores WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+        "GROUP BY LOWER(TRIM(rep)) ORDER BY store_count DESC"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q).fetchall()
+    return jsonify([{'rep': r[0], 'store_count': r[1]} for r in rows])
 
 
 # ------- Optional daily lcbo.com scrape (dual-source ingest) -------
