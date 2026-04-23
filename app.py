@@ -2974,6 +2974,25 @@ _sod_sync_lock = threading.Lock()
 _sod_last_result = {'daily_a': None, 'daily_b': None}
 
 
+def _sod_run_if_stale(sources, max_age_hours=6):
+    """Fire a sync ONLY if the last successful sync is older than max_age_hours
+    OR the data itself is > 1 day old.
+
+    Used by the 07:00/12:00/18:00 ET catch-up jobs so we don't re-run
+    unnecessarily when the 03:00 main job succeeded.
+    """
+    run_age = _last_successful_run_age_hours_safe()
+    data_age = _sod_data_age_days()
+    needs_sync = (
+        run_age is None or run_age > max_age_hours or data_age is None or data_age > 1
+    )
+    if needs_sync:
+        print(f'[SOD] catch-up firing (run_age={run_age}h, data_age={data_age}d, threshold={max_age_hours}h)')
+        _sod_sync_worker(sources)
+    else:
+        print(f'[SOD] catch-up skipped (run {run_age:.1f}h ago, data {data_age}d old — fresh enough)')
+
+
 def _sod_sync_worker(sources):
     """Run the sync in a background thread (used for manual trigger)."""
     if not _sod_sync_lock.acquire(blocking=False):
@@ -3764,35 +3783,75 @@ def start_sod_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
+        # MAIN: 03:00 ET — primary run, after LCBO's ~01:30-02:30 ET upload window
         sched.add_job(
             lambda: _sod_sync_worker(['daily_a', 'daily_b']),
-            CronTrigger(hour=3, minute=0),  # 03:00 ET — after LCBO finishes uploading
-            id='sod_daily_sync',
+            CronTrigger(hour=3, minute=0),
+            id='sod_main_sync',
             replace_existing=True,
             max_instances=1,
             coalesce=True,
-            misfire_grace_time=3600 * 6,  # tolerate up to 6h delay (e.g. Render cold boot)
+            misfire_grace_time=3600 * 6,
+        )
+        # CATCH-UP #1: 07:00 ET — if 03:00 missed (Render cold boot, LCBO late upload).
+        # Uses the same _sod_sync_worker which is idempotent via ON CONFLICT upserts.
+        sched.add_job(
+            lambda: _sod_run_if_stale(['daily_a', 'daily_b'], max_age_hours=6),
+            CronTrigger(hour=7, minute=0),
+            id='sod_catchup_morning',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 4,
+        )
+        # CATCH-UP #2: 12:00 ET — midday check. Only fires if we still don't have
+        # today's data.
+        sched.add_job(
+            lambda: _sod_run_if_stale(['daily_a', 'daily_b'], max_age_hours=12),
+            CronTrigger(hour=12, minute=0),
+            id='sod_catchup_noon',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 4,
+        )
+        # CATCH-UP #3: 18:00 ET — evening check. Last chance to pull today's file.
+        sched.add_job(
+            lambda: _sod_run_if_stale(['daily_a', 'daily_b'], max_age_hours=18),
+            CronTrigger(hour=18, minute=0),
+            id='sod_catchup_evening',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 4,
         )
         sched.start()
         _sod_scheduler = sched
-        print(f'[SOD] Daily scheduler started — next run: {sched.get_job("sod_daily_sync").next_run_time}')
+        next_run = sched.get_job("sod_main_sync").next_run_time
+        print(f'[SOD] Scheduler started — main @ 03:00 ET, catch-ups @ 07:00/12:00/18:00 ET '
+              f'(next: {next_run})')
 
-        # --- Startup catch-up: if last successful sync is > 24h old, fire immediately (delayed) ---
+        # --- Startup catch-up: if no sync in > 6h OR snapshot > 1 day old, fire immediately ---
         def _catchup_if_stale():
             try:
-                # Defer briefly so the DB is ready and the app is serving
                 import time as _t
-                _t.sleep(30)
-                with app.app_context():
-                    age = _sod_last_successful_sync_age_hours()
-                if age is None:
-                    print('[SOD] no prior successful sync — running initial catch-up')
-                    _sod_sync_worker(['daily_a', 'daily_b'])
-                elif age > 24:
-                    print(f'[SOD] last sync was {age:.1f}h ago — running catch-up')
+                _t.sleep(30)  # let DB + app finish warming
+                run_age = _last_successful_run_age_hours_safe()
+                data_age = _sod_data_age_days()
+                should_catchup = (
+                    run_age is None
+                    or run_age > 6
+                    or data_age is None
+                    or data_age > 1
+                )
+                if should_catchup:
+                    print(
+                        f'[SOD] startup catch-up firing '
+                        f'(run_age={run_age}h, data_age={data_age}d)'
+                    )
                     _sod_sync_worker(['daily_a', 'daily_b'])
                 else:
-                    print(f'[SOD] last sync {age:.1f}h ago — no catch-up needed')
+                    print(f'[SOD] fresh (run {run_age:.1f}h ago, data {data_age}d old) — no catch-up')
             except Exception as e:
                 print(f'[SOD] catch-up check failed: {e}')
         threading.Thread(target=_catchup_if_stale, daemon=True).start()
@@ -5393,86 +5452,92 @@ def api_crm_store_trend(store_number):
 def api_crm_wow_deltas():
     """Per-tracked-SKU comparison: latest vs 7d ago vs 30d ago vs 365d ago.
 
-    Useful for dashboard delta badges. Each metric is the # of stores at status='L'
-    plus the total on_hand at that snapshot.
+    Fixed: closest_snapshot now scoped PER-SKU — the latest snapshot <= target
+    that actually CONTAINS the SKU. Previously used global max snapshot, which
+    picked daily_b agent-only snapshots where Anu SKUs don't exist → false
+    -100% deltas.
     """
     today = _toronto_today()
-    targets = {
-        'today': today.isoformat(),
-        'wow': (today - timedelta(days=7)).isoformat(),
-        'mom': (today - timedelta(days=30)).isoformat(),
-        'yoy': (today - timedelta(days=365)).isoformat(),
-    }
     tracked = list(SOD_TRACKED_SKUS.keys())
     if not tracked:
         return jsonify({})
+    target_days = {'today': 0, 'wow': 7, 'mom': 30, 'yoy': 365}
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
 
-    def closest_snapshot(target_date_str):
-        """Return the latest snapshot_date <= target_date_str, or None."""
-        q = f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE snapshot_date <= {ph}"
+    def closest_snapshot_for_sku(sku, target_date_str):
+        q = (f"SELECT MAX(snapshot_date) FROM sod_inventory "
+             f"WHERE sku = {ph} AND snapshot_date <= {ph}")
         if USE_POSTGRES:
             cur = db.cursor()
-            cur.execute(q, (target_date_str,))
+            cur.execute(q, (sku, target_date_str))
             r = cur.fetchone()
             cur.close()
         else:
-            r = db.execute(q, (target_date_str,)).fetchone()
+            r = db.execute(q, (sku, target_date_str)).fetchone()
         return str(r[0]) if r and r[0] else None
 
-    snapshots = {k: closest_snapshot(v) for k, v in targets.items()}
-
-    def metrics_at(snap_date):
+    def metrics_for(sku, snap_date):
         if not snap_date:
-            return {}
-        phs = ','.join([ph] * len(tracked))
-        q = f"""
-            SELECT sku,
-                   SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed,
-                   COALESCE(SUM(on_hand), 0) AS oh
-            FROM sod_inventory
-            WHERE snapshot_date = {ph} AND sku IN ({phs})
-            GROUP BY sku
-        """
+            return {'listed': 0, 'on_hand': 0}
+        q = (f"SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+             f"COALESCE(SUM(on_hand), 0) "
+             f"FROM sod_inventory WHERE sku = {ph} AND snapshot_date = {ph}")
         if USE_POSTGRES:
             cur = db.cursor()
-            cur.execute(q, [snap_date] + tracked)
-            rows = cur.fetchall()
+            cur.execute(q, (sku, snap_date))
+            r = cur.fetchone()
             cur.close()
         else:
-            rows = db.execute(q, [snap_date] + tracked).fetchall()
-        return {r[0]: {'listed': int(r[1] or 0), 'on_hand': int(r[2] or 0)} for r in rows}
-
-    by_window = {k: metrics_at(v) for k, v in snapshots.items()}
+            r = db.execute(q, (sku, snap_date)).fetchone()
+        return {'listed': int(r[0] or 0), 'on_hand': int(r[1] or 0)}
 
     def delta(now, then):
         if then == 0:
             return {'abs': now, 'pct': None}
         return {'abs': now - then, 'pct': round(100 * (now - then) / then, 1)}
 
+    snapshot_tally = {}
     out = []
     for sku in tracked:
         brand, pname = SOD_TRACKED_SKUS[sku]
-        latest = by_window['today'].get(sku, {'listed': 0, 'on_hand': 0})
-        wow = by_window['wow'].get(sku, {'listed': 0, 'on_hand': 0})
-        mom = by_window['mom'].get(sku, {'listed': 0, 'on_hand': 0})
-        yoy = by_window['yoy'].get(sku, {'listed': 0, 'on_hand': 0})
+        snaps = {
+            k: closest_snapshot_for_sku(sku, (today - timedelta(days=d)).isoformat())
+            for k, d in target_days.items()
+        }
+        mets = {k: metrics_for(sku, snaps[k]) for k in target_days}
+        if snaps['today']:
+            snapshot_tally[snaps['today']] = snapshot_tally.get(snaps['today'], 0) + 1
+        latest = mets['today']
         out.append({
             'sku': sku, 'brand': brand, 'product_name': pname,
-            'now': latest,
-            'wow': {'listed_delta': delta(latest['listed'], wow['listed']),
-                    'on_hand_delta': delta(latest['on_hand'], wow['on_hand']),
-                    'baseline_snapshot': snapshots['wow']},
-            'mom': {'listed_delta': delta(latest['listed'], mom['listed']),
-                    'on_hand_delta': delta(latest['on_hand'], mom['on_hand']),
-                    'baseline_snapshot': snapshots['mom']},
-            'yoy': {'listed_delta': delta(latest['listed'], yoy['listed']),
-                    'on_hand_delta': delta(latest['on_hand'], yoy['on_hand']),
-                    'baseline_snapshot': snapshots['yoy']},
+            'now': latest, 'now_snapshot': snaps['today'],
+            'wow': {
+                'listed_delta': delta(latest['listed'], mets['wow']['listed']),
+                'on_hand_delta': delta(latest['on_hand'], mets['wow']['on_hand']),
+                'baseline_snapshot': snaps['wow'],
+            },
+            'mom': {
+                'listed_delta': delta(latest['listed'], mets['mom']['listed']),
+                'on_hand_delta': delta(latest['on_hand'], mets['mom']['on_hand']),
+                'baseline_snapshot': snaps['mom'],
+            },
+            'yoy': {
+                'listed_delta': delta(latest['listed'], mets['yoy']['listed']),
+                'on_hand_delta': delta(latest['on_hand'], mets['yoy']['on_hand']),
+                'baseline_snapshot': snaps['yoy'],
+            },
         })
+    top_today = (
+        max(snapshot_tally.items(), key=lambda x: x[1])[0] if snapshot_tally else None
+    )
     return jsonify({
-        'snapshots': snapshots,
+        'snapshots': {
+            'today': top_today,
+            'wow': (today - timedelta(days=7)).isoformat(),
+            'mom': (today - timedelta(days=30)).isoformat(),
+            'yoy': (today - timedelta(days=365)).isoformat(),
+        },
         'tracked': out,
         'freshness': _sod_freshness(),
     })
