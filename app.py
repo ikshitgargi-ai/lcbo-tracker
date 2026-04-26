@@ -6302,6 +6302,194 @@ def api_crm_velocity(sku):
     })
 
 
+@app.route('/api/crm/store/<int:store_number>/replace-targets', methods=['GET'])
+def api_crm_replace_targets(store_number):
+    """For ONE store, return worst-performing competitor SKUs in EACH category that
+    our tracked SKUs compete in. The killer rep-workflow feature: walk into a store,
+    instantly see the pitch list ranked by replacement opportunity score.
+
+    Per category, we return up to `per_cat` SKUs (default 5) sorted by:
+      - status: D > F > L (delisting first, then fully delisted, then slow listed)
+      - on_hand: ascending (lowest stock first)
+
+    Each row includes the recommended OUR_SKU to pitch as replacement (the first
+    tracked SKU we have in that category).
+    """
+    per_cat = int(request.args.get('per_cat', 5))
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Latest snapshot at this store
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE store_number = %s", (store_number,))
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(
+            "SELECT MAX(snapshot_date) FROM sod_inventory WHERE store_number = ?",
+            (store_number,),
+        ).fetchone()[0]
+
+    if not latest:
+        return jsonify({'store_number': store_number, 'snapshot_date': None, 'categories': []})
+
+    # Determine which categories our tracked SKUs are in + map cat -> our pitch SKU
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    pitch_for_cat = {}
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT sku, COALESCE(category, ''), COALESCE(brand, ''), COALESCE(product_name, '') "
+            f"FROM sod_products WHERE sku IN ({','.join(['%s'] * len(tracked))})",
+            tracked,
+        )
+        for r in cur.fetchall():
+            sku, cat, brand, name = r[0], r[1], r[2], r[3]
+            if cat and cat not in pitch_for_cat:
+                # Use our hardcoded SOD_TRACKED_SKUS for canonical brand/name
+                tb, tn = SOD_TRACKED_SKUS.get(sku, (brand, name))
+                pitch_for_cat[cat] = {'sku': sku, 'brand': tb, 'product_name': tn}
+        cur.close()
+    else:
+        rows = db.execute(
+            f"SELECT sku, COALESCE(category, ''), COALESCE(brand, ''), COALESCE(product_name, '') "
+            f"FROM sod_products WHERE sku IN ({','.join(['?'] * len(tracked))})",
+            tracked,
+        ).fetchall()
+        for r in rows:
+            sku, cat, brand, name = r[0], r[1], r[2], r[3]
+            if cat and cat not in pitch_for_cat:
+                tb, tn = SOD_TRACKED_SKUS.get(sku, (brand, name))
+                pitch_for_cat[cat] = {'sku': sku, 'brand': tb, 'product_name': tn}
+
+    if not pitch_for_cat:
+        return jsonify({'store_number': store_number, 'snapshot_date': str(latest), 'categories': []})
+
+    # For each category at this store, find competitor SKUs ranked by underperformance
+    out = []
+    for cat, pitch in pitch_for_cat.items():
+        # competitor candidates: same category, at this store, in latest snapshot,
+        # NOT one of our tracked SKUs, sorted by status then on_hand
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""SELECT i.sku, i.product_name, i.status, i.on_hand,
+                           p.brand, p.category
+                    FROM sod_inventory i
+                    JOIN sod_products p ON p.sku = i.sku
+                    WHERE i.store_number = %s
+                      AND i.snapshot_date = %s
+                      AND p.category = %s
+                      AND i.sku NOT IN ({','.join(['%s'] * len(tracked))})
+                    ORDER BY
+                      CASE i.status WHEN 'D' THEN 1 WHEN 'F' THEN 2 WHEN 'L' THEN 3 ELSE 4 END,
+                      i.on_hand ASC
+                    LIMIT %s""",
+                [store_number, latest, cat] + tracked + [per_cat],
+            )
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = db.execute(
+                f"""SELECT i.sku, i.product_name, i.status, i.on_hand,
+                           p.brand, p.category
+                    FROM sod_inventory i
+                    JOIN sod_products p ON p.sku = i.sku
+                    WHERE i.store_number = ?
+                      AND i.snapshot_date = ?
+                      AND p.category = ?
+                      AND i.sku NOT IN ({','.join(['?'] * len(tracked))})
+                    ORDER BY
+                      CASE i.status WHEN 'D' THEN 1 WHEN 'F' THEN 2 WHEN 'L' THEN 3 ELSE 4 END,
+                      i.on_hand ASC
+                    LIMIT ?""",
+                [store_number, latest, cat] + tracked + [per_cat],
+            ).fetchall()
+
+        targets = []
+        for r in rows:
+            sku, name, status, on_hand, brand, _ = r
+            score = 0
+            if status == 'D':
+                score += 50
+            elif status == 'F':
+                score += 30
+            if (on_hand or 0) == 0:
+                score += 40
+            elif (on_hand or 0) <= 1:
+                score += 25
+            elif (on_hand or 0) <= 3:
+                score += 10
+            targets.append({
+                'competitor_sku': sku,
+                'competitor_name': name,
+                'competitor_brand': brand,
+                'competitor_status': status,
+                'competitor_on_hand': int(on_hand or 0),
+                'opportunity_score': score,
+            })
+        out.append({
+            'category': cat,
+            'pitch_our_sku': pitch['sku'],
+            'pitch_our_brand': pitch['brand'],
+            'pitch_our_product': pitch['product_name'],
+            'targets': targets,
+        })
+
+    # Sort categories by total opportunity score (descending)
+    out.sort(key=lambda c: -sum(t['opportunity_score'] for t in c['targets']))
+    return jsonify({
+        'store_number': store_number,
+        'snapshot_date': str(latest),
+        'categories': out,
+    })
+
+
+@app.route('/api/crm/store/<int:store_number>/full', methods=['GET'])
+def api_crm_store_full(store_number):
+    """One-call store profile: store info + tracked SKU status + recent activities +
+    open deals + replace-targets summary. Powers the upgraded /stores/[id] page."""
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    # Store info
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            """SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+                      s.phone, s.email, s.priority, s.rep, s.lat, s.lng,
+                      s.manager_name, s.asst_manager_name, s.manager_phone, s.store_email,
+                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+               FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
+               WHERE s.store_number = %s LIMIT 1""",
+            (store_number,),
+        )
+        s = cur.fetchone()
+        cur.close()
+    else:
+        s = db.execute(
+            """SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+                      s.phone, s.email, s.priority, s.rep, s.lat, s.lng,
+                      s.manager_name, s.asst_manager_name, s.manager_phone, s.store_email,
+                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+               FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
+               WHERE s.store_number = ? LIMIT 1""",
+            (store_number,),
+        ).fetchone()
+    if not s:
+        return jsonify({'error': 'store not found'}), 404
+    store = {
+        'id': s[0], 'store_number': s[1], 'account': s[2], 'address': s[3],
+        'city': s[4], 'postal': s[5], 'phone': s[6], 'email': s[7],
+        'priority': s[8], 'rep': s[9], 'lat': s[10], 'lng': s[11],
+        'manager_name': s[12], 'asst_manager_name': s[13],
+        'manager_phone': s[14], 'store_email': s[15],
+        'territory_id': s[16] or None, 'territory_code': s[17],
+        'territory_name': s[18], 'territory_color': s[19],
+    }
+    return jsonify({'store': store, 'snapshot_date': str(_max_snapshot_date()) if _max_snapshot_date() else None})
+
+
 @app.route('/api/crm/shelf-share/<int:store_number>', methods=['GET'])
 def api_crm_shelf_share(store_number):
     """For one store: our share of each tracked SKU's category at the latest snapshot.
