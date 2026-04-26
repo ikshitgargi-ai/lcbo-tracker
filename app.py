@@ -451,6 +451,21 @@ def init_db():
                 detected_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        # Per-(store, sku) change tracking for our tracked SKUs:
+        # answers "which stores added/dropped Red Admiral last week?"
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sod_store_sku_changes (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                change_date DATE NOT NULL,
+                old_status TEXT,
+                new_status TEXT,
+                change_type TEXT NOT NULL,
+                detected_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(sku, store_number, change_date, change_type)
+            )
+        ''')
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_sod_inv_sku ON sod_inventory(sku)",
             "CREATE INDEX IF NOT EXISTS idx_sod_inv_date ON sod_inventory(snapshot_date)",
@@ -460,6 +475,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_sod_changes_sku ON sod_listing_changes(sku)",
             "CREATE INDEX IF NOT EXISTS idx_sod_changes_date ON sod_listing_changes(change_date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_sod_products_tracked ON sod_products(is_tracked)",
+            "CREATE INDEX IF NOT EXISTS idx_sssc_date ON sod_store_sku_changes(change_date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sssc_sku ON sod_store_sku_changes(sku)",
+            "CREATE INDEX IF NOT EXISTS idx_sssc_type ON sod_store_sku_changes(change_type)",
         ]:
             try:
                 cur.execute(idx)
@@ -786,6 +804,20 @@ def init_db():
                 change_type TEXT,
                 detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS sod_store_sku_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                change_date TEXT NOT NULL,
+                old_status TEXT,
+                new_status TEXT,
+                change_type TEXT NOT NULL,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(sku, store_number, change_date, change_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sssc_date ON sod_store_sku_changes(change_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_sssc_sku ON sod_store_sku_changes(sku);
+            CREATE INDEX IF NOT EXISTS idx_sssc_type ON sod_store_sku_changes(change_type);
             CREATE INDEX IF NOT EXISTS idx_sod_inv_sku ON sod_inventory(sku);
             CREATE INDEX IF NOT EXISTS idx_sod_inv_date ON sod_inventory(snapshot_date);
             CREATE INDEX IF NOT EXISTS idx_sod_inv_sku_date ON sod_inventory(sku, snapshot_date);
@@ -2927,7 +2959,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         parsed = None
         gc.collect()
 
-        # 4) Pull prior sod_products state to compute listing changes
+        # 4) Pull prior sod_products state to compute SKU-level listing changes
         cur.execute("SELECT sku, current_status FROM sod_products")
         prior = {row[0]: row[1] for row in cur.fetchall()}
         new_listings = 0
@@ -2960,6 +2992,78 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                         new_listings += 1
                 else:
                     change_inserts.append((sku, None, snapshot_date, old, status, 'STATUS_FLIP'))
+
+        # 4b) PER-STORE per-SKU change detection for our tracked SKUs.
+        # Answers "which stores added Red Admiral last week" — the rep workflow.
+        # Compare current snapshot per-(sku,store) status to the most-recent PRIOR
+        # snapshot for that SKU. Insert into sod_store_sku_changes (idempotent via
+        # UNIQUE constraint).
+        store_change_inserts = []  # (sku, store_number, change_date, old_status, new_status, change_type)
+        tracked_in_snapshot = {sku: agg for sku, agg in per_sku.items() if sku in SOD_TRACKED_SKUS}
+        for tracked_sku in tracked_in_snapshot:
+            # Find the previous snapshot date for this SKU (the one BEFORE today's)
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku = %s AND snapshot_date < %s",
+                    (tracked_sku, snapshot_date),
+                )
+                prior_snap = cur.fetchone()[0]
+            else:
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku = ? AND snapshot_date < ?",
+                    (tracked_sku, snapshot_date),
+                )
+                prior_snap = cur.fetchone()[0]
+            # Build prior {store -> status}
+            prior_per_store = {}
+            if prior_snap:
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number, status FROM sod_inventory "
+                        "WHERE sku = %s AND snapshot_date = %s",
+                        (tracked_sku, prior_snap),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT store_number, status FROM sod_inventory "
+                        "WHERE sku = ? AND snapshot_date = ?",
+                        (tracked_sku, prior_snap),
+                    )
+                prior_per_store = {r[0]: r[1] for r in cur.fetchall()}
+            # Build current {store -> status} from the rows we just streamed
+            current_per_store = {
+                r['store_number']: r['status']
+                for r in latest_rows if r['sku'] == tracked_sku
+            }
+            # Diff: what's new, what changed, what disappeared
+            for store, new_st in current_per_store.items():
+                old_st = prior_per_store.get(store)
+                if old_st is None:
+                    # Store newly carrying this SKU
+                    store_change_inserts.append(
+                        (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
+                    )
+                elif old_st != new_st:
+                    if new_st == 'L' and old_st in ('D', 'F'):
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, old_st, new_st, 'RELISTED'),
+                        )
+                    elif new_st in ('D', 'F') and old_st == 'L':
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, old_st, new_st, 'DELISTED'),
+                        )
+                    else:
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, old_st, new_st, 'STATUS_FLIP'),
+                        )
+            for store, old_st in prior_per_store.items():
+                if store not in current_per_store:
+                    # Store dropped this SKU entirely (no row at all)
+                    store_change_inserts.append(
+                        (tracked_sku, store, snapshot_date, old_st, None, 'DROPPED'),
+                    )
 
         # 5) Upsert sod_inventory
         # latest_rows is already filtered correctly by the streaming parser:
@@ -3041,7 +3145,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                      agg['store_count'], agg['total_on_hand'], 1 if is_tracked else 0, brand),
                 )
 
-        # 7) Insert detected listing changes
+        # 7) Insert detected listing changes (SKU-level)
         if change_inserts:
             if USE_POSTGRES:
                 psycopg2.extras.execute_values(
@@ -3057,6 +3161,26 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                        (sku, store_number, change_date, old_status, new_status, change_type)
                        VALUES (?,?,?,?,?,?)""",
                     change_inserts,
+                )
+
+        # 7b) Insert per-(store,sku) changes — idempotent UPSERT on natural key.
+        if store_change_inserts:
+            if USE_POSTGRES:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO sod_store_sku_changes
+                       (sku, store_number, change_date, old_status, new_status, change_type)
+                       VALUES %s
+                       ON CONFLICT (sku, store_number, change_date, change_type) DO NOTHING""",
+                    store_change_inserts,
+                )
+            else:
+                cur.executemany(
+                    """INSERT INTO sod_store_sku_changes
+                       (sku, store_number, change_date, old_status, new_status, change_type)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(sku, store_number, change_date, change_type) DO NOTHING""",
+                    store_change_inserts,
                 )
 
         # 8) Also stamp a summary inventory_history row per tracked SKU (for legacy views)
@@ -5631,6 +5755,495 @@ def api_crm_store_trend(store_number):
     })
 
 
+def _backfill_store_sku_changes():
+    """One-time backfill: walk historical sod_inventory snapshots in date order,
+    diff per-(store,sku) status between consecutive dates for tracked SKUs, and
+    populate sod_store_sku_changes. Idempotent (UNIQUE constraint).
+
+    Safe to call repeatedly. Skips work if no new snapshots since last run.
+    """
+    try:
+        ph = '%s' if USE_POSTGRES else '?'
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        tracked = list(SOD_TRACKED_SKUS.keys())
+        if not tracked:
+            cur.close()
+            conn.close()
+            return 0
+        phs = ','.join([ph] * len(tracked))
+        # Get all distinct snapshot dates that contain any tracked SKU, ordered
+        cur.execute(
+            f"SELECT DISTINCT snapshot_date FROM sod_inventory "
+            f"WHERE sku IN ({phs}) ORDER BY snapshot_date ASC",
+            tracked,
+        )
+        dates = [str(r[0]) for r in cur.fetchall()]
+        if len(dates) < 2:
+            cur.close(); conn.close()
+            return 0
+
+        total_inserts = 0
+        # For each consecutive pair of dates (per SKU), compute diffs and upsert
+        for sku in tracked:
+            # Get all snapshot dates that have this specific SKU
+            cur.execute(
+                f"SELECT DISTINCT snapshot_date FROM sod_inventory "
+                f"WHERE sku = {ph} ORDER BY snapshot_date ASC",
+                (sku,),
+            )
+            sku_dates = [str(r[0]) for r in cur.fetchall()]
+            if len(sku_dates) < 2:
+                continue
+            # Walk pairwise
+            inserts = []
+            for i in range(1, len(sku_dates)):
+                prev_date = sku_dates[i-1]
+                curr_date = sku_dates[i]
+                # prev per-store
+                cur.execute(
+                    f"SELECT store_number, status FROM sod_inventory "
+                    f"WHERE sku = {ph} AND snapshot_date = {ph}",
+                    (sku, prev_date),
+                )
+                prev_per_store = {r[0]: r[1] for r in cur.fetchall()}
+                # curr per-store
+                cur.execute(
+                    f"SELECT store_number, status FROM sod_inventory "
+                    f"WHERE sku = {ph} AND snapshot_date = {ph}",
+                    (sku, curr_date),
+                )
+                curr_per_store = {r[0]: r[1] for r in cur.fetchall()}
+                # Diffs
+                for store, new_st in curr_per_store.items():
+                    old_st = prev_per_store.get(store)
+                    if old_st is None:
+                        inserts.append((sku, store, curr_date, None, new_st, 'NEW_LISTING'))
+                    elif old_st != new_st:
+                        if new_st == 'L' and old_st in ('D', 'F'):
+                            inserts.append((sku, store, curr_date, old_st, new_st, 'RELISTED'))
+                        elif new_st in ('D', 'F') and old_st == 'L':
+                            inserts.append((sku, store, curr_date, old_st, new_st, 'DELISTED'))
+                        else:
+                            inserts.append((sku, store, curr_date, old_st, new_st, 'STATUS_FLIP'))
+                for store, old_st in prev_per_store.items():
+                    if store not in curr_per_store:
+                        inserts.append((sku, store, curr_date, old_st, None, 'DROPPED'))
+            if inserts:
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_store_sku_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES %s
+                           ON CONFLICT (sku, store_number, change_date, change_type) DO NOTHING""",
+                        inserts,
+                    )
+                else:
+                    cur.executemany(
+                        """INSERT INTO sod_store_sku_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES (?,?,?,?,?,?)
+                           ON CONFLICT(sku, store_number, change_date, change_type) DO NOTHING""",
+                        inserts,
+                    )
+                total_inserts += len(inserts)
+        conn.commit()
+        cur.close()
+        conn.close()
+        if total_inserts:
+            print(f'[backfill] inserted {total_inserts} per-store change events')
+        return total_inserts
+    except Exception as e:
+        print(f'[backfill] failed: {e}')
+        return 0
+
+
+@app.route('/api/crm/backfill-store-changes', methods=['POST'])
+def api_crm_backfill_store_changes():
+    """Manually trigger backfill of per-store changes from historical snapshots."""
+    n = _backfill_store_sku_changes()
+    return jsonify({'inserted': n, 'status': 'ok'})
+
+
+@app.route('/api/crm/distribution-additions', methods=['GET'])
+def api_crm_distribution_additions():
+    """Stores that ADDED our tracked SKUs to distribution in the last N days.
+
+    Query params:
+      days (default 60)
+      sku (optional) — filter to one tracked SKU
+      brand (optional) — filter to brand
+    """
+    days = int(request.args.get('days', 60))
+    sku_filter = request.args.get('sku', '').strip()
+    brand_filter = request.args.get('brand', '').strip().lower()
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = [f"c.change_type IN ('NEW_LISTING','RELISTED')",
+             f"c.change_date >= {ph}"]
+    params = [since]
+    if sku_filter:
+        where.append(f"c.sku = {ph}")
+        params.append(sku_filter.zfill(7))
+
+    q = f"""
+        SELECT c.sku, c.store_number, c.change_date, c.old_status, c.new_status, c.change_type,
+               s.account, s.city, s.postal, s.rep, s.priority,
+               t.name AS territory_name, COALESCE(t.color, '#888') AS territory_color,
+               -- current on_hand from latest snapshot
+               (SELECT i2.on_hand FROM sod_inventory i2
+                  WHERE i2.sku = c.sku AND i2.store_number = c.store_number
+                  ORDER BY i2.snapshot_date DESC LIMIT 1) AS current_on_hand,
+               (SELECT i2.status FROM sod_inventory i2
+                  WHERE i2.sku = c.sku AND i2.store_number = c.store_number
+                  ORDER BY i2.snapshot_date DESC LIMIT 1) AS current_status
+        FROM sod_store_sku_changes c
+        LEFT JOIN stores s ON s.store_number = c.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE {' AND '.join(where)}
+        ORDER BY c.change_date DESC, c.sku, c.store_number
+        LIMIT 1000
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+
+    out = []
+    for r in rows:
+        sku = r[0]
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        if brand_filter and brand_filter not in brand.lower():
+            continue
+        out.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': pname,
+            'store_number': r[1],
+            'change_date': str(r[2]),
+            'old_status': r[3],
+            'new_status': r[4],
+            'change_type': r[5],
+            'account': r[6],
+            'city': r[7],
+            'postal': r[8],
+            'rep': r[9],
+            'priority': r[10],
+            'territory_name': r[11] or 'Unassigned',
+            'territory_color': r[12],
+            'current_on_hand': r[13] or 0,
+            'current_status': r[14],
+        })
+    # Per-SKU summary
+    by_sku: dict = {}
+    for o in out:
+        k = o['sku']
+        by_sku.setdefault(k, {
+            'sku': k,
+            'brand': o['brand'],
+            'product_name': o['product_name'],
+            'count': 0,
+            'still_listed': 0,
+            'lost_again': 0,
+        })
+        by_sku[k]['count'] += 1
+        if o['current_status'] == 'L':
+            by_sku[k]['still_listed'] += 1
+        else:
+            by_sku[k]['lost_again'] += 1
+    return jsonify({
+        'days': days,
+        'since': since,
+        'total': len(out),
+        'per_sku': list(by_sku.values()),
+        'additions': out,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/brand/<brand>', methods=['GET'])
+def api_crm_brand(brand):
+    """Combined distribution health for one brand (e.g. 'NB Distillers' covers
+    Red Admiral + Chak De together).
+
+    Returns per-SKU rollup + combined-brand metrics + recent additions/losses
+    (last 60 days) + per-store matrix (which stores carry which of our SKUs).
+    """
+    brand_clean = brand.replace('-', ' ').strip().lower()
+    # Match SKUs by brand
+    matched = [(sku, b, n) for sku, (b, n) in SOD_TRACKED_SKUS.items()
+               if b.lower() == brand_clean or brand_clean in b.lower()]
+    if not matched:
+        return jsonify({'error': f'No tracked SKUs found for brand {brand}'}), 404
+    skus = [s for s, _, _ in matched]
+    brand_canonical = matched[0][1]
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(skus))
+
+    # Per-SKU rollup at latest snapshot per-SKU
+    per_sku_summary = []
+    for sku, b, n in matched:
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s",
+                (sku,),
+            )
+            latest = cur.fetchone()[0]
+            cur.close()
+        else:
+            latest = db.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = ?",
+                (sku,),
+            ).fetchone()[0]
+        if not latest:
+            per_sku_summary.append({
+                'sku': sku, 'brand': b, 'product_name': n,
+                'snapshot_date': None, 'listed': 0, 'delisting': 0,
+                'fully_delisted': 0, 'total_on_hand': 0,
+            })
+            continue
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0) "
+                "FROM sod_inventory WHERE sku = %s AND snapshot_date = %s",
+                (sku, latest),
+            )
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0) "
+                "FROM sod_inventory WHERE sku = ? AND snapshot_date = ?",
+                (sku, latest),
+            ).fetchone()
+        per_sku_summary.append({
+            'sku': sku, 'brand': b, 'product_name': n,
+            'snapshot_date': str(latest),
+            'listed': int(r[0] or 0),
+            'delisting': int(r[1] or 0),
+            'fully_delisted': int(r[2] or 0),
+            'total_on_hand': int(r[3] or 0),
+        })
+
+    # Per-store matrix: which of our SKUs does each store carry, at status='L'?
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""WITH latest_per_sku AS (
+                    SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.store_number, i.sku, i.status, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date
+                LEFT JOIN stores s ON s.store_number = i.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE i.sku IN ({phs})""",
+            skus + skus,
+        )
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(
+            f"""WITH latest_per_sku AS (
+                    SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.store_number, i.sku, i.status, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date
+                LEFT JOIN stores s ON s.store_number = i.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE i.sku IN ({phs})""",
+            skus + skus,
+        ).fetchall()
+
+    matrix: dict = {}
+    for r in rows:
+        store, sku, st, oh, account, city, terr_name, terr_color = r
+        if store not in matrix:
+            matrix[store] = {
+                'store_number': store, 'account': account, 'city': city,
+                'territory_name': terr_name, 'territory_color': terr_color,
+                'skus': {},
+            }
+        matrix[store]['skus'][sku] = {'status': st, 'on_hand': oh or 0}
+
+    # Compute brand-level metrics from matrix
+    stores_with_any_listed = sum(
+        1 for s in matrix.values()
+        if any(v['status'] == 'L' for v in s['skus'].values())
+    )
+    stores_with_all_listed = sum(
+        1 for s in matrix.values()
+        if all(s['skus'].get(sku, {}).get('status') == 'L' for sku in skus)
+    )
+    stores_with_any_delisting = sum(
+        1 for s in matrix.values()
+        if any(v['status'] in ('D', 'F') for v in s['skus'].values())
+    )
+
+    # Recent additions/losses (last 60 days) for these SKUs
+    since = (_toronto_today() - timedelta(days=60)).isoformat()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT change_type, COUNT(*) FROM sod_store_sku_changes
+                WHERE sku IN ({phs}) AND change_date >= {ph}
+                GROUP BY change_type""",
+            skus + [since],
+        )
+        type_counts = {r[0]: int(r[1]) for r in cur.fetchall()}
+        cur.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       c.old_status, c.new_status, s.account, s.city
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                WHERE c.sku IN ({phs}) AND c.change_date >= {ph}
+                ORDER BY c.change_date DESC LIMIT 50""",
+            skus + [since],
+        )
+        recent_changes = cur.fetchall()
+        cur.close()
+    else:
+        type_counts = {r[0]: int(r[1]) for r in db.execute(
+            f"""SELECT change_type, COUNT(*) FROM sod_store_sku_changes
+                WHERE sku IN ({phs}) AND change_date >= ?
+                GROUP BY change_type""",
+            skus + [since],
+        ).fetchall()}
+        recent_changes = db.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       c.old_status, c.new_status, s.account, s.city
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                WHERE c.sku IN ({phs}) AND c.change_date >= ?
+                ORDER BY c.change_date DESC LIMIT 50""",
+            skus + [since],
+        ).fetchall()
+
+    return jsonify({
+        'brand': brand_canonical,
+        'skus': skus,
+        'per_sku': per_sku_summary,
+        'totals': {
+            'total_stores_with_any_listed': stores_with_any_listed,
+            'total_stores_with_all_listed': stores_with_all_listed,
+            'total_stores_with_any_delisting': stores_with_any_delisting,
+            'total_stores_in_matrix': len(matrix),
+        },
+        'matrix': list(matrix.values()),
+        'recent_changes_60d': {
+            'counts': type_counts,
+            'recent': [{
+                'sku': r[0], 'store_number': r[1], 'change_date': str(r[2]),
+                'change_type': r[3], 'old_status': r[4], 'new_status': r[5],
+                'account': r[6], 'city': r[7],
+            } for r in recent_changes],
+        },
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/brands', methods=['GET'])
+def api_crm_brands_list():
+    """List all brands we track + KPIs per brand."""
+    brand_skus: dict = {}
+    for sku, (b, n) in SOD_TRACKED_SKUS.items():
+        brand_skus.setdefault(b, []).append({'sku': sku, 'product_name': n})
+    out = []
+    for brand, skus in brand_skus.items():
+        sku_list = [s['sku'] for s in skus]
+        # Per-brand: total listed stores at latest per-SKU snapshot
+        db = get_db()
+        ph = '%s' if USE_POSTGRES else '?'
+        phs = ','.join([ph] * len(sku_list))
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""WITH latest_per_sku AS (
+                        SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+                        WHERE sku IN ({phs}) GROUP BY sku
+                    )
+                    SELECT
+                        SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN i.status='D' THEN 1 ELSE 0 END),
+                        COALESCE(SUM(i.on_hand), 0),
+                        COUNT(DISTINCT i.store_number)
+                    FROM sod_inventory i
+                    JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date""",
+                sku_list,
+            )
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(
+                f"""WITH latest_per_sku AS (
+                        SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+                        WHERE sku IN ({phs}) GROUP BY sku
+                    )
+                    SELECT
+                        SUM(CASE WHEN i.status='L' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN i.status='D' THEN 1 ELSE 0 END),
+                        COALESCE(SUM(i.on_hand), 0),
+                        COUNT(DISTINCT i.store_number)
+                    FROM sod_inventory i
+                    JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date""",
+                sku_list,
+            ).fetchone()
+        # Recent additions in last 60d
+        since = (_toronto_today() - timedelta(days=60)).isoformat()
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""SELECT COUNT(*) FROM sod_store_sku_changes
+                    WHERE sku IN ({phs})
+                    AND change_type IN ('NEW_LISTING','RELISTED')
+                    AND change_date >= %s""",
+                sku_list + [since],
+            )
+            additions = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            additions = int(db.execute(
+                f"""SELECT COUNT(*) FROM sod_store_sku_changes
+                    WHERE sku IN ({phs})
+                    AND change_type IN ('NEW_LISTING','RELISTED')
+                    AND change_date >= ?""",
+                sku_list + [since],
+            ).fetchone()[0] or 0)
+        out.append({
+            'brand': brand,
+            'slug': brand.lower().replace(' ', '-'),
+            'sku_count': len(sku_list),
+            'skus': skus,
+            'total_listed': int(r[0] or 0),
+            'total_delisting': int(r[1] or 0),
+            'total_on_hand': int(r[2] or 0),
+            'total_stores': int(r[3] or 0),
+            'additions_60d': additions,
+        })
+    return jsonify({'brands': out})
+
+
 @app.route('/api/crm/portfolio-trend', methods=['GET'])
 def api_crm_portfolio_trend():
     """One time-series across ALL tracked SKUs, per snapshot_date.
@@ -7451,6 +8064,13 @@ refresh_sod_product_categories()
 # Sprint 0: cleanup orphaned 'running' SOD runs from prior crashes (e.g. OOM kills).
 # This makes /api/sod/status accurate and avoids stuck rows polluting the dashboard.
 _cleanup_orphaned_sod_runs(max_age_hours=6)
+# Sprint 4: backfill per-store SKU change events from historical snapshots so the
+# /distribution-additions + brand drill-downs have data immediately on first deploy.
+# Idempotent: re-running is safe (UNIQUE constraint).
+try:
+    _backfill_store_sku_changes()
+except Exception as _e:
+    print(f'[backfill] error during startup backfill: {_e}')
 start_sod_scheduler()
 start_lcbo_scheduler()
 
