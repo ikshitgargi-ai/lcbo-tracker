@@ -5631,6 +5631,116 @@ def api_crm_store_trend(store_number):
     })
 
 
+@app.route('/api/crm/portfolio-trend', methods=['GET'])
+def api_crm_portfolio_trend():
+    """One time-series across ALL tracked SKUs, per snapshot_date.
+
+    Powers the dashboard hero chart. Returns one row per date with:
+      total_listed (sum of stores carrying any tracked SKU at status='L'),
+      total_delisting, total_fully_delisted, total_on_hand,
+      tracked_skus_with_data (how many of our 8 SKUs had data that day).
+    """
+    days = int(request.args.get('days', 30))
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    if not tracked:
+        return jsonify({'series': []})
+    phs = ','.join([ph] * len(tracked))
+    q = f"""
+        SELECT snapshot_date,
+               SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed,
+               SUM(CASE WHEN status='D' THEN 1 ELSE 0 END) AS delisting,
+               SUM(CASE WHEN status='F' THEN 1 ELSE 0 END) AS fully_delisted,
+               COALESCE(SUM(on_hand), 0) AS total_on_hand,
+               COUNT(DISTINCT sku) AS skus_with_data
+        FROM sod_inventory
+        WHERE sku IN ({phs}) AND snapshot_date >= {ph}
+        GROUP BY snapshot_date
+        ORDER BY snapshot_date
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, tracked + [since])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, tracked + [since]).fetchall()
+    return jsonify({
+        'days': days,
+        'since': since,
+        'series': [{
+            'date': str(r[0]),
+            'listed': int(r[1] or 0),
+            'delisting': int(r[2] or 0),
+            'fully_delisted': int(r[3] or 0),
+            'total_on_hand': int(r[4] or 0),
+            'skus_with_data': int(r[5] or 0),
+        } for r in rows],
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/sod/ingest-calendar', methods=['GET'])
+def api_sod_ingest_calendar():
+    """Last N days: which days have a SOD snapshot ingested? For the SOD page strip.
+
+    Each day: { date, snapshot_date_present, latest_run_at, success_count, fail_count, sources }
+    """
+    days = int(request.args.get('days', 14))
+    db = get_db()
+    today = _toronto_today()
+    out = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        d_str = d.isoformat()
+        # Did we ingest a snapshot for this date in either source?
+        ph = '%s' if USE_POSTGRES else '?'
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date = %s LIMIT 1",
+                (d_str,),
+            )
+            has_data = cur.fetchone()[0] > 0
+            cur.execute(
+                "SELECT MAX(run_at), COUNT(CASE WHEN status='success' THEN 1 END), "
+                "COUNT(CASE WHEN status='failed' THEN 1 END), "
+                "STRING_AGG(DISTINCT source, ',') "
+                "FROM sod_sync_runs WHERE DATE(run_at) = %s",
+                (d_str,),
+            )
+            r = cur.fetchone()
+            cur.close()
+            latest_run, success, fails, sources = (r[0], r[1] or 0, r[2] or 0, r[3] or '')
+        else:
+            r0 = db.execute(
+                "SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date = ? LIMIT 1",
+                (d_str,),
+            ).fetchone()
+            has_data = r0[0] > 0
+            r = db.execute(
+                "SELECT MAX(run_at), COUNT(CASE WHEN status='success' THEN 1 END), "
+                "COUNT(CASE WHEN status='failed' THEN 1 END), "
+                "GROUP_CONCAT(DISTINCT source) "
+                "FROM sod_sync_runs WHERE DATE(run_at) = ?",
+                (d_str,),
+            ).fetchone()
+            latest_run, success, fails, sources = (r[0], r[1] or 0, r[2] or 0, r[3] or '')
+        out.append({
+            'date': d_str,
+            'weekday': d.strftime('%a'),
+            'has_snapshot': has_data,
+            'latest_run_at': str(latest_run) if latest_run else None,
+            'success_runs': success,
+            'failed_runs': fails,
+            'sources': sources or '',
+            'is_today': i == 0,
+        })
+    return jsonify({'days': days, 'calendar': out})
+
+
 @app.route('/api/crm/wow-deltas', methods=['GET'])
 def api_crm_wow_deltas():
     """Per-tracked-SKU comparison: latest vs 7d ago vs 30d ago vs 365d ago.
