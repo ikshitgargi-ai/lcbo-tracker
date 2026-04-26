@@ -5866,6 +5866,193 @@ def api_crm_backfill_store_changes():
     return jsonify({'inserted': n, 'status': 'ok'})
 
 
+@app.route('/api/crm/log-listing', methods=['POST'])
+def api_crm_log_listing():
+    """Manual listing event — rep marks a NEW_LISTING they know about before SOD detects it.
+
+    Body: {sku, store_number, change_date (optional, defaults today), source (optional)}
+    Inserts directly into sod_store_sku_changes with change_type='NEW_LISTING'.
+    Idempotent via UNIQUE constraint.
+    """
+    body = request.get_json(silent=True) or {}
+    sku = (body.get('sku') or '').strip()
+    store_number = body.get('store_number')
+    change_date = body.get('change_date') or _toronto_today().isoformat()
+    if not sku or not store_number:
+        return jsonify({'error': 'sku + store_number required'}), 400
+    sku_norm = sku.zfill(7)
+    if sku_norm not in SOD_TRACKED_SKUS:
+        return jsonify({'error': f'sku {sku_norm} is not tracked'}), 400
+
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            """INSERT INTO sod_store_sku_changes
+               (sku, store_number, change_date, old_status, new_status, change_type)
+               VALUES (%s, %s, %s, NULL, 'L', 'NEW_LISTING')
+               ON CONFLICT (sku, store_number, change_date, change_type) DO NOTHING
+               RETURNING id""",
+            (sku_norm, int(store_number), change_date),
+        )
+        r = cur.fetchone()
+        db.commit()
+        cur.close()
+        new_id = r[0] if r else None
+    else:
+        c = db.execute(
+            """INSERT INTO sod_store_sku_changes
+               (sku, store_number, change_date, old_status, new_status, change_type)
+               VALUES (?, ?, ?, NULL, 'L', 'NEW_LISTING')
+               ON CONFLICT(sku, store_number, change_date, change_type) DO NOTHING""",
+            (sku_norm, int(store_number), change_date),
+        )
+        db.commit()
+        new_id = c.lastrowid
+    brand, name = SOD_TRACKED_SKUS[sku_norm]
+    return jsonify({
+        'status': 'ok' if new_id else 'duplicate_ignored',
+        'id': new_id,
+        'sku': sku_norm,
+        'brand': brand,
+        'product_name': name,
+        'store_number': int(store_number),
+        'change_date': change_date,
+    })
+
+
+@app.route('/api/crm/inventory-adds', methods=['GET'])
+def api_crm_inventory_adds():
+    """Stores where on_hand jumped from 0 (or no row) to >0 in last N days for tracked SKUs.
+
+    Detects new shipments — distinct from NEW_LISTING (which is a status change).
+    Cross-references sod_inventory snapshots: for each (sku, store), find dates where
+    on_hand transitioned from 0/missing to a positive number.
+
+    Query params: days (default 60, max 120)
+    """
+    days = min(int(request.args.get('days', 60)), 120)
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    sku_filter = (request.args.get('sku') or '').strip()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    tracked = [sku_filter.zfill(7)] if sku_filter else list(SOD_TRACKED_SKUS.keys())
+    phs = ','.join([ph] * len(tracked))
+
+    # For each (sku, store) pair, walk snapshots in date order and find 0→positive transitions.
+    # Use a window function to compare each row to its previous snapshot.
+    if USE_POSTGRES:
+        q = f"""
+            WITH ranked AS (
+                SELECT sku, store_number, snapshot_date, on_hand,
+                       LAG(on_hand) OVER (PARTITION BY sku, store_number ORDER BY snapshot_date) AS prev_oh,
+                       LAG(snapshot_date) OVER (PARTITION BY sku, store_number ORDER BY snapshot_date) AS prev_date
+                FROM sod_inventory
+                WHERE sku IN ({phs})
+            )
+            SELECT r.sku, r.store_number, r.snapshot_date, r.on_hand, r.prev_oh, r.prev_date,
+                   s.account, s.city, s.postal, s.rep, t.name, COALESCE(t.color, '#888')
+            FROM ranked r
+            LEFT JOIN stores s ON s.store_number = r.store_number
+            LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE r.snapshot_date >= {ph}
+              AND r.on_hand > 0
+              AND (r.prev_oh = 0 OR r.prev_oh IS NULL)
+              AND r.prev_date IS NOT NULL
+            ORDER BY r.snapshot_date DESC, r.on_hand DESC
+            LIMIT 500
+        """
+        cur = db.cursor()
+        cur.execute(q, tracked + [since])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        # SQLite supports LAG window function in 3.25+
+        q = f"""
+            WITH ranked AS (
+                SELECT sku, store_number, snapshot_date, on_hand,
+                       LAG(on_hand) OVER (PARTITION BY sku, store_number ORDER BY snapshot_date) AS prev_oh,
+                       LAG(snapshot_date) OVER (PARTITION BY sku, store_number ORDER BY snapshot_date) AS prev_date
+                FROM sod_inventory
+                WHERE sku IN ({phs})
+            )
+            SELECT r.sku, r.store_number, r.snapshot_date, r.on_hand, r.prev_oh, r.prev_date,
+                   s.account, s.city, s.postal, s.rep, t.name, COALESCE(t.color, '#888')
+            FROM ranked r
+            LEFT JOIN stores s ON s.store_number = r.store_number
+            LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE r.snapshot_date >= ?
+              AND r.on_hand > 0
+              AND (r.prev_oh = 0 OR r.prev_oh IS NULL)
+              AND r.prev_date IS NOT NULL
+            ORDER BY r.snapshot_date DESC, r.on_hand DESC
+            LIMIT 500
+        """
+        rows = db.execute(q, tracked + [since]).fetchall()
+
+    out = []
+    for r in rows:
+        sku, store, snap, oh, prev_oh, prev_date, account, city, postal, rep, terr_name, terr_color = r
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        out.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': pname,
+            'store_number': store,
+            'snapshot_date': str(snap),
+            'on_hand': int(oh or 0),
+            'prev_on_hand': int(prev_oh or 0),
+            'prev_date': str(prev_date) if prev_date else None,
+            'jump': int(oh or 0) - int(prev_oh or 0),
+            'account': account,
+            'city': city,
+            'postal': postal,
+            'rep': rep,
+            'territory_name': terr_name or 'Unassigned',
+            'territory_color': terr_color or '#888',
+        })
+
+    # Per-SKU rollup
+    by_sku = {}
+    for o in out:
+        k = o['sku']
+        agg = by_sku.setdefault(k, {
+            'sku': k, 'brand': o['brand'], 'product_name': o['product_name'],
+            'event_count': 0, 'unique_stores': set(), 'total_units_added': 0,
+        })
+        agg['event_count'] += 1
+        agg['unique_stores'].add(o['store_number'])
+        agg['total_units_added'] += o['jump']
+    per_sku = [
+        {**v, 'unique_stores': len(v['unique_stores'])}
+        for v in by_sku.values()
+    ]
+
+    # Available data window
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MIN(snapshot_date), MAX(snapshot_date), COUNT(DISTINCT snapshot_date) FROM sod_inventory")
+        r = cur.fetchone()
+        cur.close()
+    else:
+        r = db.execute(
+            "SELECT MIN(snapshot_date), MAX(snapshot_date), COUNT(DISTINCT snapshot_date) FROM sod_inventory"
+        ).fetchone()
+    earliest, latest, days_available = (str(r[0]) if r[0] else None, str(r[1]) if r[1] else None, int(r[2] or 0))
+
+    return jsonify({
+        'days_requested': days,
+        'days_of_history_available': days_available,
+        'earliest_snapshot': earliest,
+        'latest_snapshot': latest,
+        'since': since,
+        'total': len(out),
+        'per_sku': per_sku,
+        'events': out,
+        'freshness': _sod_freshness(),
+    })
+
+
 @app.route('/api/crm/distribution-additions', methods=['GET'])
 def api_crm_distribution_additions():
     """Stores that ADDED our tracked SKUs to distribution in the last N days.
@@ -5957,8 +6144,25 @@ def api_crm_distribution_additions():
             by_sku[k]['still_listed'] += 1
         else:
             by_sku[k]['lost_again'] += 1
+    # Available data window
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MIN(snapshot_date), MAX(snapshot_date), COUNT(DISTINCT snapshot_date) FROM sod_inventory")
+        rr = cur.fetchone()
+        cur.close()
+    else:
+        rr = db.execute(
+            "SELECT MIN(snapshot_date), MAX(snapshot_date), COUNT(DISTINCT snapshot_date) FROM sod_inventory"
+        ).fetchone()
+    earliest = str(rr[0]) if rr[0] else None
+    latest = str(rr[1]) if rr[1] else None
+    days_available = int(rr[2] or 0)
+
     return jsonify({
-        'days': days,
+        'days_requested': days,
+        'days_of_history_available': days_available,
+        'earliest_snapshot': earliest,
+        'latest_snapshot': latest,
         'since': since,
         'total': len(out),
         'per_sku': list(by_sku.values()),
