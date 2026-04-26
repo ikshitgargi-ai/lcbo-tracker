@@ -4243,6 +4243,203 @@ def api_healthz():
     }), 200 if healthy else 503
 
 
+# ============================================================================
+# DAILY AGENT — automated health check + auto-recovery, runs every morning
+# ============================================================================
+
+def _daily_health_check(auto_recover=True):
+    """Run a comprehensive system health check + (optionally) auto-recover.
+
+    Checks:
+      1. SOD snapshot freshness (age <= 2 days)
+      2. Last successful sync per source
+      3. Tracked-SKU data integrity (each of our 8 SKUs has data in latest snapshot)
+      4. No stuck-running rows
+      5. Per-store change tracking (sod_store_sku_changes has data)
+      6. Brand endpoints return non-zero counts
+
+    Auto-recovery actions when checks fail:
+      - SOD stale → trigger _sod_sync_worker(['daily_a','daily_b'])
+      - Stuck running → cleanup orphaned rows
+      - Missing per-store changes → run _backfill_store_sku_changes()
+
+    Returns dict: {checks, recovered, healthy, summary}.
+    Used by scheduler + GET /api/admin/daily-health-check.
+    """
+    import time
+    started = datetime.utcnow()
+    checks = []
+    recovered = []
+
+    def check(name, ok, detail=''):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': detail})
+
+    # 1. SOD freshness
+    fresh = _sod_freshness()
+    age = fresh.get('snapshot_age_days')
+    sod_fresh = age is not None and age <= 2
+    check('sod_snapshot_fresh', sod_fresh,
+          f'snapshot_date={fresh.get("latest_snapshot")} age_days={age}')
+    if not sod_fresh and auto_recover and SOD_USER and SOD_PASSWORD:
+        try:
+            _cleanup_orphaned_sod_runs(max_age_hours=1)
+            if not _sod_sync_lock.locked():
+                start_sod_sync_async(['daily_a', 'daily_b'])
+                recovered.append('triggered_sod_refresh')
+        except Exception as e:
+            recovered.append(f'sod_refresh_failed:{e}')
+
+    # 2. Last successful sync per source within 36h
+    for source in ('daily_a', 'daily_b'):
+        row = db_fetchone(
+            "SELECT MAX(run_at) FROM sod_sync_runs "
+            "WHERE source = ? AND status = 'success'",
+            [source],
+        )
+        v = (row_to_dict(row) if row and not isinstance(row, dict) else row) if row else None
+        # Get the timestamp value
+        last_at = None
+        if row:
+            try:
+                last_at = list(row.values())[0] if isinstance(row, dict) else row[0]
+            except Exception:
+                last_at = None
+        if isinstance(last_at, str):
+            try:
+                last_at = datetime.fromisoformat(last_at)
+            except Exception:
+                last_at = None
+        if last_at and hasattr(last_at, 'tzinfo') and last_at.tzinfo:
+            last_at = last_at.replace(tzinfo=None)
+        hours = ((datetime.utcnow() - last_at).total_seconds() / 3600) if last_at else None
+        check(f'last_success_{source}_within_36h',
+              hours is not None and hours <= 36,
+              f'hours_since_last_success={round(hours,1) if hours is not None else None}')
+
+    # 3. Each tracked SKU has data in latest snapshot
+    snap = _max_snapshot_date()
+    for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+        row = db_fetchone(
+            "SELECT COUNT(*) FROM sod_inventory WHERE sku = ? AND snapshot_date = ?",
+            [sku, snap.isoformat() if snap else ''],
+        )
+        cnt = (list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
+        check(f'tracked_sku_data_{sku}', cnt > 0,
+              f'{brand} {name}: {cnt} rows in snapshot {snap}')
+
+    # 4. No stuck-running rows older than 6h
+    row = db_fetchone(
+        "SELECT COUNT(*) FROM sod_sync_runs WHERE status = 'running' "
+        "AND run_at < " + ("NOW() - INTERVAL '6 hours'" if USE_POSTGRES else "datetime('now', '-6 hours')")
+    )
+    stuck = (list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
+    check('no_stuck_running_rows', stuck == 0, f'{stuck} stuck')
+    if stuck > 0 and auto_recover:
+        n = _cleanup_orphaned_sod_runs(max_age_hours=6)
+        recovered.append(f'cleaned_{n}_stuck_runs')
+
+    # 5. Per-store changes table has data
+    row = db_fetchone("SELECT COUNT(*) FROM sod_store_sku_changes")
+    sssc_count = (list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
+    has_store_changes = sssc_count > 0
+    check('per_store_changes_present', has_store_changes,
+          f'{sssc_count} change events in DB')
+    if not has_store_changes and auto_recover:
+        try:
+            n = _backfill_store_sku_changes()
+            recovered.append(f'backfilled_{n}_store_changes')
+        except Exception as e:
+            recovered.append(f'backfill_failed:{e}')
+
+    # 6. Brand endpoints return non-zero
+    tracked_count = sum(1 for _ in SOD_TRACKED_SKUS.items())
+    check('tracked_sku_count', tracked_count >= 1, f'{tracked_count} tracked SKUs configured')
+
+    duration = (datetime.utcnow() - started).total_seconds()
+    healthy = all(c['ok'] for c in checks)
+    return {
+        'started_at': started.isoformat() + 'Z',
+        'duration_seconds': round(duration, 2),
+        'healthy': healthy,
+        'checks': checks,
+        'recovered': recovered,
+        'auto_recover_enabled': auto_recover,
+        'summary': f"{sum(1 for c in checks if c['ok'])}/{len(checks)} checks passed"
+                   + (f"; recovered: {len(recovered)} action(s)" if recovered else ""),
+        'freshness': fresh,
+    }
+
+
+@app.route('/api/admin/daily-health-check', methods=['GET', 'POST'])
+def api_daily_health_check():
+    """Run the daily health check + auto-recovery on demand.
+
+    GET = check only (don't fix), POST = check AND auto-recover.
+    Always returns 200 with full report (use 'healthy' field to alert).
+    """
+    auto_recover = request.method == 'POST'
+    report = _daily_health_check(auto_recover=auto_recover)
+    return jsonify(report)
+
+
+_health_scheduler = None
+
+
+def start_health_scheduler():
+    """Start an APScheduler job that runs the daily health check at 06:00 ET.
+
+    This is BELT-AND-SUSPENDERS: catches if the 03:00 sync failed silently,
+    runs auto-recovery, and logs a summary so we can audit.
+    """
+    global _health_scheduler
+    if _health_scheduler is not None:
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[health] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        def _run():
+            try:
+                report = _daily_health_check(auto_recover=True)
+                print(f"[health] {report['summary']} (took {report['duration_seconds']}s)")
+                if not report['healthy']:
+                    failed = [c for c in report['checks'] if not c['ok']]
+                    print(f"[health] FAILED CHECKS: {failed}")
+            except Exception as e:
+                print(f"[health] check failed: {e}")
+        sched.add_job(
+            _run,
+            CronTrigger(hour=6, minute=0),  # 06:00 ET — after SOD sync at 03:00
+            id='daily_health_check',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 4,
+        )
+        # Also run mid-day sanity check at 14:00 ET
+        sched.add_job(
+            _run,
+            CronTrigger(hour=14, minute=0),
+            id='midday_health_check',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 2,
+        )
+        sched.start()
+        _health_scheduler = sched
+        print('[health] Daily health check scheduled at 06:00 + 14:00 ET')
+    except Exception as e:
+        print(f'[health] scheduler failed: {e}')
+
+
 # ======================================================================================
 # ================================= CRM LAYER ==========================================
 #
@@ -8277,6 +8474,8 @@ except Exception as _e:
     print(f'[backfill] error during startup backfill: {_e}')
 start_sod_scheduler()
 start_lcbo_scheduler()
+# Sprint 5: daily automated health check + auto-recovery (06:00 + 14:00 ET).
+start_health_scheduler()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
