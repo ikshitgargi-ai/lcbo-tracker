@@ -659,10 +659,40 @@ def init_db():
             ('activities', 'horeca_account_id', "INTEGER"),
             ('activities', 'lat', "REAL DEFAULT 0"),  # GPS where visit was logged
             ('activities', 'lng', "REAL DEFAULT 0"),
+            # Sprint 6: storage backbone — backdating + soft-delete + provenance
+            ('activities', 'visit_date', "DATE"),  # When visit ACTUALLY happened (vs when logged)
+            ('activities', 'deleted_at', "TIMESTAMP"),  # Soft-delete timestamp; NEVER hard-delete
+            ('activities', 'updated_at', "TIMESTAMP DEFAULT NOW()"),
         ]
         for table, col, coltype in crm_migrate_cols:
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+
+        # Sprint 6: append-only audit log of EVERY mutation
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS event_log (
+                id BIGSERIAL PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                actor TEXT DEFAULT '',
+                payload_json TEXT DEFAULT '',
+                ip_address TEXT DEFAULT '',
+                user_agent TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_event_log_entity ON event_log(entity_type, entity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_event_log_at ON event_log(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_activities_visit_date ON activities(visit_date)",
+            "CREATE INDEX IF NOT EXISTS idx_activities_deleted_at ON activities(deleted_at)",
+        ]:
+            try:
+                cur.execute(idx)
             except Exception:
                 pass
 
@@ -982,10 +1012,39 @@ def init_db():
             ('activities', 'horeca_account_id', "INTEGER"),
             ('activities', 'lat', "REAL DEFAULT 0"),
             ('activities', 'lng', "REAL DEFAULT 0"),
+            # Sprint 6: storage backbone
+            ('activities', 'visit_date', "TEXT"),
+            ('activities', 'deleted_at', "TIMESTAMP"),
+            ('activities', 'updated_at', "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
         ]
         for table, col, coltype in migrate_cols:
             try:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+        # Append-only audit log
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS event_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                actor TEXT DEFAULT '',
+                payload_json TEXT DEFAULT '',
+                ip_address TEXT DEFAULT '',
+                user_agent TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_event_log_entity ON event_log(entity_type, entity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_event_log_at ON event_log(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_activities_visit_date ON activities(visit_date)",
+            "CREATE INDEX IF NOT EXISTS idx_activities_deleted_at ON activities(deleted_at)",
+        ]:
+            try:
+                db.execute(idx)
             except Exception:
                 pass
         db.commit()
@@ -4435,6 +4494,30 @@ def start_health_scheduler():
                 if not report['healthy']:
                     failed = [c for c in report['checks'] if not c['ok']]
                     print(f"[health] FAILED CHECKS: {failed}")
+                    # Webhook alert (Slack/Discord/Make/Zapier — set ALERT_WEBHOOK_URL env var)
+                    webhook = os.environ.get('ALERT_WEBHOOK_URL', '').strip()
+                    if webhook and http_requests:
+                        try:
+                            http_requests.post(
+                                webhook,
+                                json={
+                                    'text': f"LCBO Tracker health check FAILED: {report['summary']}",
+                                    'attachments': [{
+                                        'color': 'danger',
+                                        'title': 'Failed checks',
+                                        'text': '\n'.join(
+                                            f"• {c['name']}: {c['detail']}" for c in failed
+                                        ),
+                                        'fields': [{
+                                            'title': 'Recovered actions',
+                                            'value': ', '.join(report.get('recovered', [])) or 'none',
+                                        }],
+                                    }],
+                                },
+                                timeout=10,
+                            )
+                        except Exception as we:
+                            print(f"[health] webhook failed: {we}")
             except Exception as e:
                 print(f"[health] check failed: {e}")
         sched.add_job(
@@ -7938,16 +8021,21 @@ def api_crm_activities_create():
     if not rep_id:
         return jsonify({'error': 'rep required'}), 400
 
+    # Sprint 6: visit_date allows backdating — rep can log a visit that already
+    # happened. Defaults to today if not provided.
+    visit_date = d.get('visit_date') or _toronto_today().isoformat()
+
     insert_cols = ['store_id', 'rep_id', 'activity_type', 'notes', 'rep',
                    'outcome', 'duration_minutes', 'rating',
                    'next_action', 'next_action_date', 'horeca_account_id',
-                   'lat', 'lng']
+                   'lat', 'lng', 'visit_date']
     vals = (
         store_id, rep_id, activity_type, d.get('notes', ''), rep_name,
         d.get('outcome', ''), int(d.get('duration_minutes') or 0), int(d.get('rating') or 0),
         d.get('next_action', ''), d.get('next_action_date') or None,
         d.get('horeca_account_id'),
         float(d.get('lat') or 0), float(d.get('lng') or 0),
+        visit_date,
     )
     if USE_POSTGRES:
         cur = db.cursor()
@@ -7965,6 +8053,13 @@ def api_crm_activities_create():
         )
         activity_id = c.lastrowid
         db.commit()
+    # Audit log
+    try:
+        _log_event('activity_created', 'activity', str(activity_id), rep_name,
+                   {'activity_type': activity_type, 'store_number': store_number,
+                    'visit_date': visit_date, 'sku_outcomes_count': len(d.get('sku_outcomes') or [])})
+    except Exception:
+        pass
 
     # Per-SKU outcomes → activity_sku_outcomes rows
     sku_outcomes = d.get('sku_outcomes') or []
@@ -8523,6 +8618,226 @@ def _lcbo_daily_scrape_worker():
               f'found {discoveries} discoveries (lcbo.com live but SOD blank/F)')
     except Exception as e:
         print(f'[LCBO-live] scrape failed: {e}')
+
+
+def _log_event(event_type, entity_type, entity_id, actor, payload=None):
+    """Append-only audit log. Never throws — failures shouldn't block writes.
+
+    event_type: e.g. 'activity_created', 'deal_advanced', 'listing_marked'
+    entity_type: 'activity' / 'deal' / 'store' / 'sku' etc.
+    entity_id:   the ID or natural key
+    actor:       who did it (rep name)
+    payload:     dict, will be JSON-encoded
+    """
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO event_log (event_type, entity_type, entity_id, actor, "
+                "payload_json, ip_address, user_agent) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (event_type, entity_type, str(entity_id) if entity_id is not None else None,
+                 actor or '', json.dumps(payload) if payload else '',
+                 request.headers.get('X-Forwarded-For', request.remote_addr or '')[:50] if request else '',
+                 (request.headers.get('User-Agent', '') if request else '')[:200]),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO event_log (event_type, entity_type, entity_id, actor, "
+                "payload_json, ip_address, user_agent) VALUES (?,?,?,?,?,?,?)",
+                (event_type, entity_type, str(entity_id) if entity_id is not None else None,
+                 actor or '', json.dumps(payload) if payload else '',
+                 request.headers.get('X-Forwarded-For', request.remote_addr or '')[:50] if request else '',
+                 (request.headers.get('User-Agent', '') if request else '')[:200]),
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        # NEVER let logging block the user. Just print and move on.
+        print(f'[event_log] failed to write: {e}')
+
+
+@app.route('/api/crm/event-log', methods=['GET'])
+def api_crm_event_log():
+    """Append-only audit trail of every mutation."""
+    days = int(request.args.get('days', 30))
+    entity_type = request.args.get('entity_type', '').strip()
+    actor = request.args.get('actor', '').strip()
+    limit = int(request.args.get('limit', 500))
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = [f'created_at >= {ph}']
+    params = [since]
+    if entity_type:
+        where.append(f'entity_type = {ph}')
+        params.append(entity_type)
+    if actor:
+        where.append(f'LOWER(actor) = LOWER({ph})')
+        params.append(actor)
+    q = (f"SELECT id, event_type, entity_type, entity_id, actor, payload_json, "
+         f"ip_address, user_agent, created_at FROM event_log "
+         f"WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT {ph}")
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params + [limit])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params + [limit]).fetchall()
+    return jsonify({
+        'events': [{
+            'id': r[0], 'event_type': r[1], 'entity_type': r[2], 'entity_id': r[3],
+            'actor': r[4], 'payload_json': r[5], 'ip_address': r[6],
+            'user_agent': r[7], 'created_at': str(r[8]),
+        } for r in rows],
+        'days': days,
+        'total': len(rows),
+    })
+
+
+@app.route('/api/crm/tasting-followups', methods=['GET'])
+def api_crm_tasting_followups():
+    """Stores where a TASTING / SAMPLE was logged for a tracked SKU but the SKU
+    is NOT currently listed at that store. The follow-up opportunity list.
+
+    Joins activity_sku_outcomes (with outcomes ∈ tasting/sampled/samples_left)
+    against the latest SOD snapshot per SKU. Returns rows where current SOD
+    status is missing, 'D', or 'F'.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    days = int(request.args.get('days', 365))
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+
+    # Find activities (visits/tastings) within window, with sku_outcomes that are tasting-y
+    tasting_outcomes = ('tasting', 'sampled', 'samples_left', 'sample_drop')
+    phs = ','.join([ph] * len(tasting_outcomes))
+    q = f"""
+        SELECT
+            aso.sku, aso.outcome, aso.facings,
+            a.id AS activity_id, a.activity_type, a.notes, a.outcome AS activity_outcome,
+            a.rep, COALESCE(a.visit_date, a.created_at) AS visit_when,
+            s.id AS store_id, s.store_number, s.account, s.city, s.postal,
+            t.name AS territory_name, COALESCE(t.color, '#888') AS territory_color
+        FROM activity_sku_outcomes aso
+        JOIN activities a ON a.id = aso.activity_id
+        LEFT JOIN stores s ON s.id = a.store_id
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE a.deleted_at IS NULL
+          AND COALESCE(a.visit_date, a.created_at::date) >= {ph}
+          AND (
+            LOWER(aso.outcome) IN ({phs})
+            OR LOWER(a.activity_type) IN ('tasting', 'sample_drop')
+          )
+    """ if USE_POSTGRES else f"""
+        SELECT
+            aso.sku, aso.outcome, aso.facings,
+            a.id AS activity_id, a.activity_type, a.notes, a.outcome AS activity_outcome,
+            a.rep, COALESCE(a.visit_date, DATE(a.created_at)) AS visit_when,
+            s.id AS store_id, s.store_number, s.account, s.city, s.postal,
+            t.name AS territory_name, COALESCE(t.color, '#888') AS territory_color
+        FROM activity_sku_outcomes aso
+        JOIN activities a ON a.id = aso.activity_id
+        LEFT JOIN stores s ON s.id = a.store_id
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE a.deleted_at IS NULL
+          AND COALESCE(a.visit_date, DATE(a.created_at)) >= {ph}
+          AND (
+            LOWER(aso.outcome) IN ({phs})
+            OR LOWER(a.activity_type) IN ('tasting', 'sample_drop')
+          )
+    """
+    params = [since] + [o for o in tasting_outcomes]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, params).fetchall()
+
+    # For each tasting row, look up CURRENT SOD status of that SKU at that store
+    out = []
+    seen = set()
+    for r in rows:
+        sku, sku_outcome, facings, activity_id, atype, anotes, aoutcome, rep, visit_when, \
+            store_id, store_number, account, city, postal, terr_name, terr_color = r
+        if not store_number:
+            continue
+        # Latest SOD status for this (sku, store)
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT status, on_hand, snapshot_date FROM sod_inventory "
+                "WHERE sku = %s AND store_number = %s "
+                "ORDER BY snapshot_date DESC LIMIT 1",
+                (sku, store_number),
+            )
+            sod_row = cur.fetchone()
+            cur.close()
+        else:
+            sod_row = db.execute(
+                "SELECT status, on_hand, snapshot_date FROM sod_inventory "
+                "WHERE sku = ? AND store_number = ? "
+                "ORDER BY snapshot_date DESC LIMIT 1",
+                (sku, store_number),
+            ).fetchone()
+        current_status = sod_row[0] if sod_row else None
+        current_on_hand = (sod_row[1] or 0) if sod_row else 0
+        # Only flag if NOT currently listed (missing, D, or F)
+        if current_status == 'L':
+            continue
+        # De-dup: one entry per (store, sku) — pick the most recent tasting
+        key = (store_number, sku)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            visit_date = visit_when.isoformat() if hasattr(visit_when, 'isoformat') else str(visit_when)
+        except Exception:
+            visit_date = str(visit_when)
+        try:
+            days_since = (datetime.now() - datetime.fromisoformat(visit_date.split('T')[0])).days
+        except Exception:
+            days_since = None
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        out.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': pname,
+            'store_number': store_number,
+            'store_id': store_id,
+            'account': account,
+            'city': city,
+            'postal': postal,
+            'territory_name': terr_name or 'Unassigned',
+            'territory_color': terr_color,
+            'tasting_date': visit_date,
+            'days_since_tasting': days_since,
+            'tasting_outcome': sku_outcome,
+            'tasting_facings': facings,
+            'activity_id': activity_id,
+            'activity_type': atype,
+            'activity_outcome': aoutcome or '',
+            'activity_notes': (anotes or '')[:200],
+            'rep': rep,
+            'current_sod_status': current_status,  # None / D / F
+            'current_sod_on_hand': current_on_hand,
+            'priority_score': (
+                30 + (60 - min(days_since or 60, 60))  # newer = higher score
+                + (15 if current_status == 'D' else 0)  # delisting nudge
+                + (10 if facings and facings > 0 else 0)
+            ),
+        })
+    out.sort(key=lambda x: -(x.get('priority_score') or 0))
+    return jsonify({
+        'days': days,
+        'since': since,
+        'total': len(out),
+        'followups': out,
+    })
 
 
 @app.route('/api/crm/lcbo-live-discoveries', methods=['GET'])
