@@ -4316,16 +4316,39 @@ def _daily_health_check(auto_recover=True):
               hours is not None and hours <= 36,
               f'hours_since_last_success={round(hours,1) if hours is not None else None}')
 
-    # 3. Each tracked SKU has data in latest snapshot
-    snap = _max_snapshot_date()
+    # 3. Each tracked SKU has data in its OWN latest snapshot (within last 3 days).
+    # Why per-SKU: daily_b is agent-only (VINETER) and doesn't contain Anu SKUs.
+    # Globally MAX(snapshot_date) might be daily_b's date with 0 Anu rows. We need
+    # to ask "does this SKU have a recent snapshot of its own?"
+    today = _toronto_today()
     for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+        # Find the latest snapshot that has THIS SKU
         row = db_fetchone(
-            "SELECT COUNT(*) FROM sod_inventory WHERE sku = ? AND snapshot_date = ?",
-            [sku, snap.isoformat() if snap else ''],
+            "SELECT MAX(snapshot_date), COUNT(*) FROM sod_inventory WHERE sku = ?",
+            [sku],
         )
-        cnt = (list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
-        check(f'tracked_sku_data_{sku}', cnt > 0,
-              f'{brand} {name}: {cnt} rows in snapshot {snap}')
+        if row:
+            vals = list(row.values()) if isinstance(row, dict) else row
+            sku_latest, total_rows = vals[0], vals[1]
+        else:
+            sku_latest, total_rows = None, 0
+        # Convert sku_latest to date for age calc
+        sku_latest_date = None
+        if sku_latest:
+            try:
+                if isinstance(sku_latest, str):
+                    sku_latest_date = datetime.strptime(sku_latest, '%Y-%m-%d').date()
+                elif hasattr(sku_latest, 'date'):
+                    sku_latest_date = sku_latest.date()
+                else:
+                    sku_latest_date = sku_latest
+            except Exception:
+                pass
+        sku_age = (today - sku_latest_date).days if sku_latest_date else None
+        # Healthy if SKU has ANY data within last 3 days
+        ok = total_rows > 0 and sku_age is not None and sku_age <= 3
+        check(f'tracked_sku_data_{sku}', ok,
+              f'{brand} {name}: latest_snapshot={sku_latest} age={sku_age}d total_rows={total_rows}')
 
     # 4. No stuck-running rows older than 6h
     row = db_fetchone(
