@@ -8294,6 +8294,15 @@ def api_crm_deals_create():
             vals,
         )
         new_id = cur.fetchone()[0]
+        # Auto-stamp closed_at if created in a terminal stage so manager dashboard
+        # listings_won_60d includes deals created directly as 'listed' (e.g. bulk
+        # imports). Without this, listings_won_60d would always show 0 for
+        # imports until someone PATCHed the deal.
+        if stage in ('listed', 'lost'):
+            cur.execute(
+                "UPDATE deals SET closed_at = NOW() WHERE id = %s AND closed_at IS NULL",
+                (new_id,),
+            )
         db.commit()
         cur.close()
     else:
@@ -8302,8 +8311,39 @@ def api_crm_deals_create():
             vals,
         )
         new_id = c.lastrowid
+        if stage in ('listed', 'lost'):
+            db.execute(
+                "UPDATE deals SET closed_at = CURRENT_TIMESTAMP WHERE id = ? AND closed_at IS NULL",
+                (new_id,),
+            )
         db.commit()
     return jsonify({'status': 'ok', 'id': new_id})
+
+
+@app.route('/api/crm/admin/backfill-closed-deals', methods=['POST'])
+def api_crm_backfill_closed_deals():
+    """One-shot fix: set closed_at on any 'listed' or 'lost' deal where it's NULL.
+
+    Useful right after a bulk import where the create endpoint was older.
+    """
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE deals SET closed_at = NOW() "
+            "WHERE stage IN ('listed','lost') AND closed_at IS NULL"
+        )
+        n = cur.rowcount
+        db.commit()
+        cur.close()
+    else:
+        c = db.execute(
+            "UPDATE deals SET closed_at = CURRENT_TIMESTAMP "
+            "WHERE stage IN ('listed','lost') AND closed_at IS NULL"
+        )
+        n = c.rowcount
+        db.commit()
+    return jsonify({'status': 'ok', 'updated': n})
 
 
 @app.route('/api/crm/deals/<int:deal_id>', methods=['PUT', 'PATCH'])
