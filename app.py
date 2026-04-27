@@ -8630,10 +8630,24 @@ def api_crm_manager_dashboard():
     phs = ','.join([ph] * len(tracked))
 
     # 1) Reps from stores table (deduped + trimmed)
+    # Union: any rep that has stores OR activities OR deals shows up. This
+    # ensures reps like Namit show up in the manager dashboard even before
+    # they've been assigned to stores via the territory builder.
     reps_query = (
-        "SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count "
-        "FROM stores WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
-        "GROUP BY LOWER(TRIM(rep)) ORDER BY store_count DESC"
+        "SELECT MIN(rep) AS rep, MAX(store_count) AS store_count FROM ("
+        "  SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count FROM stores "
+        "    WHERE rep IS NOT NULL AND TRIM(rep) <> '' GROUP BY LOWER(TRIM(rep))"
+        "  UNION ALL"
+        "  SELECT MIN(TRIM(rep)) AS rep, 0 AS store_count FROM activities "
+        "    WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+        "    AND deleted_at IS NULL GROUP BY LOWER(TRIM(rep))"
+        "  UNION ALL"
+        "  SELECT MIN(TRIM(owner_rep)) AS rep, 0 AS store_count FROM deals "
+        "    WHERE owner_rep IS NOT NULL AND TRIM(owner_rep) <> '' "
+        "    GROUP BY LOWER(TRIM(owner_rep))"
+        ") u "
+        "GROUP BY LOWER(TRIM(rep)) "
+        "ORDER BY MAX(store_count) DESC, MIN(rep) ASC"
     )
     if USE_POSTGRES:
         cur = db.cursor()
