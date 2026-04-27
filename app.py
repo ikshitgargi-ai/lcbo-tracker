@@ -8143,6 +8143,344 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@app.route('/api/crm/manager-dashboard', methods=['GET'])
+def api_crm_manager_dashboard():
+    """Single-call aggregate for the /manager page.
+
+    Returns per-rep:
+      - stores_assigned (territory or stores.rep)
+      - activities logged (last 30d) — by type
+      - new listings won (deals stage='listed' OR new SOD listings in their stores last 60d)
+      - delistings in their stores (last 30d)
+      - new stores added in their territory (last 60d)
+      - gap_count (stores in their territory NOT carrying any tracked SKU)
+
+    Plus territories summary + global KPIs.
+    """
+    days_activity = int(request.args.get('days_activity', 30))
+    days_listings = int(request.args.get('days_listings', 60))
+    today_d = _toronto_today()
+    activity_since = (today_d - timedelta(days=days_activity)).isoformat()
+    listings_since = (today_d - timedelta(days=days_listings)).isoformat()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    tracked = list(SOD_TRACKED_SKUS.keys())
+    if not tracked:
+        return jsonify({'reps': [], 'territories': [], 'totals': {}})
+    phs = ','.join([ph] * len(tracked))
+
+    # 1) Reps from stores table (deduped + trimmed)
+    reps_query = (
+        "SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count "
+        "FROM stores WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+        "GROUP BY LOWER(TRIM(rep)) ORDER BY store_count DESC"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(reps_query)
+        rep_rows = cur.fetchall()
+        cur.close()
+    else:
+        rep_rows = db.execute(reps_query).fetchall()
+
+    out_reps = []
+    for rr in rep_rows:
+        rep_name, store_count = rr[0], int(rr[1] or 0)
+
+        # 2) Activities logged in the last N days
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN LOWER(activity_type) LIKE '%%visit%%' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN LOWER(activity_type) IN ('tasting','sample_drop') THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN LOWER(activity_type) IN ('call','email') THEN 1 ELSE 0 END) "
+                "FROM activities WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s)) "
+                "AND created_at >= %s "
+                "AND deleted_at IS NULL",
+                (rep_name, activity_since),
+            )
+            ar = cur.fetchone()
+            cur.close()
+        else:
+            ar = db.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN LOWER(activity_type) LIKE '%visit%' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN LOWER(activity_type) IN ('tasting','sample_drop') THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN LOWER(activity_type) IN ('call','email') THEN 1 ELSE 0 END) "
+                "FROM activities WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?)) "
+                "AND datetime(created_at) >= ? "
+                "AND deleted_at IS NULL",
+                (rep_name, activity_since),
+            ).fetchone()
+        activities_total = int((ar[0] or 0) if ar else 0)
+        visits = int((ar[1] or 0) if ar else 0)
+        tastings = int((ar[2] or 0) if ar else 0)
+        outreach = int((ar[3] or 0) if ar else 0)
+
+        # 3) New listings won — deals closed-as-listed by this rep
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM deals WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(%s)) "
+                "AND stage='listed' AND closed_at >= %s",
+                (rep_name, listings_since),
+            )
+            listings_won = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            listings_won = int(db.execute(
+                "SELECT COUNT(*) FROM deals WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(?)) "
+                "AND stage='listed' AND datetime(closed_at) >= ?",
+                (rep_name, listings_since),
+            ).fetchone()[0] or 0)
+
+        # 4) New stores added in this rep's territory in last N days
+        # (stores covered by this rep where one of our SKUs got NEW_LISTING/RELISTED)
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""SELECT COUNT(DISTINCT (c.sku, c.store_number))
+                    FROM sod_store_sku_changes c
+                    JOIN stores s ON s.store_number = c.store_number
+                    WHERE c.sku IN ({phs})
+                      AND c.change_type IN ('NEW_LISTING','RELISTED')
+                      AND c.change_date >= %s
+                      AND LOWER(TRIM(s.rep)) = LOWER(TRIM(%s))""",
+                tracked + [listings_since, rep_name],
+            )
+            new_stores = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            new_stores = int(db.execute(
+                f"""SELECT COUNT(*) FROM (
+                      SELECT DISTINCT c.sku, c.store_number
+                      FROM sod_store_sku_changes c
+                      JOIN stores s ON s.store_number = c.store_number
+                      WHERE c.sku IN ({phs})
+                        AND c.change_type IN ('NEW_LISTING','RELISTED')
+                        AND c.change_date >= ?
+                        AND LOWER(TRIM(s.rep)) = LOWER(TRIM(?)))""",
+                tracked + [listings_since, rep_name],
+            ).fetchone()[0] or 0)
+
+        # 5) Delistings in their stores last N days
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""SELECT COUNT(DISTINCT (c.sku, c.store_number))
+                    FROM sod_store_sku_changes c
+                    JOIN stores s ON s.store_number = c.store_number
+                    WHERE c.sku IN ({phs})
+                      AND c.change_type IN ('DELISTED','DROPPED')
+                      AND c.change_date >= %s
+                      AND LOWER(TRIM(s.rep)) = LOWER(TRIM(%s))""",
+                tracked + [listings_since, rep_name],
+            )
+            delistings = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            delistings = int(db.execute(
+                f"""SELECT COUNT(*) FROM (
+                      SELECT DISTINCT c.sku, c.store_number
+                      FROM sod_store_sku_changes c
+                      JOIN stores s ON s.store_number = c.store_number
+                      WHERE c.sku IN ({phs})
+                        AND c.change_type IN ('DELISTED','DROPPED')
+                        AND c.change_date >= ?
+                        AND LOWER(TRIM(s.rep)) = LOWER(TRIM(?)))""",
+                tracked + [listings_since, rep_name],
+            ).fetchone()[0] or 0)
+
+        # 6) Gap count — stores in their book NOT carrying ANY tracked SKU at status='L'
+        # latest snapshot per sku, count distinct stores assigned to this rep that
+        # have ZERO listed tracked SKUs.
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"""WITH rep_stores AS (
+                        SELECT id, store_number FROM stores
+                        WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s))
+                    ),
+                    listed AS (
+                        SELECT DISTINCT i.store_number FROM sod_inventory i
+                        WHERE i.sku IN ({phs}) AND i.status='L'
+                          AND i.snapshot_date = (SELECT MAX(snapshot_date)
+                                                 FROM sod_inventory i2
+                                                 WHERE i2.sku = i.sku)
+                    )
+                    SELECT COUNT(*) FROM rep_stores rs
+                    WHERE rs.store_number NOT IN (SELECT store_number FROM listed)""",
+                [rep_name] + tracked,
+            )
+            gap_count = int(cur.fetchone()[0] or 0)
+            cur.close()
+        else:
+            gap_count = int(db.execute(
+                f"""WITH rep_stores AS (
+                        SELECT id, store_number FROM stores
+                        WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?))
+                    ),
+                    listed AS (
+                        SELECT DISTINCT i.store_number FROM sod_inventory i
+                        WHERE i.sku IN ({phs}) AND i.status='L'
+                          AND i.snapshot_date = (SELECT MAX(snapshot_date)
+                                                 FROM sod_inventory i2
+                                                 WHERE i2.sku = i.sku)
+                    )
+                    SELECT COUNT(*) FROM rep_stores rs
+                    WHERE rs.store_number NOT IN (SELECT store_number FROM listed)""",
+                [rep_name] + tracked,
+            ).fetchone()[0] or 0)
+
+        # 7) Quota lookup for current quarter
+        cq = _current_quarter()
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT target_activities, target_visits, target_new_listings "
+                "FROM rep_quotas WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s)) AND quarter=%s LIMIT 1",
+                (rep_name, cq),
+            )
+            qrow = cur.fetchone()
+            cur.close()
+        else:
+            qrow = db.execute(
+                "SELECT target_activities, target_visits, target_new_listings "
+                "FROM rep_quotas WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?)) AND quarter=? LIMIT 1",
+                (rep_name, cq),
+            ).fetchone()
+        quota_acts = int((qrow[0] if qrow else 0) or 0)
+        quota_visits = int((qrow[1] if qrow else 0) or 0)
+        quota_listings = int((qrow[2] if qrow else 0) or 0)
+
+        out_reps.append({
+            'rep': rep_name,
+            'store_count': store_count,
+            'gap_count': gap_count,
+            'activities_30d': activities_total,
+            'visits_30d': visits,
+            'tastings_30d': tastings,
+            'outreach_30d': outreach,
+            'listings_won_60d': listings_won,
+            'new_stores_60d': new_stores,
+            'delistings_60d': delistings,
+            'quota_activities': quota_acts,
+            'quota_visits': quota_visits,
+            'quota_new_listings': quota_listings,
+            'pct_quota_activities': round(100 * activities_total / quota_acts, 1) if quota_acts > 0 else None,
+            'pct_quota_visits': round(100 * visits / quota_visits, 1) if quota_visits > 0 else None,
+            'pct_quota_listings': round(100 * listings_won / quota_listings, 1) if quota_listings > 0 else None,
+            'gap_pct': round(100 * gap_count / store_count, 1) if store_count > 0 else None,
+        })
+
+    # 8) Territory rollup — store + rep + listed-SKU coverage per territory
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            """SELECT t.id, t.code, t.name, t.region, t.color, t.rep_name,
+                      COUNT(s.id) AS store_count
+               FROM territories t
+               LEFT JOIN stores s ON s.territory_id = t.id
+               GROUP BY t.id, t.code, t.name, t.region, t.color, t.rep_name
+               ORDER BY t.region, t.name""")
+        terr_rows = cur.fetchall()
+        cur.close()
+    else:
+        terr_rows = db.execute(
+            """SELECT t.id, t.code, t.name, t.region, t.color, t.rep_name,
+                      COUNT(s.id) AS store_count
+               FROM territories t
+               LEFT JOIN stores s ON s.territory_id = t.id
+               GROUP BY t.id, t.code, t.name, t.region, t.color, t.rep_name
+               ORDER BY t.region, t.name""").fetchall()
+    out_terr = [{
+        'id': r[0], 'code': r[1], 'name': r[2], 'region': r[3] or '',
+        'color': r[4] or '#888', 'rep_name': r[5] or '',
+        'store_count': int(r[6] or 0),
+    } for r in terr_rows]
+
+    # 9) Global totals
+    totals = {
+        'reps': len(out_reps),
+        'territories': len(out_terr),
+        'total_stores': sum(r['store_count'] for r in out_reps),
+        'total_listings_won_60d': sum(r['listings_won_60d'] for r in out_reps),
+        'total_new_stores_60d': sum(r['new_stores_60d'] for r in out_reps),
+        'total_delistings_60d': sum(r['delistings_60d'] for r in out_reps),
+        'total_activities_30d': sum(r['activities_30d'] for r in out_reps),
+        'total_gap': sum(r['gap_count'] for r in out_reps),
+    }
+
+    return jsonify({
+        'days_activity': days_activity,
+        'days_listings': days_listings,
+        'reps': out_reps,
+        'territories': out_terr,
+        'totals': totals,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/territories/<int:territory_id>/assign-stores', methods=['POST'])
+def api_crm_territory_assign_stores(territory_id):
+    """Bulk-assign stores to a territory + optionally set the rep_name on the territory.
+
+    Body: {store_numbers: [1, 2, 3, ...], rep_name?: 'Ikshit Sharma'}
+    """
+    body = request.get_json(silent=True) or {}
+    store_numbers = body.get('store_numbers') or []
+    rep_name = (body.get('rep_name') or '').strip()
+    if not store_numbers:
+        return jsonify({'error': 'store_numbers required'}), 400
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(store_numbers))
+
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"UPDATE stores SET territory_id = %s WHERE store_number IN ({phs})",
+            [territory_id] + list(store_numbers),
+        )
+        # Optionally also set the rep
+        if rep_name:
+            cur.execute(
+                f"UPDATE stores SET rep = %s WHERE store_number IN ({phs})",
+                [rep_name] + list(store_numbers),
+            )
+            cur.execute(
+                "UPDATE territories SET rep_name = %s WHERE id = %s",
+                (rep_name, territory_id),
+            )
+        db.commit()
+        cur.close()
+    else:
+        db.execute(
+            f"UPDATE stores SET territory_id = ? WHERE store_number IN ({phs})",
+            [territory_id] + list(store_numbers),
+        )
+        if rep_name:
+            db.execute(
+                f"UPDATE stores SET rep = ? WHERE store_number IN ({phs})",
+                [rep_name] + list(store_numbers),
+            )
+            db.execute(
+                "UPDATE territories SET rep_name = ? WHERE id = ?",
+                (rep_name, territory_id),
+            )
+        db.commit()
+
+    try:
+        _log_event('territory_assigned', 'territory', str(territory_id), rep_name,
+                   {'store_count': len(store_numbers), 'rep_name': rep_name})
+    except Exception:
+        pass
+    return jsonify({'status': 'ok', 'assigned': len(store_numbers), 'territory_id': territory_id, 'rep': rep_name or None})
+
+
 @app.route('/api/crm/quotas', methods=['GET'])
 def api_crm_quotas_list():
     """List all quotas with live progress."""
