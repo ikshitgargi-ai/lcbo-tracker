@@ -8391,11 +8391,17 @@ _lcbo_scheduler = None
 
 
 def _lcbo_daily_scrape_worker():
-    """Scrape live LCBO.com inventory for each tracked SKU and log into inventory_history.
+    """Scrape live LCBO.com inventory + RECONCILE with SOD.
 
-    This gives us a second data source alongside SOD — useful for SKUs that LCBO uploads
-    late or that are on a different release schedule. Idempotent: always appends with a
-    fresh recorded_at timestamp (inventory_history is an append-only trend table).
+    Two outputs:
+      1. inventory_history: append-only trend log (existing behavior).
+      2. sod_store_sku_changes with change_type='LCBO_LIVE_ONLY' for stores where
+         lcbo.com shows on_hand > 0 BUT SOD has no row OR status='F' (delisted).
+         This is the killer signal: 'lcbo.com shows live inventory at this store
+         but SOD says it's delisted/missing — investigate.'
+
+    Idempotent on the reconciliation side via UNIQUE(sku, store_number, change_date,
+    change_type). Runs every 2 hours via the scheduler.
     """
     try:
         scrape = globals().get('scrape_lcbo_inventory')
@@ -8405,50 +8411,217 @@ def _lcbo_daily_scrape_worker():
         conn = _sod_get_conn()
         cur = conn.cursor()
         total_rows = 0
+        discoveries = 0  # NEW: stores found via lcbo.com but missing from SOD
+        today_str = _toronto_today().isoformat()
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
             sku_clean = sku.lstrip('0')
+            sku_padded = sku  # already 7-char zero-padded in SOD_TRACKED_SKUS
             try:
                 rows = scrape(sku_clean) or []
             except Exception as e:
                 print(f'[LCBO-live] scrape failed for {sku}: {e}')
                 continue
-            # Find/create product row
+
+            # Find product row for inventory_history
             if USE_POSTGRES:
                 cur.execute("SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1", (sku_clean,))
                 prow = cur.fetchone()
             else:
                 prow = cur.execute("SELECT id FROM products WHERE lcbo_sku=? LIMIT 1", (sku_clean,)).fetchone()
-            if not prow:
-                continue
-            pid = prow[0]
-            for r in rows:
+            pid = prow[0] if prow else None
+
+            # Pull SOD's current view of THIS sku (latest snapshot)
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s",
+                    (sku_padded,),
+                )
+                latest = cur.fetchone()[0]
+            else:
+                latest = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?",
+                    (sku_padded,),
+                ).fetchone()[0]
+            sod_per_store = {}
+            if latest:
                 if USE_POSTGRES:
                     cur.execute(
-                        """INSERT INTO inventory_history
-                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
-                           VALUES (%s,%s,%s,%s,%s,NOW())""",
-                        (pid, str(r.get('store_number', '')), r.get('store_name', ''),
-                         r.get('store_city', ''), r.get('quantity', 0)),
+                        "SELECT store_number, status, on_hand FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s",
+                        (sku_padded, latest),
                     )
                 else:
                     cur.execute(
-                        """INSERT INTO inventory_history
-                           (product_id, store_number, store_name, store_city, quantity, recorded_at)
-                           VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)""",
-                        (pid, str(r.get('store_number', '')), r.get('store_name', ''),
-                         r.get('store_city', ''), r.get('quantity', 0)),
+                        "SELECT store_number, status, on_hand FROM sod_inventory "
+                        "WHERE sku=? AND snapshot_date=?",
+                        (sku_padded, latest),
                     )
-                total_rows += 1
+                sod_per_store = {int(r[0]): {'status': r[1], 'on_hand': r[2]} for r in cur.fetchall()}
+
+            # Walk lcbo.com rows
+            sku_discoveries = []
+            for r in rows:
+                store_num_raw = r.get('store_number', '')
+                qty = int(r.get('quantity', 0) or 0)
+                # Append to inventory_history
+                if pid is not None:
+                    if USE_POSTGRES:
+                        cur.execute(
+                            """INSERT INTO inventory_history
+                               (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                               VALUES (%s,%s,%s,%s,%s,NOW())""",
+                            (pid, str(store_num_raw), r.get('store_name', ''),
+                             r.get('store_city', ''), qty),
+                        )
+                    else:
+                        cur.execute(
+                            """INSERT INTO inventory_history
+                               (product_id, store_number, store_name, store_city, quantity, recorded_at)
+                               VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                            (pid, str(store_num_raw), r.get('store_name', ''),
+                             r.get('store_city', ''), qty),
+                        )
+                    total_rows += 1
+
+                # RECONCILE: lcbo.com shows in-stock but SOD missing or status=F?
+                try:
+                    store_num = int(store_num_raw)
+                except (ValueError, TypeError):
+                    continue
+                if qty <= 0:
+                    continue
+                sod = sod_per_store.get(store_num)
+                if sod is None:
+                    sku_discoveries.append((sku_padded, store_num, today_str, None, 'L', 'LCBO_LIVE_ONLY'))
+                elif sod.get('status') == 'F':
+                    sku_discoveries.append((sku_padded, store_num, today_str, 'F', 'L', 'LCBO_LIVE_ONLY'))
+
+            # Bulk insert discoveries (idempotent)
+            if sku_discoveries:
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_store_sku_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES %s
+                           ON CONFLICT (sku, store_number, change_date, change_type) DO NOTHING""",
+                        sku_discoveries,
+                    )
+                else:
+                    cur.executemany(
+                        """INSERT INTO sod_store_sku_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES (?,?,?,?,?,?)
+                           ON CONFLICT(sku, store_number, change_date, change_type) DO NOTHING""",
+                        sku_discoveries,
+                    )
+                discoveries += len(sku_discoveries)
         conn.commit()
         cur.close()
         conn.close()
-        print(f'[LCBO-live] scraped {total_rows} store-rows across {len(SOD_TRACKED_SKUS)} SKUs')
+        print(f'[LCBO-live] scraped {total_rows} store-rows; '
+              f'found {discoveries} discoveries (lcbo.com live but SOD blank/F)')
     except Exception as e:
-        print(f'[LCBO-live] daily scrape failed: {e}')
+        print(f'[LCBO-live] scrape failed: {e}')
+
+
+@app.route('/api/crm/lcbo-live-discoveries', methods=['GET'])
+def api_crm_lcbo_live_discoveries():
+    """Stores where lcbo.com shows our SKU live but SOD has it as missing/delisted.
+
+    These are highest-value discoveries — LCBO ordered the product, it's on shelf
+    selling, but SOD hasn't reflected it yet (SOD lag can be days/weeks for some
+    listings). Surfacing them lets the rep act before the next SOD cycle.
+    """
+    days = int(request.args.get('days', 30))
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    q = f"""
+        SELECT c.sku, c.store_number, c.change_date, c.old_status,
+               s.account, s.city, s.postal, s.rep,
+               t.name AS territory_name, COALESCE(t.color, '#888') AS territory_color,
+               (SELECT i.status FROM sod_inventory i
+                  WHERE i.sku = c.sku AND i.store_number = c.store_number
+                  ORDER BY i.snapshot_date DESC LIMIT 1) AS current_sod_status,
+               (SELECT i.on_hand FROM sod_inventory i
+                  WHERE i.sku = c.sku AND i.store_number = c.store_number
+                  ORDER BY i.snapshot_date DESC LIMIT 1) AS current_sod_on_hand,
+               (SELECT MAX(ih.recorded_at) FROM inventory_history ih
+                  JOIN products p ON p.id = ih.product_id
+                  WHERE p.lcbo_sku = TRIM(LEADING '0' FROM c.sku)
+                  AND ih.store_number = CAST(c.store_number AS TEXT)) AS last_lcbo_seen
+        FROM sod_store_sku_changes c
+        LEFT JOIN stores s ON s.store_number = c.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE c.change_type = 'LCBO_LIVE_ONLY' AND c.change_date >= {ph}
+        ORDER BY c.change_date DESC, c.sku, c.store_number
+        LIMIT 500
+    """ if USE_POSTGRES else f"""
+        SELECT c.sku, c.store_number, c.change_date, c.old_status,
+               s.account, s.city, s.postal, s.rep,
+               t.name AS territory_name, COALESCE(t.color, '#888') AS territory_color,
+               (SELECT i.status FROM sod_inventory i
+                  WHERE i.sku = c.sku AND i.store_number = c.store_number
+                  ORDER BY i.snapshot_date DESC LIMIT 1) AS current_sod_status,
+               (SELECT i.on_hand FROM sod_inventory i
+                  WHERE i.sku = c.sku AND i.store_number = c.store_number
+                  ORDER BY i.snapshot_date DESC LIMIT 1) AS current_sod_on_hand,
+               (SELECT MAX(ih.recorded_at) FROM inventory_history ih
+                  JOIN products p ON p.id = ih.product_id
+                  WHERE p.lcbo_sku = LTRIM(c.sku, '0')
+                  AND ih.store_number = CAST(c.store_number AS TEXT)) AS last_lcbo_seen
+        FROM sod_store_sku_changes c
+        LEFT JOIN stores s ON s.store_number = c.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE c.change_type = 'LCBO_LIVE_ONLY' AND c.change_date >= ?
+        ORDER BY c.change_date DESC, c.sku, c.store_number
+        LIMIT 500
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, [since])
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, [since]).fetchall()
+    out = []
+    for r in rows:
+        sku = r[0]
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        out.append({
+            'sku': sku, 'brand': brand, 'product_name': pname,
+            'store_number': r[1],
+            'change_date': str(r[2]),
+            'old_sod_status': r[3],
+            'account': r[4], 'city': r[5], 'postal': r[6], 'rep': r[7],
+            'territory_name': r[8] or 'Unassigned',
+            'territory_color': r[9],
+            'current_sod_status': r[10],
+            'current_sod_on_hand': r[11] or 0,
+            'last_lcbo_seen': str(r[12]) if r[12] else None,
+        })
+    return jsonify({
+        'days': days, 'since': since, 'total': len(out), 'discoveries': out,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/lcbo-rescan', methods=['POST'])
+def api_crm_lcbo_rescan():
+    """Manually trigger an immediate lcbo.com scrape + reconcile."""
+    if _sod_sync_lock.locked():
+        return jsonify({'status': 'busy', 'note': 'a sync is already running'}), 202
+    threading.Thread(target=_lcbo_daily_scrape_worker, daemon=True).start()
+    return jsonify({'status': 'started', 'note': 'scraping lcbo.com for tracked SKUs'}), 202
 
 
 def start_lcbo_scheduler():
-    """Start the daily lcbo.com scraper at 04:00 America/Toronto (1 hour after SOD)."""
+    """Start the lcbo.com scraper every 2 hours.
+
+    More aggressive than the SOD scheduler because lcbo.com updates in real-time
+    when stores get new shipments, while SOD only refreshes once a day.
+    """
     global _lcbo_scheduler
     if _lcbo_scheduler is not None:
         return
@@ -8463,14 +8636,15 @@ def start_lcbo_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
+        # Every 2 hours from 06:00 to 22:00 ET (9 runs/day)
         sched.add_job(
             _lcbo_daily_scrape_worker,
-            CronTrigger(hour=4, minute=0),
-            id='lcbo_daily_scrape',
+            CronTrigger(hour='6,8,10,12,14,16,18,20,22', minute=0),
+            id='lcbo_2h_scrape',
             replace_existing=True,
             max_instances=1,
             coalesce=True,
-            misfire_grace_time=3600 * 6,
+            misfire_grace_time=3600 * 4,
         )
         sched.start()
         _lcbo_scheduler = sched
