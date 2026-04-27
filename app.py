@@ -6474,6 +6474,465 @@ def api_crm_distribution_additions():
     })
 
 
+@app.route('/api/crm/nb-tracker', methods=['GET'])
+def api_crm_nb_tracker():
+    """Dedicated NB Distillers tracker — premium client view.
+
+    NB Distillers is the paying client. This endpoint is shaped specifically for
+    their executive view — Red Admiral Vodka (SKU 20187) + Chak De Canadian
+    Whisky (SKU 22246) combined, with everything they care about in one payload.
+
+    Returns:
+      - per_sku: rollup with listed/delisting/fully_delisted/on_hand
+      - velocity: week-rate per SKU, days-to-OOS for stores at risk
+      - top_stores: stores carrying NB products by on-hand
+      - additions_60d: every store that added an NB SKU in last 60 days
+      - delistings_60d: every store where an NB SKU got delisted
+      - oos_risk: stores listed but on_hand <= 2
+      - tasting_followups: stores where tasting happened, NB SKU not currently listed
+      - lcbo_live_discoveries: stores where lcbo.com shows NB live but SOD shows blank/F
+      - territory_coverage: NB store count per territory
+      - 30-day trend series for the dashboard chart
+    """
+    NB_SKUS = [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b == 'NB Distillers']
+    if not NB_SKUS:
+        return jsonify({'error': 'No NB Distillers SKUs configured'}), 500
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(NB_SKUS))
+    today_d = _toronto_today()
+    since60 = (today_d - timedelta(days=60)).isoformat()
+
+    # 1) Per-SKU rollup
+    per_sku = []
+    for sku in NB_SKUS:
+        brand, pname = SOD_TRACKED_SKUS[sku]
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s", (sku,))
+            latest = cur.fetchone()[0]
+            cur.close()
+        else:
+            latest = db.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = ?", (sku,)
+            ).fetchone()[0]
+        if not latest:
+            per_sku.append({
+                'sku': sku, 'brand': brand, 'product_name': pname,
+                'snapshot_date': None,
+                'listed': 0, 'delisting': 0, 'fully_delisted': 0,
+                'total_on_hand': 0, 'avg_on_hand': 0,
+            })
+            continue
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0), "
+                "COALESCE(AVG(CASE WHEN status='L' AND on_hand > 0 THEN on_hand END), 0) "
+                "FROM sod_inventory WHERE sku=%s AND snapshot_date=%s",
+                (sku, latest),
+            )
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0), "
+                "COALESCE(AVG(CASE WHEN status='L' AND on_hand > 0 THEN on_hand END), 0) "
+                "FROM sod_inventory WHERE sku=? AND snapshot_date=?",
+                (sku, latest),
+            ).fetchone()
+        per_sku.append({
+            'sku': sku, 'brand': brand, 'product_name': pname,
+            'lcbo_url': f'https://www.lcbo.com/en/product-{int(sku)}',
+            'snapshot_date': str(latest),
+            'listed': int(r[0] or 0),
+            'delisting': int(r[1] or 0),
+            'fully_delisted': int(r[2] or 0),
+            'total_on_hand': int(r[3] or 0),
+            'avg_on_hand_at_listed': round(float(r[4] or 0), 1),
+        })
+
+    # 2) Top stores carrying NB products
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.store_number, i.sku, i.status, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest l ON l.sku=i.sku AND l.d=i.snapshot_date
+                LEFT JOIN stores s ON s.store_number = i.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE i.sku IN ({phs}) AND i.status = 'L'
+                ORDER BY i.on_hand DESC LIMIT 25""",
+            NB_SKUS + NB_SKUS,
+        )
+        top_rows = cur.fetchall()
+        cur.close()
+    else:
+        top_rows = db.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.store_number, i.sku, i.status, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest l ON l.sku=i.sku AND l.d=i.snapshot_date
+                LEFT JOIN stores s ON s.store_number = i.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE i.sku IN ({phs}) AND i.status = 'L'
+                ORDER BY i.on_hand DESC LIMIT 25""",
+            NB_SKUS + NB_SKUS,
+        ).fetchall()
+    top_stores = [{
+        'store_number': r[0], 'sku': r[1],
+        'product_name': SOD_TRACKED_SKUS.get(r[1], ('', ''))[1],
+        'status': r[2], 'on_hand': int(r[3] or 0),
+        'account': r[4], 'city': r[5],
+        'territory_name': r[6] or 'Unassigned',
+        'territory_color': r[7],
+    } for r in top_rows]
+
+    # 3) Additions in last 60 days
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888'),
+                       (SELECT i.on_hand FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_on_hand,
+                       (SELECT i.status FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_status
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('NEW_LISTING', 'RELISTED')
+                  AND c.change_date >= %s
+                ORDER BY c.change_date DESC LIMIT 100""",
+            NB_SKUS + [since60],
+        )
+        add_rows = cur.fetchall()
+        cur.close()
+    else:
+        add_rows = db.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888'),
+                       (SELECT i.on_hand FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_on_hand,
+                       (SELECT i.status FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_status
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('NEW_LISTING', 'RELISTED')
+                  AND c.change_date >= ?
+                ORDER BY c.change_date DESC LIMIT 100""",
+            NB_SKUS + [since60],
+        ).fetchall()
+    additions_60d = [{
+        'sku': r[0], 'product_name': SOD_TRACKED_SKUS.get(r[0], ('', ''))[1],
+        'store_number': r[1], 'change_date': str(r[2]), 'change_type': r[3],
+        'account': r[4], 'city': r[5],
+        'territory_name': r[6] or 'Unassigned', 'territory_color': r[7],
+        'current_on_hand': int(r[8] or 0), 'current_status': r[9],
+    } for r in add_rows]
+
+    # 4) Delistings in last 60 days
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       c.old_status, c.new_status,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('DELISTED','DROPPED','STATUS_FLIP')
+                  AND c.change_date >= %s
+                ORDER BY c.change_date DESC LIMIT 100""",
+            NB_SKUS + [since60],
+        )
+        del_rows = cur.fetchall()
+        cur.close()
+    else:
+        del_rows = db.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       c.old_status, c.new_status,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('DELISTED','DROPPED','STATUS_FLIP')
+                  AND c.change_date >= ?
+                ORDER BY c.change_date DESC LIMIT 100""",
+            NB_SKUS + [since60],
+        ).fetchall()
+    delistings_60d = [{
+        'sku': r[0], 'product_name': SOD_TRACKED_SKUS.get(r[0], ('', ''))[1],
+        'store_number': r[1], 'change_date': str(r[2]), 'change_type': r[3],
+        'old_status': r[4], 'new_status': r[5],
+        'account': r[6], 'city': r[7],
+        'territory_name': r[8] or 'Unassigned', 'territory_color': r[9],
+    } for r in del_rows]
+
+    # 5) OOS risk for NB SKUs
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.sku, i.store_number, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest l ON l.sku=i.sku AND l.d=i.snapshot_date
+                LEFT JOIN stores s ON s.store_number=i.store_number
+                LEFT JOIN territories t ON t.id=s.territory_id
+                WHERE i.sku IN ({phs}) AND i.status='L' AND i.on_hand <= 2
+                ORDER BY i.on_hand ASC LIMIT 50""",
+            NB_SKUS + NB_SKUS,
+        )
+        oos_rows = cur.fetchall()
+        cur.close()
+    else:
+        oos_rows = db.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT i.sku, i.store_number, i.on_hand,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM sod_inventory i
+                JOIN latest l ON l.sku=i.sku AND l.d=i.snapshot_date
+                LEFT JOIN stores s ON s.store_number=i.store_number
+                LEFT JOIN territories t ON t.id=s.territory_id
+                WHERE i.sku IN ({phs}) AND i.status='L' AND i.on_hand <= 2
+                ORDER BY i.on_hand ASC LIMIT 50""",
+            NB_SKUS + NB_SKUS,
+        ).fetchall()
+    oos_risk = [{
+        'sku': r[0], 'product_name': SOD_TRACKED_SKUS.get(r[0], ('', ''))[1],
+        'store_number': r[1], 'on_hand': int(r[2] or 0),
+        'severity': 'critical' if (r[2] or 0) == 0 else ('high' if (r[2] or 0) <= 1 else 'medium'),
+        'account': r[3], 'city': r[4],
+        'territory_name': r[5] or 'Unassigned', 'territory_color': r[6],
+    } for r in oos_rows]
+
+    # 6) Territory coverage (count of stores carrying any NB SKU at status='L', per territory)
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT t.code, t.name, COALESCE(t.color, '#888'),
+                       COUNT(DISTINCT i.store_number) AS nb_stores,
+                       COUNT(DISTINCT s.id) AS total_stores
+                FROM territories t
+                LEFT JOIN stores s ON s.territory_id = t.id
+                LEFT JOIN sod_inventory i ON i.store_number = s.store_number AND i.status='L'
+                  AND i.sku IN ({phs})
+                  AND i.snapshot_date = (SELECT d FROM latest WHERE latest.sku=i.sku)
+                GROUP BY t.code, t.name, t.color
+                ORDER BY nb_stores DESC""",
+            NB_SKUS + NB_SKUS,
+        )
+        terr_rows = cur.fetchall()
+        cur.close()
+    else:
+        terr_rows = db.execute(
+            f"""WITH latest AS (
+                    SELECT sku, MAX(snapshot_date) d FROM sod_inventory
+                    WHERE sku IN ({phs}) GROUP BY sku
+                )
+                SELECT t.code, t.name, COALESCE(t.color, '#888'),
+                       COUNT(DISTINCT i.store_number) AS nb_stores,
+                       COUNT(DISTINCT s.id) AS total_stores
+                FROM territories t
+                LEFT JOIN stores s ON s.territory_id = t.id
+                LEFT JOIN sod_inventory i ON i.store_number = s.store_number AND i.status='L'
+                  AND i.sku IN ({phs})
+                  AND i.snapshot_date = (SELECT d FROM latest WHERE latest.sku=i.sku)
+                GROUP BY t.code, t.name, t.color
+                ORDER BY nb_stores DESC""",
+            NB_SKUS + NB_SKUS,
+        ).fetchall()
+    territory_coverage = [{
+        'code': r[0], 'name': r[1], 'color': r[2],
+        'nb_stores': int(r[3] or 0),
+        'total_stores': int(r[4] or 0),
+        'coverage_pct': round(100 * (r[3] or 0) / (r[4] or 1), 1) if r[4] else 0,
+    } for r in terr_rows]
+
+    # 7) 30-day trend series (combined NB)
+    since30 = (today_d - timedelta(days=30)).isoformat()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT snapshot_date,
+                       SUM(CASE WHEN status='L' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='D' THEN 1 ELSE 0 END),
+                       COALESCE(SUM(on_hand), 0)
+                FROM sod_inventory
+                WHERE sku IN ({phs}) AND snapshot_date >= %s
+                GROUP BY snapshot_date
+                ORDER BY snapshot_date""",
+            NB_SKUS + [since30],
+        )
+        trend_rows = cur.fetchall()
+        cur.close()
+    else:
+        trend_rows = db.execute(
+            f"""SELECT snapshot_date,
+                       SUM(CASE WHEN status='L' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='D' THEN 1 ELSE 0 END),
+                       COALESCE(SUM(on_hand), 0)
+                FROM sod_inventory
+                WHERE sku IN ({phs}) AND snapshot_date >= ?
+                GROUP BY snapshot_date
+                ORDER BY snapshot_date""",
+            NB_SKUS + [since30],
+        ).fetchall()
+    trend = [{
+        'date': str(r[0]),
+        'listed': int(r[1] or 0),
+        'delisting': int(r[2] or 0),
+        'total_on_hand': int(r[3] or 0),
+    } for r in trend_rows]
+
+    # 8) Tasting follow-ups specifically for NB
+    nb_followups = []
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT
+                    aso.sku, aso.outcome,
+                    a.id, a.activity_type, a.notes, a.rep,
+                    COALESCE(a.visit_date, a.created_at::date) AS visit_when,
+                    s.store_number, s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM activity_sku_outcomes aso
+                JOIN activities a ON a.id = aso.activity_id
+                LEFT JOIN stores s ON s.id = a.store_id
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE a.deleted_at IS NULL
+                  AND aso.sku IN ({phs})
+                  AND (LOWER(aso.outcome) IN ('tasting','sampled','samples_left','sample_drop')
+                       OR LOWER(a.activity_type) IN ('tasting','sample_drop'))""",
+            NB_SKUS,
+        )
+        f_rows = cur.fetchall()
+        cur.close()
+    else:
+        f_rows = db.execute(
+            f"""SELECT
+                    aso.sku, aso.outcome,
+                    a.id, a.activity_type, a.notes, a.rep,
+                    COALESCE(a.visit_date, DATE(a.created_at)) AS visit_when,
+                    s.store_number, s.account, s.city, t.name, COALESCE(t.color, '#888')
+                FROM activity_sku_outcomes aso
+                JOIN activities a ON a.id = aso.activity_id
+                LEFT JOIN stores s ON s.id = a.store_id
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE a.deleted_at IS NULL
+                  AND aso.sku IN ({phs})
+                  AND (LOWER(aso.outcome) IN ('tasting','sampled','samples_left','sample_drop')
+                       OR LOWER(a.activity_type) IN ('tasting','sample_drop'))""",
+            NB_SKUS,
+        ).fetchall()
+    seen = set()
+    for r in f_rows:
+        sku = r[0]
+        store_number = r[7]
+        if not store_number or (store_number, sku) in seen:
+            continue
+        seen.add((store_number, sku))
+        # Current status
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT status FROM sod_inventory WHERE sku=%s AND store_number=%s "
+                "ORDER BY snapshot_date DESC LIMIT 1", (sku, store_number),
+            )
+            sr = cur.fetchone()
+            cur.close()
+        else:
+            sr = db.execute(
+                "SELECT status FROM sod_inventory WHERE sku=? AND store_number=? "
+                "ORDER BY snapshot_date DESC LIMIT 1", (sku, store_number),
+            ).fetchone()
+        current_status = sr[0] if sr else None
+        if current_status == 'L':
+            continue
+        try:
+            visit_iso = r[6].isoformat() if hasattr(r[6], 'isoformat') else str(r[6])
+            days_since = (datetime.now() - datetime.fromisoformat(visit_iso.split('T')[0])).days
+        except Exception:
+            visit_iso = str(r[6])
+            days_since = None
+        nb_followups.append({
+            'sku': sku,
+            'product_name': SOD_TRACKED_SKUS.get(sku, ('', ''))[1],
+            'store_number': store_number,
+            'tasting_date': visit_iso,
+            'days_since_tasting': days_since,
+            'tasting_outcome': r[1],
+            'rep': r[5],
+            'account': r[8], 'city': r[9],
+            'territory_name': r[10] or 'Unassigned',
+            'territory_color': r[11],
+            'current_sod_status': current_status,
+        })
+
+    # Aggregated brand totals
+    totals = {
+        'total_skus': len(NB_SKUS),
+        'total_listed_stores': sum(p['listed'] for p in per_sku),
+        'total_delisting_stores': sum(p['delisting'] for p in per_sku),
+        'total_on_hand_units': sum(p['total_on_hand'] for p in per_sku),
+        'additions_60d': len(additions_60d),
+        'delistings_60d': len(delistings_60d),
+        'oos_risk_count': len(oos_risk),
+        'tasting_followups_count': len(nb_followups),
+    }
+
+    return jsonify({
+        'brand': 'NB Distillers',
+        'tagline': 'Premium Anu Spirits client tracker',
+        'skus': NB_SKUS,
+        'per_sku': per_sku,
+        'totals': totals,
+        'top_stores': top_stores,
+        'additions_60d': additions_60d,
+        'delistings_60d': delistings_60d,
+        'oos_risk': oos_risk,
+        'tasting_followups': nb_followups,
+        'territory_coverage': territory_coverage,
+        'trend_30d': trend,
+        'freshness': _sod_freshness(),
+    })
+
+
 @app.route('/api/crm/brand/<brand>', methods=['GET'])
 def api_crm_brand(brand):
     """Combined distribution health for one brand (e.g. 'NB Distillers' covers
@@ -8421,6 +8880,148 @@ def api_crm_manager_dashboard():
         'totals': totals,
         'freshness': _sod_freshness(),
     })
+
+
+REP_ROSTER_DEFAULT = ['Neeraj', 'Virat', 'Namit', 'Ikshit']
+
+
+@app.route('/api/crm/admin/roster', methods=['GET'])
+def api_crm_admin_roster_get():
+    """Return the configured rep roster (4 official reps for Anu)."""
+    return jsonify({
+        'roster': REP_ROSTER_DEFAULT,
+        'placeholder_for_unassigned': 'New Rep 1',
+    })
+
+
+@app.route('/api/crm/admin/set-roster', methods=['POST'])
+def api_crm_admin_set_roster():
+    """Normalize the rep roster across stores + territories.
+
+    Sets stores.rep = NULL for any rep NOT in the official roster.
+    Sets territories.rep_name = 'New Rep 1' for any territory that has no rep
+    after normalization (so the manager UI shows a placeholder).
+
+    Body (optional): {roster: ['Neeraj', 'Virat', ...]} to override defaults.
+    """
+    body = request.get_json(silent=True) or {}
+    roster = body.get('roster') or REP_ROSTER_DEFAULT
+    placeholder = body.get('placeholder', 'New Rep 1')
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # 1) Clear stores.rep for any name not matching the roster (case-insensitive trim).
+    if USE_POSTGRES:
+        cur = db.cursor()
+        roster_lower = [r.lower().strip() for r in roster]
+        ph_list = ','.join([ph] * len(roster_lower))
+        cur.execute(
+            f"UPDATE stores SET rep = '' "
+            f"WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+            f"AND LOWER(TRIM(rep)) NOT IN ({ph_list})",
+            roster_lower,
+        )
+        cleared_count = cur.rowcount
+
+        # 2) Reset territories.rep_name → 'New Rep 1' if not in roster
+        cur.execute(
+            f"UPDATE territories SET rep_name = %s "
+            f"WHERE LOWER(TRIM(COALESCE(rep_name,''))) NOT IN ({ph_list}) OR rep_name IS NULL",
+            [placeholder] + roster_lower,
+        )
+        terr_reset = cur.rowcount
+        db.commit()
+        cur.close()
+    else:
+        roster_lower = [r.lower().strip() for r in roster]
+        ph_list = ','.join(['?'] * len(roster_lower))
+        c1 = db.execute(
+            f"UPDATE stores SET rep = '' "
+            f"WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+            f"AND LOWER(TRIM(rep)) NOT IN ({ph_list})",
+            roster_lower,
+        )
+        cleared_count = c1.rowcount
+        c2 = db.execute(
+            f"UPDATE territories SET rep_name = ? "
+            f"WHERE LOWER(TRIM(COALESCE(rep_name,''))) NOT IN ({ph_list}) OR rep_name IS NULL",
+            [placeholder] + roster_lower,
+        )
+        terr_reset = c2.rowcount
+        db.commit()
+
+    try:
+        _log_event('roster_set', 'admin', None, '',
+                   {'roster': roster, 'cleared_stores_count': cleared_count,
+                    'territories_reset': terr_reset, 'placeholder': placeholder})
+    except Exception:
+        pass
+
+    return jsonify({
+        'status': 'ok',
+        'roster': roster,
+        'cleared_stores_count': cleared_count,
+        'territories_reset_to_placeholder': terr_reset,
+        'placeholder': placeholder,
+    })
+
+
+@app.route('/api/crm/admin/bulk-reassign-rep', methods=['POST'])
+def api_crm_admin_bulk_reassign_rep():
+    """Move every store from one rep to another in one shot.
+
+    Body: {from_rep: 'Tyler Weber', to_rep: 'Neeraj'}
+    Useful for rolling new hires into the system.
+    """
+    body = request.get_json(silent=True) or {}
+    from_rep = (body.get('from_rep') or '').strip()
+    to_rep = (body.get('to_rep') or '').strip()
+    if not to_rep:
+        return jsonify({'error': 'to_rep required'}), 400
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    if from_rep:
+        # Move stores from one rep to another
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"UPDATE stores SET rep = %s WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s))",
+                (to_rep, from_rep),
+            )
+            n = cur.rowcount
+            db.commit()
+            cur.close()
+        else:
+            c = db.execute(
+                f"UPDATE stores SET rep = ? WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?))",
+                (to_rep, from_rep),
+            )
+            n = c.rowcount
+            db.commit()
+    else:
+        # Move all stores with no rep to the target rep
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                f"UPDATE stores SET rep = %s WHERE rep IS NULL OR TRIM(rep) = ''",
+                (to_rep,),
+            )
+            n = cur.rowcount
+            db.commit()
+            cur.close()
+        else:
+            c = db.execute(
+                f"UPDATE stores SET rep = ? WHERE rep IS NULL OR TRIM(rep) = ''",
+                (to_rep,),
+            )
+            n = c.rowcount
+            db.commit()
+    try:
+        _log_event('rep_bulk_reassign', 'admin', None, '',
+                   {'from_rep': from_rep or '(empty)', 'to_rep': to_rep, 'count': n})
+    except Exception:
+        pass
+    return jsonify({'status': 'ok', 'reassigned': n, 'to_rep': to_rep})
 
 
 @app.route('/api/crm/territories/<int:territory_id>/assign-stores', methods=['POST'])
