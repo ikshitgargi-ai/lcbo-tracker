@@ -3365,6 +3365,21 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 conn.commit()
         except Exception:
             pass
+        # Email the user — SOD ingest failures are critical, the rep workflow depends on this data.
+        try:
+            send_alert(
+                subject=f"SOD sync FAILED: {source}",
+                body=(
+                    f"SOD ingest from source '{source}' failed at {datetime.utcnow().isoformat()}Z.\n\n"
+                    f"Error:\n{err[:1500]}\n\n"
+                    f"This means the rep dashboard, route planner, and gap reports may show stale data\n"
+                    f"until the next successful sync. The daily health check at 06:00 / 14:00 ET will\n"
+                    f"attempt auto-recovery; you can also POST /api/sod/sync to retry manually."
+                ),
+                level='critical',
+            )
+        except Exception as _:
+            pass
         return {'status': 'failed', 'source': source, 'error': err}
     finally:
         try:
@@ -4534,32 +4549,37 @@ def start_health_scheduler():
                 if not report['healthy']:
                     failed = [c for c in report['checks'] if not c['ok']]
                     print(f"[health] FAILED CHECKS: {failed}")
-                    # Webhook alert (Slack/Discord/Make/Zapier — set ALERT_WEBHOOK_URL env var)
-                    webhook = os.environ.get('ALERT_WEBHOOK_URL', '').strip()
-                    if webhook and http_requests:
-                        try:
-                            http_requests.post(
-                                webhook,
-                                json={
-                                    'text': f"LCBO Tracker health check FAILED: {report['summary']}",
-                                    'attachments': [{
-                                        'color': 'danger',
-                                        'title': 'Failed checks',
-                                        'text': '\n'.join(
-                                            f"• {c['name']}: {c['detail']}" for c in failed
-                                        ),
-                                        'fields': [{
-                                            'title': 'Recovered actions',
-                                            'value': ', '.join(report.get('recovered', [])) or 'none',
-                                        }],
-                                    }],
-                                },
-                                timeout=10,
-                            )
-                        except Exception as we:
-                            print(f"[health] webhook failed: {we}")
+                    body_lines = [
+                        f"Health check failed at {datetime.utcnow().isoformat()}Z",
+                        f"Summary: {report['summary']}",
+                        '',
+                        'Failed checks:',
+                    ]
+                    for c in failed:
+                        body_lines.append(f"  • {c['name']}: {c['detail']}")
+                    if report.get('recovered'):
+                        body_lines.append('')
+                        body_lines.append(f"Auto-recovered: {', '.join(report['recovered'])}")
+                    fresh = report.get('freshness', {})
+                    if fresh:
+                        body_lines.append('')
+                        body_lines.append(f"Latest SOD snapshot: {fresh.get('latest_snapshot')} ({fresh.get('snapshot_age_days')}d old)")
+                        body_lines.append(f"Last successful run: {fresh.get('last_run_age_hours')}h ago")
+                    send_alert(
+                        subject=f"Health check FAILED: {len(failed)} issue(s)",
+                        body='\n'.join(body_lines),
+                        level='critical' if any(c['name'].startswith('sod_') for c in failed) else 'warning',
+                    )
             except Exception as e:
                 print(f"[health] check failed: {e}")
+                try:
+                    send_alert(
+                        subject="Health check raised an exception",
+                        body=f"_daily_health_check exception: {e}",
+                        level='critical',
+                    )
+                except Exception:
+                    pass
         sched.add_job(
             _run,
             CronTrigger(hour=6, minute=0),  # 06:00 ET — after SOD sync at 03:00
@@ -4584,6 +4604,123 @@ def start_health_scheduler():
         print('[health] Daily health check scheduled at 06:00 + 14:00 ET')
     except Exception as e:
         print(f'[health] scheduler failed: {e}')
+
+
+# ======================================================================================
+# ============================== EMAIL + WEBHOOK ALERTS ================================
+#
+# Email alerts so the user knows when:
+#   - SOD ingest fails or the latest report doesn't arrive
+#   - The daily health check detects stale data, missing tracked-SKU rows,
+#     or stuck rows
+#   - The backend can't sync (DB unreachable, scheduler failed)
+#   - Subscription / billing issues bubble up via the alert webhook
+#
+# Two delivery paths, configured via env vars (set EITHER, BOTH, or NEITHER):
+#   1) Resend API   — RESEND_API_KEY + ALERT_EMAIL_TO + (optional) ALERT_EMAIL_FROM
+#   2) Plain SMTP   — SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL_TO
+#                     + (optional) ALERT_EMAIL_FROM
+#
+# Plus the existing ALERT_WEBHOOK_URL keeps working for Slack/Discord/Make/Zapier.
+# Failures are logged and never crash the caller.
+
+def send_alert(subject: str, body: str, level: str = 'warning'):
+    """Best-effort send: email (Resend then SMTP) + webhook. Logs every attempt.
+
+    level: 'info' | 'warning' | 'critical' — colors / prefixes the subject.
+    """
+    prefix = {'info': '✓', 'warning': '⚠', 'critical': '🔴'}.get(level, '⚠')
+    full_subject = f"[Anu LCBO] {prefix} {subject}"
+    print(f"[alert/{level}] {subject}")
+
+    # ---- 1. Resend API (preferred — clean HTTP) ----
+    resend_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_addr = os.environ.get('ALERT_EMAIL_TO', '').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+    if resend_key and to_addr and http_requests:
+        try:
+            r = http_requests.post(
+                'https://api.resend.com/emails',
+                headers={
+                    'Authorization': f'Bearer {resend_key}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'from': from_addr,
+                    'to': [a.strip() for a in to_addr.split(',') if a.strip()],
+                    'subject': full_subject,
+                    'text': body,
+                },
+                timeout=10,
+            )
+            if r.status_code in (200, 201, 202):
+                print(f"[alert] resend ok ({r.status_code})")
+            else:
+                print(f"[alert] resend failed {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[alert] resend exception: {e}")
+    elif to_addr:
+        # ---- 2. SMTP fallback ----
+        smtp_host = os.environ.get('SMTP_HOST', '').strip()
+        if smtp_host:
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                msg = MIMEText(body, 'plain', 'utf-8')
+                msg['Subject'] = full_subject
+                msg['From'] = from_addr
+                msg['To'] = to_addr
+                port = int(os.environ.get('SMTP_PORT', '587'))
+                user = os.environ.get('SMTP_USER', '')
+                pw = os.environ.get('SMTP_PASS', '')
+                with smtplib.SMTP(smtp_host, port, timeout=15) as s:
+                    s.ehlo()
+                    if port == 587:
+                        s.starttls()
+                        s.ehlo()
+                    if user and pw:
+                        s.login(user, pw)
+                    s.sendmail(from_addr, [a.strip() for a in to_addr.split(',') if a.strip()], msg.as_string())
+                print("[alert] smtp ok")
+            except Exception as e:
+                print(f"[alert] smtp exception: {e}")
+
+    # ---- 3. Webhook (Slack/Discord/Make/Zapier) ----
+    webhook = os.environ.get('ALERT_WEBHOOK_URL', '').strip()
+    if webhook and http_requests:
+        try:
+            color = {'info': 'good', 'warning': 'warning', 'critical': 'danger'}.get(level, 'warning')
+            http_requests.post(
+                webhook,
+                json={
+                    'text': full_subject,
+                    'attachments': [{'color': color, 'text': body[:3000]}],
+                },
+                timeout=10,
+            )
+            print("[alert] webhook ok")
+        except Exception as e:
+            print(f"[alert] webhook exception: {e}")
+
+
+@app.route('/api/admin/test-alert', methods=['POST', 'GET'])
+def api_test_alert():
+    """Fire a test alert through every configured channel. Use after configuring
+    RESEND_API_KEY / SMTP / ALERT_WEBHOOK_URL to verify the wiring works.
+    """
+    subject = request.args.get('subject', 'Test alert')
+    body = request.args.get('body', 'This is a test alert from the LCBO Tracker. '
+                             'If you received this email or webhook ping, alerts are wired correctly.')
+    level = request.args.get('level', 'info')
+    send_alert(subject, body, level=level)
+    return jsonify({
+        'status': 'sent',
+        'channels_configured': {
+            'resend': bool(os.environ.get('RESEND_API_KEY')) and bool(os.environ.get('ALERT_EMAIL_TO')),
+            'smtp': bool(os.environ.get('SMTP_HOST')) and bool(os.environ.get('ALERT_EMAIL_TO')),
+            'webhook': bool(os.environ.get('ALERT_WEBHOOK_URL')),
+        },
+    })
 
 
 # ======================================================================================
