@@ -7731,6 +7731,73 @@ def api_crm_cities():
     return jsonify([{'city': r[0], 'store_count': int(r[1])} for r in rows])
 
 
+@app.route('/api/crm/store-search', methods=['GET'])
+def api_crm_store_search():
+    """Typeahead lookup: match by store_number, account name, address, OR city.
+
+    Used by the rep "Quick Log" sheet so reps can paste either a number or any
+    fragment of the store name/address. Returns up to 10 matches with the same
+    fields the StoreLookup card needs (autopopulate name + address + phone +
+    manager).
+    """
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 2:
+        return jsonify({'matches': [], 'query': q})
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    like = f'%{q}%'
+    # If the query is a digit, prefer exact + prefix store_number matches
+    digits = q.isdigit()
+    sql = f"""
+        SELECT s.id, s.store_number, COALESCE(s.account, ''), COALESCE(s.address, ''),
+               COALESCE(s.city, ''), COALESCE(s.postal, ''),
+               COALESCE(s.phone, ''), COALESCE(s.manager_phone, ''),
+               COALESCE(s.manager_name, ''), COALESCE(s.rep, ''),
+               COALESCE(s.lat, 0), COALESCE(s.lng, 0)
+        FROM stores s
+        WHERE (
+              CAST(s.store_number AS TEXT) LIKE {ph}
+           OR LOWER(s.account) LIKE LOWER({ph})
+           OR LOWER(s.address) LIKE LOWER({ph})
+           OR LOWER(s.city) LIKE LOWER({ph})
+           OR LOWER(s.postal) LIKE LOWER({ph})
+        )
+        ORDER BY
+          CASE WHEN CAST(s.store_number AS TEXT) = {ph} THEN 0
+               WHEN CAST(s.store_number AS TEXT) LIKE {ph} THEN 1
+               ELSE 2 END,
+          s.store_number
+        LIMIT 10
+    """
+    params = (like, like, like, like, like, q, f'{q}%')
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        # SQLite uses ? placeholders identically
+        rows = db.execute(sql, params).fetchall()
+    matches = [
+        {
+            'id': r[0],
+            'store_number': r[1],
+            'account': r[2],
+            'address': r[3],
+            'city': r[4],
+            'postal': r[5],
+            'phone': r[6],
+            'manager_phone': r[7],
+            'manager_name': r[8],
+            'rep': r[9],
+            'lat': float(r[10]) if r[10] else 0,
+            'lng': float(r[11]) if r[11] else 0,
+        }
+        for r in rows
+    ]
+    return jsonify({'matches': matches, 'query': q})
+
+
 @app.route('/api/crm/nearby', methods=['GET'])
 def api_crm_nearby():
     """Stores near a given lat/lng, sorted by distance.
