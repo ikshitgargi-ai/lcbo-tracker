@@ -2604,21 +2604,41 @@ SOD_USER = os.environ.get('SOD_USER', '').strip()
 SOD_PASSWORD = os.environ.get('SOD_PASSWORD', '').strip()
 SOD_AGENT_ID = os.environ.get('SOD_AGENT_ID', '1113').strip()  # default: VINETER/XTVTR
 
-# ------- SKU → brand mapping (only Anu/NB Distillers products tracked in reports) -------
-# Keys are 7-char zero-padded SKUs (matches what SOD emits)
+# ------- SKU → brand mapping -------
+# Keys are 7-char zero-padded SKUs (matches what SOD emits).
+# NB Distillers is the PRIMARY paying client. Goenchi + Fratelli are
+# Anu's secondary import portfolio — tracked separately in /anu-import.
 SOD_TRACKED_SKUS = {
-    # NB Distillers (Anu-owned)
+    # NB Distillers (PRIMARY paying client)
     '0020187': ('NB Distillers', 'Red Admiral Vodka'),
     '0022246': ('NB Distillers', 'Chak De Canadian Whisky'),
-    # Goenchi (Anu portfolio)
+    # Anu Import portfolio (SECONDARY)
     '0046340': ('Goenchi', 'Goenchi Cashew Feni'),
     '0046343': ('Goenchi', 'Goenchi Coconut Feni'),
-    # Fratelli (Anu portfolio)
     '0046282': ('Fratelli', 'Fratelli Classic Shiraz'),
     '0046285': ('Fratelli', 'Fratelli Chenin Blanc'),
     '0046286': ('Fratelli', 'Fratelli Sauvignon Blanc'),
     '0046287': ('Fratelli', 'Fratelli Cabernet Sauvignon'),
 }
+
+# Client classification — drives whether a SKU appears in NB-primary views vs the
+# /anu-import secondary section.
+SOD_PRIMARY_BRAND = 'NB Distillers'
+SOD_ANU_IMPORT_BRANDS = {'Goenchi', 'Fratelli'}
+
+
+def sku_client_class(sku):
+    """Return 'nb_primary' for NB Distillers SKUs, 'anu_import' for the rest."""
+    brand, _ = SOD_TRACKED_SKUS.get(sku, ('', ''))
+    return 'nb_primary' if brand == SOD_PRIMARY_BRAND else 'anu_import'
+
+
+def primary_skus():
+    return [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b == SOD_PRIMARY_BRAND]
+
+
+def anu_import_skus():
+    return [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b in SOD_ANU_IMPORT_BRANDS]
 
 _SOD_CSRF_RE = re.compile(
     r'<input[^>]*name="csrf_token"[^>]*value="([^"]+)"', re.IGNORECASE
@@ -7415,6 +7435,301 @@ def api_crm_wow_deltas():
     })
 
 
+@app.route('/api/crm/route-planner', methods=['GET'])
+def api_crm_route_planner():
+    """Build an optimized rep route for a day.
+
+    Filter: stores in a city/district with AT MOST `max_skus_listed` of our
+    tracked SKUs currently listed (default 1) — i.e. priority targets that
+    have zero or one of our products and need attention.
+
+    Optimization: nearest-neighbor TSP starting from start_lat/start_lng (rep's
+    current location) or the first store if no start coords.
+
+    Query params:
+      city           — exact city match (e.g. 'Toronto')
+      district       — territory name match (e.g. 'GTA West') — alternative to city
+      max_skus_listed — stores with ≤ this many of our SKUs at status='L' (default 1)
+      brand          — 'NB Distillers' or 'Anu Import' to scope by brand
+      max_stops      — cap (default 10)
+      start_lat, start_lng — optimize from this location
+      include_no_lcbo — include stores not yet in our CRM (default false)
+    """
+    city = request.args.get('city', '').strip()
+    district = request.args.get('district', '').strip()
+    max_skus_listed = int(request.args.get('max_skus_listed', 1))
+    brand_filter = request.args.get('brand', '').strip()
+    max_stops = int(request.args.get('max_stops', 10))
+    try:
+        start_lat = float(request.args.get('start_lat', 0))
+        start_lng = float(request.args.get('start_lng', 0))
+    except ValueError:
+        start_lat = start_lng = 0.0
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Determine which SKUs count toward "listed at this store"
+    if brand_filter.lower().startswith('anu'):
+        scoped_skus = anu_import_skus()
+    elif brand_filter == 'NB Distillers' or brand_filter.lower() == 'nb':
+        scoped_skus = primary_skus()
+    else:
+        scoped_skus = list(SOD_TRACKED_SKUS.keys())
+    if not scoped_skus:
+        return jsonify({'route': [], 'totals': {}})
+    sku_phs = ','.join([ph] * len(scoped_skus))
+
+    # Pull stores in the city/district with valid coords
+    where = ['s.lat <> 0', 's.lng <> 0']
+    params = []
+    if city:
+        where.append(f'LOWER(s.city) = LOWER({ph})')
+        params.append(city)
+    elif district:
+        where.append(f'LOWER(t.name) LIKE LOWER({ph})')
+        params.append(f'%{district}%')
+    sql_where = ' AND '.join(where)
+
+    # For each candidate store, count how many of our SKUs are listed at status='L'
+    # at the latest snapshot per SKU.
+    q = f"""
+        WITH latest_per_sku AS (
+            SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+            WHERE sku IN ({sku_phs}) GROUP BY sku
+        ),
+        store_listed AS (
+            SELECT i.store_number, COUNT(DISTINCT i.sku) AS listed_count
+            FROM sod_inventory i
+            JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date
+            WHERE i.sku IN ({sku_phs}) AND i.status = 'L'
+            GROUP BY i.store_number
+        )
+        SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
+               s.priority, s.rep, s.lat, s.lng, s.manager_name, s.manager_phone,
+               COALESCE(t.id, 0), COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+               COALESCE(sl.listed_count, 0) AS listed_count
+        FROM stores s
+        LEFT JOIN territories t ON t.id = s.territory_id
+        LEFT JOIN store_listed sl ON sl.store_number = s.store_number
+        WHERE {sql_where}
+        AND COALESCE(sl.listed_count, 0) <= {ph}
+    """
+    final_params = scoped_skus + scoped_skus + params + [max_skus_listed]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, final_params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, final_params).fetchall()
+
+    candidates = [{
+        'store_id': r[0], 'store_number': r[1], 'account': r[2],
+        'address': r[3], 'city': r[4], 'postal': r[5], 'priority': r[6],
+        'rep': r[7] or '', 'lat': float(r[8] or 0), 'lng': float(r[9] or 0),
+        'manager_name': r[10] or '', 'manager_phone': r[11] or '',
+        'territory_id': r[12] or None, 'territory_name': r[13],
+        'territory_color': r[14], 'skus_listed': int(r[15] or 0),
+    } for r in rows if r[8] and r[9]]
+
+    if not candidates:
+        return jsonify({
+            'route': [], 'total_stops': 0, 'total_distance_km': 0,
+            'city': city, 'district': district, 'max_skus_listed': max_skus_listed,
+        })
+
+    # Score: prefer 0-listed > 1-listed > priority='High' > recently-not-visited
+    candidates.sort(key=lambda c: (
+        c['skus_listed'],  # zero first
+        0 if (c['priority'] or '').lower() in ('top', 'high') else 1,
+        c['city'],
+    ))
+
+    # Nearest-neighbor TSP
+    if start_lat and start_lng:
+        seed = {'lat': start_lat, 'lng': start_lng}
+    else:
+        seed = candidates[0]
+    route = []
+    pool = list(candidates)
+    while pool and len(route) < max_stops:
+        nxt = min(pool, key=lambda c: haversine(seed['lat'], seed['lng'], c['lat'], c['lng']))
+        nxt['leg_distance_km'] = round(
+            haversine(seed['lat'], seed['lng'], nxt['lat'], nxt['lng']), 2,
+        )
+        route.append(nxt)
+        pool.remove(nxt)
+        seed = nxt
+
+    total_dist = round(sum(s['leg_distance_km'] for s in route), 1)
+    return jsonify({
+        'city': city or None,
+        'district': district or None,
+        'brand_filter': brand_filter or 'all',
+        'max_skus_listed': max_skus_listed,
+        'total_stops': len(route),
+        'total_distance_km': total_dist,
+        'total_candidates': len(candidates),
+        'route': route,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/anu-import', methods=['GET'])
+def api_crm_anu_import():
+    """Anu Import portfolio tracker (Goenchi + Fratelli) — secondary to NB.
+
+    Same shape as /nb-tracker but scoped to Anu Import SKUs.
+    """
+    skus = anu_import_skus()
+    if not skus:
+        return jsonify({'brand': 'Anu Import', 'skus': [], 'totals': {}})
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(skus))
+    today_d = _toronto_today()
+    since60 = (today_d - timedelta(days=60)).isoformat()
+
+    per_sku = []
+    for sku in skus:
+        brand, pname = SOD_TRACKED_SKUS[sku]
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s", (sku,))
+            latest = cur.fetchone()[0]
+            cur.close()
+        else:
+            latest = db.execute(
+                "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = ?", (sku,)
+            ).fetchone()[0]
+        if not latest:
+            per_sku.append({'sku': sku, 'brand': brand, 'product_name': pname,
+                            'snapshot_date': None, 'listed': 0, 'delisting': 0,
+                            'fully_delisted': 0, 'total_on_hand': 0,
+                            'lcbo_url': f'https://www.lcbo.com/en/product-{int(sku)}'})
+            continue
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0) FROM sod_inventory "
+                "WHERE sku=%s AND snapshot_date=%s",
+                (sku, latest),
+            )
+            r = cur.fetchone()
+            cur.close()
+        else:
+            r = db.execute(
+                "SELECT SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='D' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='F' THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(on_hand), 0) FROM sod_inventory "
+                "WHERE sku=? AND snapshot_date=?",
+                (sku, latest),
+            ).fetchone()
+        per_sku.append({
+            'sku': sku, 'brand': brand, 'product_name': pname,
+            'lcbo_url': f'https://www.lcbo.com/en/product-{int(sku)}',
+            'snapshot_date': str(latest),
+            'listed': int(r[0] or 0), 'delisting': int(r[1] or 0),
+            'fully_delisted': int(r[2] or 0), 'total_on_hand': int(r[3] or 0),
+        })
+
+    # Recent additions
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888'),
+                       (SELECT i.on_hand FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_on_hand,
+                       (SELECT i.status FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1) AS current_status
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('NEW_LISTING','RELISTED')
+                  AND c.change_date >= %s
+                ORDER BY c.change_date DESC LIMIT 100""",
+            skus + [since60],
+        )
+        add_rows = cur.fetchall()
+        cur.close()
+    else:
+        add_rows = db.execute(
+            f"""SELECT c.sku, c.store_number, c.change_date, c.change_type,
+                       s.account, s.city, t.name, COALESCE(t.color, '#888'),
+                       (SELECT i.on_hand FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1),
+                       (SELECT i.status FROM sod_inventory i
+                          WHERE i.sku=c.sku AND i.store_number=c.store_number
+                          ORDER BY i.snapshot_date DESC LIMIT 1)
+                FROM sod_store_sku_changes c
+                LEFT JOIN stores s ON s.store_number = c.store_number
+                LEFT JOIN territories t ON t.id = s.territory_id
+                WHERE c.sku IN ({phs})
+                  AND c.change_type IN ('NEW_LISTING','RELISTED')
+                  AND c.change_date >= ?
+                ORDER BY c.change_date DESC LIMIT 100""",
+            skus + [since60],
+        ).fetchall()
+    additions_60d = [{
+        'sku': r[0], 'product_name': SOD_TRACKED_SKUS.get(r[0], ('', ''))[1],
+        'store_number': r[1], 'change_date': str(r[2]), 'change_type': r[3],
+        'account': r[4], 'city': r[5],
+        'territory_name': r[6] or 'Unassigned', 'territory_color': r[7],
+        'current_on_hand': int(r[8] or 0), 'current_status': r[9],
+    } for r in add_rows]
+
+    totals = {
+        'total_skus': len(skus),
+        'total_listed_stores': sum(p['listed'] for p in per_sku),
+        'total_delisting_stores': sum(p['delisting'] for p in per_sku),
+        'total_on_hand_units': sum(p['total_on_hand'] for p in per_sku),
+        'additions_60d': len(additions_60d),
+    }
+
+    return jsonify({
+        'brand': 'Anu Import',
+        'tagline': 'Goenchi + Fratelli — secondary import portfolio',
+        'skus': skus,
+        'per_sku': per_sku,
+        'totals': totals,
+        'additions_60d': additions_60d,
+        'freshness': _sod_freshness(),
+    })
+
+
+@app.route('/api/crm/cities', methods=['GET'])
+def api_crm_cities():
+    """List all distinct cities with store counts (for route-planner picker)."""
+    db = get_db()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT city, COUNT(*) FROM stores WHERE city IS NOT NULL "
+            "AND TRIM(city) <> '' AND lat <> 0 AND lng <> 0 "
+            "GROUP BY city ORDER BY COUNT(*) DESC, city ASC",
+        )
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(
+            "SELECT city, COUNT(*) FROM stores WHERE city IS NOT NULL "
+            "AND TRIM(city) <> '' AND lat <> 0 AND lng <> 0 "
+            "GROUP BY city ORDER BY COUNT(*) DESC, city ASC",
+        ).fetchall()
+    return jsonify([{'city': r[0], 'store_count': int(r[1])} for r in rows])
+
+
 @app.route('/api/crm/nearby', methods=['GET'])
 def api_crm_nearby():
     """Stores near a given lat/lng, sorted by distance.
@@ -9944,15 +10259,17 @@ def start_lcbo_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
-        # Every 2 hours from 06:00 to 22:00 ET (9 runs/day)
+        # Every 30 minutes from 06:00 to 23:00 ET (35 runs/day) — near-realtime.
+        # User asked for "by-the-second" — this is the closest we can get without
+        # rate-limiting LCBO.com. Each run reconciles tracked SKUs against SOD.
         sched.add_job(
             _lcbo_daily_scrape_worker,
-            CronTrigger(hour='6,8,10,12,14,16,18,20,22', minute=0),
-            id='lcbo_2h_scrape',
+            CronTrigger(hour='6-23', minute='0,30'),
+            id='lcbo_30min_scrape',
             replace_existing=True,
             max_instances=1,
             coalesce=True,
-            misfire_grace_time=3600 * 4,
+            misfire_grace_time=1800 * 2,
         )
         sched.start()
         _lcbo_scheduler = sched
