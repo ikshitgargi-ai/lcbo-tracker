@@ -1,0 +1,49 @@
+# Fly.io config for LCBO Tracker (Anu Spirits CRM backend).
+#
+# This replaces Render. Fly's free tier (shared-cpu-1x, 256MB) handles our load
+# (~10 RPS peak, 1.5M-row SOD ingest streamed in chunks). Always-on by default
+# (auto_stop_machines=false) so APScheduler keeps the 30-min lcbo.com scrape
+# and daily SOD sync running without cold starts.
+#
+# Deploy:  fly launch --no-deploy   (first time, creates app)
+#          fly secrets set DATABASE_URL=... SOD_USER=... ANTHROPIC_API_KEY=... SOD_CRON_TOKEN=...
+#          fly deploy
+#
+# After it's healthy, point the frontend at it via Vercel env:
+#   NEXT_PUBLIC_API_BASE=https://lcbo-tracker.fly.dev
+
+app = "lcbo-tracker"
+primary_region = "yyz"   # Toronto — closest to Neon (us-east) and our LCBO stores
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  PYTHONUNBUFFERED = "1"
+  FLASK_DEBUG = "false"
+  TZ = "America/Toronto"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # keep APScheduler running
+  auto_start_machines = true
+  min_machines_running = 1     # always-on
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512   # bump from 256 for SOD ingest headroom
+
+# Fly.io scheduled jobs (replace Render Cron). The 30-min lcbo.com scrape
+# and daily SOD already run via in-process APScheduler — no external cron
+# needed here.

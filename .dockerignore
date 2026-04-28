@@ -1,0 +1,35 @@
+# Local SQLite DB — production uses Postgres (Neon)
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Git / CI
+.git/
+.github/
+
+# Render-specific (we're migrating off)
+render.yaml
+
+# Tests / data dumps
+tests/
+data/
+
+# Misc
+*.log
+*.zip
