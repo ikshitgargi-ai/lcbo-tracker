@@ -4318,6 +4318,7 @@ def api_healthz():
     healthy = age_days is not None and age_days <= 2
     return jsonify({
         'status': 'healthy' if healthy else 'unhealthy',
+        'build': 'route-planner-anu-import-cities-v2',
         **fresh,
     }), 200 if healthy else 503
 
