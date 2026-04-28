@@ -1881,12 +1881,31 @@ def api_gap_report():
 @app.route('/api/inventory/reorder-needed')
 def api_reorder_needed():
     """REORDER NEEDED: stores with low stock (below threshold) on any tracked product.
-    Query params: threshold (default 5), sku (optional), city (optional)."""
+    Query params: threshold (default 5), sku (optional), city (optional).
+
+    Note: legacy endpoint backed by inventory_cache (SQLite scrape table). On
+    Postgres production we surface SOD-driven reorder via /api/sod/reorder. We
+    return an empty list (with explicit redirect note) instead of 500ing if the
+    legacy table doesn't exist on this DB.
+    """
     threshold = int(request.args.get('threshold', 5))
     sku_filter = request.args.get('sku', '').strip()
     city_filter = request.args.get('city', '').strip()
 
-    # Find low-stock inventory entries
+    if USE_POSTGRES:
+        # Legacy table doesn't exist in Postgres production; redirect callers to /api/sod/reorder
+        return jsonify({
+            'threshold': threshold,
+            'total_reorder_alerts': 0,
+            'critical_count': 0,
+            'high_count': 0,
+            'medium_count': 0,
+            'alerts': [],
+            'note': 'Legacy endpoint (inventory_cache). Use /api/sod/reorder for SOD-driven low-stock alerts.',
+            'generated_at': datetime.now().isoformat(),
+        })
+
+    # Find low-stock inventory entries (SQLite legacy path only)
     query = """
         SELECT ic.store_number, ic.store_name, ic.store_city, ic.quantity,
                p.id as product_id, p.lcbo_sku, p.name as product_name, p.brand, p.price,
