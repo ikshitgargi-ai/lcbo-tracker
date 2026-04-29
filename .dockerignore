@@ -33,3 +33,8 @@ data/
 # Misc
 *.log
 *.zip
+
+# Local fly secrets (NEVER ship into Docker image)
+.env.fly
+.env
+.env.local

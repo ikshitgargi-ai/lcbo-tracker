@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 lcbo_tracker.db
 .env
+.env.fly
+.env.local
+.DS_Store
 *.db-journal
 *.db-wal
 lcbo_tracker.db-shm
