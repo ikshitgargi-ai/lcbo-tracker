@@ -6249,6 +6249,171 @@ def api_admin_db_stats():
         'total_rows': sum(v for v in stats.values() if isinstance(v, int)),
         'snapshot_freshness': _sod_freshness(),
         'admin_token_required': bool(os.environ.get('ADMIN_TOKEN')),
+        'data_host': 'Neon Postgres (separate from app host) — data persists across host migrations',
+    })
+
+
+def _build_essential_backup():
+    """Build the essential backup payload (small enough to email): every CRM
+    table EXCEPT the giant SOD inventory snapshots. Returns a dict ready to
+    be JSON-serialized.
+    """
+    db = get_db()
+    out = {
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'schema_version': 1,
+        'include': 'core',
+        'tables': {},
+    }
+    excluded = {'sod_inventory', 'inventory_history'}
+    for tname, _pk in _EXPORT_TABLES:
+        if tname in excluded:
+            continue
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(f"SELECT * FROM {tname}")
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in cur.fetchall()]
+                cur.close()
+            else:
+                rows_raw = db.execute(f"SELECT * FROM {tname}").fetchall()
+                cols = [d[0] for d in db.execute(f"SELECT * FROM {tname} LIMIT 0").description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in rows_raw]
+            out['tables'][tname] = {'row_count': len(rows), 'columns': cols, 'rows': rows}
+        except Exception as e:
+            out['tables'][tname] = {'error': str(e)}
+    return out
+
+
+def _send_backup_email(payload: dict):
+    """Email the backup JSON as an attachment via Resend. Best-effort — logs
+    failure but never raises (we don't want backup failure to crash the cron).
+    """
+    resend_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_addr = os.environ.get('ALERT_EMAIL_TO', '').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+    if not (resend_key and to_addr and http_requests):
+        print("[backup] skipped — RESEND_API_KEY or ALERT_EMAIL_TO not configured")
+        return False
+    import json as _json, base64
+    body_json = _json.dumps(payload, separators=(',', ':'))
+    b64 = base64.b64encode(body_json.encode('utf-8')).decode('ascii')
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    total_rows = sum(t.get('row_count', 0) for t in payload.get('tables', {}).values() if isinstance(t, dict))
+    summary_lines = ['Daily backup — Anu LCBO Tracker', f"Date: {today}",
+                     f"Total rows: {total_rows}", '', 'Per-table row counts:']
+    for tname, td in sorted(payload.get('tables', {}).items()):
+        if isinstance(td, dict):
+            n = td.get('row_count', 'ERR' if 'error' in td else '?')
+            summary_lines.append(f"  • {tname:30s} {n}")
+    summary_lines += ['', 'To restore on a new host:',
+                      '  1. Stand up the app on a new host pointed at a fresh Postgres DB',
+                      '  2. Download this attachment',
+                      '  3. POST it to /api/admin/import?mode=merge with X-Admin-Token header',
+                      '',
+                      'Note: SOD inventory rows (1M+) are NOT in this backup — those rebuild',
+                      'automatically on the next SOD sync. CRM data, audit log, and pipeline',
+                      'state ARE in this backup.']
+    try:
+        r = http_requests.post(
+            'https://api.resend.com/emails',
+            headers={'Authorization': f'Bearer {resend_key}', 'Content-Type': 'application/json'},
+            json={
+                'from': from_addr,
+                'to': [a.strip() for a in to_addr.split(',') if a.strip()],
+                'subject': f'[Anu LCBO] Daily backup — {today} — {total_rows} rows',
+                'text': '\n'.join(summary_lines),
+                'attachments': [{
+                    'filename': f'anu-lcbo-backup-{today}.json',
+                    'content': b64,
+                }],
+            },
+            timeout=30,
+        )
+        if r.status_code in (200, 201, 202):
+            print(f"[backup] daily backup emailed ({total_rows} rows, {len(body_json)} bytes)")
+            return True
+        else:
+            print(f"[backup] resend failed {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[backup] email exception: {e}")
+    return False
+
+
+_backup_scheduler = None
+
+
+def start_backup_scheduler():
+    """Run a daily backup at 02:00 ET (before SOD sync at 03:00) — emails the
+    full CRM backup as a JSON attachment to ALERT_EMAIL_TO. Belt-and-suspenders
+    for data loss: if Render runs out of credits AND Neon goes offline AND we
+    lose the latest hot data, the user still has yesterday's snapshot in email.
+    """
+    global _backup_scheduler
+    if _backup_scheduler is not None:
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[backup] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+
+        def _run_backup():
+            try:
+                payload = _build_essential_backup()
+                ok = _send_backup_email(payload)
+                if not ok:
+                    send_alert(
+                        subject="Daily backup failed to send",
+                        body="The daily backup couldn't be emailed. Verify RESEND_API_KEY + "
+                             "ALERT_EMAIL_TO are set. Hit /api/admin/export manually as a fallback.",
+                        level='warning',
+                    )
+            except Exception as e:
+                print(f"[backup] daily run failed: {e}")
+                try:
+                    send_alert(
+                        subject="Daily backup raised an exception",
+                        body=f"_run_backup exception: {e}",
+                        level='warning',
+                    )
+                except Exception:
+                    pass
+
+        sched.add_job(
+            _run_backup,
+            CronTrigger(hour=2, minute=0),  # 02:00 ET
+            id='daily_backup',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 6,
+        )
+        sched.start()
+        _backup_scheduler = sched
+        print('[backup] Daily backup scheduled at 02:00 ET (emails to ALERT_EMAIL_TO)')
+    except Exception as e:
+        print(f'[backup] scheduler failed: {e}')
+
+
+@app.route('/api/admin/run-backup-now', methods=['POST'])
+def api_admin_run_backup_now():
+    """Trigger an immediate backup-to-email. Auth: X-Admin-Token."""
+    if not _admin_token_ok():
+        return jsonify({'error': 'forbidden — set X-Admin-Token header'}), 403
+    payload = _build_essential_backup()
+    ok = _send_backup_email(payload)
+    return jsonify({
+        'status': 'sent' if ok else 'skipped',
+        'rows': sum(t.get('row_count', 0) for t in payload.get('tables', {}).values() if isinstance(t, dict)),
+        'email_to': os.environ.get('ALERT_EMAIL_TO', '(not set)'),
     })
 
 
@@ -10770,6 +10935,9 @@ start_sod_scheduler()
 start_lcbo_scheduler()
 # Sprint 5: daily automated health check + auto-recovery (06:00 + 14:00 ET).
 start_health_scheduler()
+# Sprint 6: daily backup-to-email at 02:00 ET so data is recoverable even if
+# the host AND the DB die (worst-case disaster recovery via email attachment).
+start_backup_scheduler()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
