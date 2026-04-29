@@ -6181,7 +6181,7 @@ _EXPORT_TABLES = [
     ('activities',                 'id'),
     ('deals',                      'id'),
     ('followups',                  'id'),
-    ('quotas',                     'id'),
+    ('rep_quotas',                 'id'),
     ('sales_goals',                'id'),
     ('horeca_accounts',            'id'),
     # Audit + history
@@ -6254,6 +6254,12 @@ def api_admin_export():
                 rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in rows_raw]
             out['tables'][tname] = {'row_count': len(rows), 'columns': cols, 'rows': rows}
         except Exception as e:
+            # Postgres: roll back the aborted transaction so subsequent tables work
+            if USE_POSTGRES:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             out['tables'][tname] = {'error': str(e)}
     return jsonify(out)
 
@@ -6380,6 +6386,12 @@ def api_admin_db_stats():
                 row = db.execute(f"SELECT COUNT(*) FROM {tname}").fetchone()
                 stats[tname] = int(row[0])
         except Exception as e:
+            # Postgres: roll back so subsequent table queries don't fail in cascade
+            if USE_POSTGRES:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             stats[tname] = f"ERR: {str(e)[:100]}"
     return jsonify({
         'tables': stats,
@@ -6419,6 +6431,12 @@ def _build_essential_backup():
                 rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in rows_raw]
             out['tables'][tname] = {'row_count': len(rows), 'columns': cols, 'rows': rows}
         except Exception as e:
+            # Postgres: must rollback after error or subsequent queries fail
+            if USE_POSTGRES:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             out['tables'][tname] = {'error': str(e)}
     return out
 
