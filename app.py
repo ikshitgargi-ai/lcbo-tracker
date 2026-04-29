@@ -5977,6 +5977,9 @@ def api_crm_backup():
     """One-shot JSON dump of all CRM + SOD tables. Use for offline backup / disaster recovery.
 
     Pipe to a file:  curl https://.../api/crm/backup > backup-$(date +%F).json
+
+    For a complete plug-and-play export including audit + inventory tables, use
+    /api/admin/export instead.
     """
     db = get_db()
     tables = [
@@ -6002,6 +6005,251 @@ def api_crm_backup():
         except Exception as e:
             out['tables'][t] = {'error': str(e)}
     return jsonify(out)
+
+
+# ============================================================================
+# PLUG-AND-PLAY EXPORT/IMPORT — one-button host migration safety net.
+#
+# Scenario: app dies on host X. You want to spin up the same code on host Y
+# pointed at the same Neon DB — no migration needed (data is in Neon, not on
+# the host). But if you want to MOVE the data too (different DB, different
+# Postgres provider), use:
+#
+#   1. Pull full snapshot from running app:
+#        curl -H "X-Admin-Token: $TOKEN" https://OLD/api/admin/export?include=core \
+#          > anu-tracker-backup.json
+#
+#   2. Stand up a fresh app on the new host (pointed at a fresh Postgres). The
+#      schema bootstraps automatically on first request.
+#
+#   3. Push the snapshot in:
+#        curl -X POST -H "X-Admin-Token: $TOKEN" -H "Content-Type: application/json" \
+#             --data-binary @anu-tracker-backup.json \
+#             https://NEW/api/admin/import?mode=merge
+#
+# All tables are upserted by primary key — safe to run twice, idempotent.
+# ============================================================================
+
+# Tables in dependency order — parents before children (for clean restore).
+# Audit tables (event_log, sod_store_sku_changes) included so you keep history.
+_EXPORT_TABLES = [
+    # Core CRM (parents first)
+    ('territories',                'id'),
+    ('stores',                     'id'),
+    ('reps',                       'id'),
+    # Reference data
+    ('products',                   'id'),
+    ('sod_products',               'sku'),
+    # Activity / pipeline (depends on stores)
+    ('activities',                 'id'),
+    ('deals',                      'id'),
+    ('followups',                  'id'),
+    ('quotas',                     'id'),
+    ('sales_goals',                'id'),
+    ('horeca_accounts',            'id'),
+    # Audit + history
+    ('event_log',                  'id'),
+    ('sod_listing_changes',        'id'),
+    ('sod_store_sku_changes',      'id'),
+    ('sod_sync_runs',              'id'),
+    # Optional (large)
+    ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
+    ('inventory_history',          None),
+]
+
+
+def _admin_token_ok() -> bool:
+    """Verify X-Admin-Token header against ADMIN_TOKEN env var.
+
+    If ADMIN_TOKEN is not set, only allow from localhost (dev convenience).
+    """
+    expected = os.environ.get('ADMIN_TOKEN', '').strip()
+    if not expected:
+        # Dev-only: allow if request looks local
+        return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
+    got = request.headers.get('X-Admin-Token', '').strip()
+    return bool(expected) and got == expected
+
+
+@app.route('/api/admin/export', methods=['GET'])
+def api_admin_export():
+    """Full JSON export — plug-and-play backup. Auth: X-Admin-Token header.
+
+    Query params:
+      include = 'core' (default — every table EXCEPT sod_inventory + inventory_history)
+              | 'all'  (everything, can be 100MB+)
+              | 'essential' (stores + territories + activities + deals + quotas)
+
+    Returns: { generated_at, schema_version, include, tables: {name: {row_count, rows}} }
+    """
+    if not _admin_token_ok():
+        return jsonify({'error': 'forbidden — set X-Admin-Token header'}), 403
+
+    include = request.args.get('include', 'core')
+    if include == 'essential':
+        wanted = {'territories', 'stores', 'activities', 'deals', 'quotas', 'reps'}
+    elif include == 'all':
+        wanted = {t for t, _ in _EXPORT_TABLES}
+    else:
+        # core: everything except the two largest tables
+        wanted = {t for t, _ in _EXPORT_TABLES if t not in ('sod_inventory', 'inventory_history')}
+
+    db = get_db()
+    out = {
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'schema_version': 1,
+        'include': include,
+        'tables': {},
+    }
+    for tname, _pk in _EXPORT_TABLES:
+        if tname not in wanted:
+            continue
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(f"SELECT * FROM {tname}")
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in cur.fetchall()]
+                cur.close()
+            else:
+                rows_raw = db.execute(f"SELECT * FROM {tname}").fetchall()
+                cols = [d[0] for d in db.execute(f"SELECT * FROM {tname} LIMIT 0").description]
+                rows = [dict(zip(cols, [_json_safe(v) for v in row])) for row in rows_raw]
+            out['tables'][tname] = {'row_count': len(rows), 'columns': cols, 'rows': rows}
+        except Exception as e:
+            out['tables'][tname] = {'error': str(e)}
+    return jsonify(out)
+
+
+@app.route('/api/admin/import', methods=['POST'])
+def api_admin_import():
+    """Restore from /api/admin/export JSON. Auth: X-Admin-Token header.
+
+    Modes (?mode=...):
+      merge   = upsert every row by PK; rows that exist are updated, new rows added (default, safest)
+      append  = INSERT only; skip rows whose PK already exists (no updates)
+      replace = TRUNCATE table then INSERT (DESTRUCTIVE — confirmation required via ?confirm=YES)
+
+    Returns per-table results with insert/update/skip counts.
+    """
+    if not _admin_token_ok():
+        return jsonify({'error': 'forbidden — set X-Admin-Token header'}), 403
+
+    mode = (request.args.get('mode') or 'merge').lower()
+    if mode == 'replace' and request.args.get('confirm') != 'YES':
+        return jsonify({'error': 'replace mode is destructive — pass ?confirm=YES to proceed'}), 400
+
+    payload = request.get_json(silent=True) or {}
+    tables = payload.get('tables') or {}
+    if not isinstance(tables, dict) or not tables:
+        return jsonify({'error': 'invalid payload — expected {tables: {name: {rows: [...]}}}'}), 400
+
+    db = get_db()
+    results = {}
+    for tname, pk in _EXPORT_TABLES:
+        td = tables.get(tname)
+        if not td or 'rows' not in td:
+            continue
+        rows = td.get('rows') or []
+        cols = td.get('columns') or (list(rows[0].keys()) if rows else [])
+        if not cols:
+            results[tname] = {'inserted': 0, 'updated': 0, 'skipped': 0, 'error': 'no columns'}
+            continue
+        ins = upd = skip = 0
+        err = None
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                if mode == 'replace':
+                    cur.execute(f"TRUNCATE TABLE {tname} RESTART IDENTITY CASCADE")
+                placeholders = ','.join(['%s'] * len(cols))
+                col_list = ','.join(cols)
+                if mode == 'merge' and pk:
+                    update_set = ','.join(f"{c}=EXCLUDED.{c}" for c in cols if c != pk)
+                    sql = (f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) "
+                           f"ON CONFLICT ({pk}) DO UPDATE SET {update_set}")
+                elif mode == 'append' and pk:
+                    sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) ON CONFLICT ({pk}) DO NOTHING"
+                else:
+                    sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders})"
+                for r in rows:
+                    vals = tuple(r.get(c) for c in cols)
+                    try:
+                        cur.execute(sql, vals)
+                        if cur.rowcount == 1:
+                            ins += 1
+                        else:
+                            upd += 1
+                    except Exception as e:
+                        # roll back this row's transaction so subsequent rows still work
+                        db.rollback()
+                        skip += 1
+                        if err is None:
+                            err = f"{type(e).__name__}: {str(e)[:200]}"
+                        cur = db.cursor()
+                db.commit()
+                cur.close()
+            else:
+                # SQLite path (dev only)
+                if mode == 'replace':
+                    db.execute(f"DELETE FROM {tname}")
+                placeholders = ','.join(['?'] * len(cols))
+                col_list = ','.join(cols)
+                verb = 'INSERT OR REPLACE' if mode == 'merge' else ('INSERT OR IGNORE' if mode == 'append' else 'INSERT')
+                sql = f"{verb} INTO {tname} ({col_list}) VALUES ({placeholders})"
+                for r in rows:
+                    vals = tuple(r.get(c) for c in cols)
+                    try:
+                        c = db.execute(sql, vals)
+                        if c.rowcount > 0:
+                            ins += 1
+                        else:
+                            skip += 1
+                    except Exception as e:
+                        skip += 1
+                        if err is None:
+                            err = f"{type(e).__name__}: {str(e)[:200]}"
+                db.commit()
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:300]}"
+        results[tname] = {'inserted': ins, 'updated': upd, 'skipped': skip, 'error': err}
+
+    return jsonify({
+        'status': 'completed',
+        'mode': mode,
+        'tables': results,
+        'summary': {
+            'tables_imported': sum(1 for r in results.values() if r.get('inserted', 0) + r.get('updated', 0) > 0),
+            'rows_inserted': sum(r.get('inserted', 0) for r in results.values()),
+            'rows_updated': sum(r.get('updated', 0) for r in results.values()),
+            'rows_skipped': sum(r.get('skipped', 0) for r in results.values()),
+        },
+    })
+
+
+@app.route('/api/admin/db-stats', methods=['GET'])
+def api_admin_db_stats():
+    """Quick DB sanity stats — row counts per table + size hints. Public (read-only)."""
+    db = get_db()
+    stats = {}
+    for tname, _pk in _EXPORT_TABLES:
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(f"SELECT COUNT(*) FROM {tname}")
+                stats[tname] = int(cur.fetchone()[0])
+                cur.close()
+            else:
+                row = db.execute(f"SELECT COUNT(*) FROM {tname}").fetchone()
+                stats[tname] = int(row[0])
+        except Exception as e:
+            stats[tname] = f"ERR: {str(e)[:100]}"
+    return jsonify({
+        'tables': stats,
+        'total_rows': sum(v for v in stats.values() if isinstance(v, int)),
+        'snapshot_freshness': _sod_freshness(),
+        'admin_token_required': bool(os.environ.get('ADMIN_TOKEN')),
+    })
 
 
 def _json_safe(v):
