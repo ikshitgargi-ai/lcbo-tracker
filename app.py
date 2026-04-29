@@ -50,6 +50,142 @@ app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),
 app.json_provider_class = PgJSONProvider
 app.json = PgJSONProvider(app)
 
+
+# ============================================================================
+# In-process response cache — saves Render free-tier credits AND speeds up
+# the heavy SKU-aggregation endpoints (velocity, sku-trend, sod-trend) from
+# 16-24s down to <100ms on cache hits. TTL = 5 minutes (data only changes
+# once a day from SOD ingest, but we want fresh-on-demand for new visits).
+# Pure-stdlib so no new dependency = no extra build credits.
+# ============================================================================
+import threading as _threading
+_cache_lock = _threading.RLock()
+_cache_store: dict = {}  # key -> (expires_epoch, value, status_code)
+_CACHE_MAX_ENTRIES = 500
+
+
+def _cache_get(key):
+    with _cache_lock:
+        v = _cache_store.get(key)
+        if v is None:
+            return None
+        expires, val, code = v
+        if expires < datetime.utcnow().timestamp():
+            _cache_store.pop(key, None)
+            return None
+        return (val, code)
+
+
+def _cache_put(key, val, code, ttl_seconds):
+    with _cache_lock:
+        if len(_cache_store) > _CACHE_MAX_ENTRIES:
+            # LRU-ish: drop oldest 20%
+            now = datetime.utcnow().timestamp()
+            expired = [k for k, v in _cache_store.items() if v[0] < now]
+            for k in expired:
+                _cache_store.pop(k, None)
+            if len(_cache_store) > _CACHE_MAX_ENTRIES:
+                # still full — drop arbitrary 20%
+                drop = list(_cache_store.keys())[: _CACHE_MAX_ENTRIES // 5]
+                for k in drop:
+                    _cache_store.pop(k, None)
+        _cache_store[key] = (datetime.utcnow().timestamp() + ttl_seconds, val, code)
+
+
+def cached_response(ttl_seconds: int = 300, key_args: tuple = ()):
+    """Decorator: cache the JSON response of a Flask handler.
+
+    key_args: extra request.args names to include in the cache key.
+    Cache headers are added so clients also benefit from browser caching.
+    """
+    def decorator(fn):
+        from functools import wraps
+
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            # Skip cache when explicitly bypassed (?nocache=1 or X-Bypass-Cache header)
+            if request.args.get('nocache') or request.headers.get('X-Bypass-Cache'):
+                return fn(*args, **kwargs)
+            arg_part = '|'.join(f"{k}={request.args.get(k, '')}" for k in key_args)
+            cache_key = f"{fn.__name__}:{request.path}?{arg_part}:{json.dumps(kwargs, sort_keys=True, default=str)}"
+            hit = _cache_get(cache_key)
+            if hit is not None:
+                val, code = hit
+                resp = Response(val, mimetype='application/json', status=code)
+                resp.headers['X-Cache'] = 'HIT'
+                resp.headers['Cache-Control'] = f'public, max-age={ttl_seconds}'
+                return resp
+            result = fn(*args, **kwargs)
+            # Flask handlers can return jsonify(...) (Response) or (Response, code) tuple
+            code = 200
+            if isinstance(result, tuple):
+                resp_obj, code = result[0], result[1]
+            else:
+                resp_obj = result
+            try:
+                body = resp_obj.get_data(as_text=True)
+                _cache_put(cache_key, body, code, ttl_seconds)
+                resp_obj.headers['X-Cache'] = 'MISS'
+                resp_obj.headers['Cache-Control'] = f'public, max-age={ttl_seconds}'
+            except Exception:
+                pass
+            return result if isinstance(result, tuple) else resp_obj
+
+        return wrapped
+    return decorator
+
+
+# ============================================================================
+# Lightweight rate limiter — protects the worker from accidental 200-parallel
+# bursts (which is what killed Render last week). Per-IP bucket; default 50
+# req/sec. No new dependency, pure stdlib.
+# ============================================================================
+from collections import deque as _deque
+_rate_buckets: dict = {}
+_rate_lock = _threading.RLock()
+
+def _client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+@app.before_request
+def _rate_limit_global():
+    # Skip rate limiting for healthz / root — those are uptime probes
+    if request.path in ('/healthz', '/'):
+        return
+    ip = _client_ip()
+    now = datetime.utcnow().timestamp()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(ip, _deque())
+        while bucket and bucket[0] < now - 1.0:
+            bucket.popleft()
+        if len(bucket) >= 50:  # 50 req/sec per IP
+            return jsonify({'error': 'rate limit — slow down (max 50/sec/IP)'}), 429
+        bucket.append(now)
+        if len(_rate_buckets) > 1000:
+            for k in list(_rate_buckets.keys())[:200]:
+                if not _rate_buckets[k] or _rate_buckets[k][-1] < now - 60:
+                    _rate_buckets.pop(k, None)
+
+
+@app.route('/api/admin/cache-stats', methods=['GET'])
+def api_admin_cache_stats():
+    with _cache_lock:
+        now = datetime.utcnow().timestamp()
+        live = sum(1 for v in _cache_store.values() if v[0] >= now)
+        expired = len(_cache_store) - live
+    return jsonify({'entries_live': live, 'entries_expired': expired, 'total': len(_cache_store)})
+
+
+@app.route('/api/admin/cache-clear', methods=['POST'])
+def api_admin_cache_clear():
+    with _cache_lock:
+        n = len(_cache_store)
+        _cache_store.clear()
+    return jsonify({'cleared': n})
+
 # CORS — allow the Vercel-hosted Next.js frontend to call this backend.
 # Default origins: localhost dev + lcbo-tracker-web.vercel.app + Anu domain.
 # Override via env var CORS_ORIGINS (comma-separated).
@@ -3750,6 +3886,7 @@ def api_sod_reorder():
     })
 
 
+@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/sod/trend/<sku>', methods=['GET'])
 def api_sod_trend(sku):
     """Daily history of store_count + total_on_hand for a SKU (line chart)."""
@@ -6820,6 +6957,7 @@ def _json_safe(v):
 
 
 # ------- CRM dashboard rollup — one-shot for the homepage -------
+@cached_response(ttl_seconds=60, key_args=())
 @app.route('/api/crm/dashboard', methods=['GET'])
 def api_crm_dashboard():
     """Everything the main CRM dashboard needs in one call.
@@ -6938,6 +7076,7 @@ def api_crm_dashboard():
 # ======================================================================================
 
 
+@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/sku-trend/<sku>', methods=['GET'])
 def api_crm_sku_trend(sku):
     """Daily aggregates for a SKU over the last N days (default 90).
@@ -6993,6 +7132,7 @@ def api_crm_sku_trend(sku):
     })
 
 
+@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/store-trend/<int:store_number>', methods=['GET'])
 def api_crm_store_trend(store_number):
     """Daily snapshot for one store across all tracked SKUs."""
@@ -7453,6 +7593,7 @@ def api_crm_distribution_additions():
     })
 
 
+@cached_response(ttl_seconds=120, key_args=())
 @app.route('/api/crm/nb-tracker', methods=['GET'])
 def api_crm_nb_tracker():
     """Dedicated NB Distillers tracker — premium client view.
@@ -8108,6 +8249,7 @@ def api_crm_brand(brand):
     })
 
 
+@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/brands', methods=['GET'])
 def api_crm_brands_list():
     """List all brands we track + KPIs per brand."""
@@ -8189,6 +8331,7 @@ def api_crm_brands_list():
     return jsonify({'brands': out})
 
 
+@cached_response(ttl_seconds=300, key_args=('days',))
 @app.route('/api/crm/portfolio-trend', methods=['GET'])
 def api_crm_portfolio_trend():
     """One time-series across ALL tracked SKUs, per snapshot_date.
@@ -8535,6 +8678,7 @@ def api_crm_route_planner():
     })
 
 
+@cached_response(ttl_seconds=120, key_args=())
 @app.route('/api/crm/anu-import', methods=['GET'])
 def api_crm_anu_import():
     """Anu Import portfolio tracker (Goenchi + Fratelli) — secondary to NB.
@@ -8667,6 +8811,7 @@ def api_crm_anu_import():
     })
 
 
+@cached_response(ttl_seconds=3600, key_args=())
 @app.route('/api/crm/cities', methods=['GET'])
 def api_crm_cities():
     """List all distinct cities with store counts (for route-planner picker)."""
@@ -9238,6 +9383,7 @@ def _sod_velocity_for(sku, store_number=None, days=30):
     }
 
 
+@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/velocity/<sku>', methods=['GET'])
 def api_crm_velocity(sku):
     """Units-per-week velocity for a SKU (aggregated across all stores).
@@ -10059,6 +10205,7 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@cached_response(ttl_seconds=60, key_args=())
 @app.route('/api/crm/manager-dashboard', methods=['GET'])
 def api_crm_manager_dashboard():
     """Single-call aggregate for the /manager page.
