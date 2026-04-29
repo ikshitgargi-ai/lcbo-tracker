@@ -3886,8 +3886,8 @@ def api_sod_reorder():
     })
 
 
-@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/sod/trend/<sku>', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=())
 def api_sod_trend(sku):
     """Daily history of store_count + total_on_hand for a SKU (line chart)."""
     padded = sku.zfill(7)
@@ -6957,8 +6957,8 @@ def _json_safe(v):
 
 
 # ------- CRM dashboard rollup — one-shot for the homepage -------
-@cached_response(ttl_seconds=60, key_args=())
 @app.route('/api/crm/dashboard', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=())
 def api_crm_dashboard():
     """Everything the main CRM dashboard needs in one call.
 
@@ -7076,8 +7076,8 @@ def api_crm_dashboard():
 # ======================================================================================
 
 
-@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/sku-trend/<sku>', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=())
 def api_crm_sku_trend(sku):
     """Daily aggregates for a SKU over the last N days (default 90).
 
@@ -7132,8 +7132,8 @@ def api_crm_sku_trend(sku):
     })
 
 
-@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/store-trend/<int:store_number>', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=())
 def api_crm_store_trend(store_number):
     """Daily snapshot for one store across all tracked SKUs."""
     days = int(request.args.get('days', 90))
@@ -7593,8 +7593,8 @@ def api_crm_distribution_additions():
     })
 
 
-@cached_response(ttl_seconds=120, key_args=())
 @app.route('/api/crm/nb-tracker', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=())
 def api_crm_nb_tracker():
     """Dedicated NB Distillers tracker — premium client view.
 
@@ -8249,8 +8249,8 @@ def api_crm_brand(brand):
     })
 
 
-@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/brands', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=())
 def api_crm_brands_list():
     """List all brands we track + KPIs per brand."""
     brand_skus: dict = {}
@@ -8331,8 +8331,8 @@ def api_crm_brands_list():
     return jsonify({'brands': out})
 
 
-@cached_response(ttl_seconds=300, key_args=('days',))
 @app.route('/api/crm/portfolio-trend', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=('days',))
 def api_crm_portfolio_trend():
     """One time-series across ALL tracked SKUs, per snapshot_date.
 
@@ -8678,8 +8678,8 @@ def api_crm_route_planner():
     })
 
 
-@cached_response(ttl_seconds=120, key_args=())
 @app.route('/api/crm/anu-import', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=())
 def api_crm_anu_import():
     """Anu Import portfolio tracker (Goenchi + Fratelli) — secondary to NB.
 
@@ -8811,8 +8811,8 @@ def api_crm_anu_import():
     })
 
 
-@cached_response(ttl_seconds=3600, key_args=())
 @app.route('/api/crm/cities', methods=['GET'])
+@cached_response(ttl_seconds=3600, key_args=())
 def api_crm_cities():
     """List all distinct cities with store counts (for route-planner picker)."""
     db = get_db()
@@ -9383,8 +9383,8 @@ def _sod_velocity_for(sku, store_number=None, days=30):
     }
 
 
-@cached_response(ttl_seconds=300, key_args=())
 @app.route('/api/crm/velocity/<sku>', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=())
 def api_crm_velocity(sku):
     """Units-per-week velocity for a SKU (aggregated across all stores).
 
@@ -10205,8 +10205,8 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
-@cached_response(ttl_seconds=60, key_args=())
 @app.route('/api/crm/manager-dashboard', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=())
 def api_crm_manager_dashboard():
     """Single-call aggregate for the /manager page.
 
