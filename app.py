@@ -6417,6 +6417,395 @@ def api_admin_run_backup_now():
     })
 
 
+# ============================================================================
+# TASTING BOOKINGS — book future tastings, see upcoming, .ics calendar export,
+#                   daily digest email of tomorrow's tastings.
+#
+# Data model: backed by the existing `deals` table with stage='tasting_scheduled'
+# and next_action_date=<future date>. Plus the corresponding store_number and
+# rep ownership. This keeps tastings inside the existing pipeline so manager
+# dashboards naturally count them.
+# ============================================================================
+
+@app.route('/api/crm/tasting-booking', methods=['POST'])
+def api_crm_book_tasting():
+    """Book a future tasting. Body:
+      { store_number: int, rep: str, scheduled_date: 'YYYY-MM-DD',
+        sku?: str, notes?: str, expected_units?: int }
+
+    Creates a deal with stage='tasting_scheduled' so it shows up in the pipeline
+    AND in the daily morning digest email of tomorrow's tastings. Idempotent on
+    (store_number, rep, scheduled_date, sku) — booking the same slot twice is
+    a no-op (returns the existing deal id).
+    """
+    body = request.get_json(silent=True) or {}
+    store_number = body.get('store_number')
+    rep = (body.get('rep') or '').strip()
+    sched = (body.get('scheduled_date') or '').strip()
+    sku = (body.get('sku') or '').strip()
+    notes = (body.get('notes') or '').strip()
+    expected_units = int(body.get('expected_units') or 0)
+
+    if not store_number or not rep or not sched:
+        return jsonify({'error': 'store_number, rep, scheduled_date are required'}), 400
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Find existing booking (idempotent)
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT id FROM deals WHERE store_number={ph} AND owner_rep={ph} AND "
+            f"next_action_date={ph} AND stage='tasting_scheduled' "
+            f"AND COALESCE(sku,'')={ph} LIMIT 1",
+            (store_number, rep, sched, sku),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.close()
+            return jsonify({'status': 'exists', 'deal_id': row[0]})
+        cur.execute(
+            f"INSERT INTO deals (store_number, sku, stage, probability, "
+            f"next_action_date, expected_units, owner_rep, next_action, notes, source) "
+            f"VALUES ({ph},{ph},'tasting_scheduled',40,{ph},{ph},{ph},'Tasting',{ph},'manual') RETURNING id",
+            (store_number, sku, sched, expected_units, rep, notes),
+        )
+        new_id = cur.fetchone()[0]
+        db.commit()
+        cur.close()
+    else:
+        row = db.execute(
+            f"SELECT id FROM deals WHERE store_number={ph} AND owner_rep={ph} AND "
+            f"next_action_date={ph} AND stage='tasting_scheduled' AND COALESCE(sku,'')={ph} LIMIT 1",
+            (store_number, rep, sched, sku),
+        ).fetchone()
+        if row:
+            return jsonify({'status': 'exists', 'deal_id': row[0]})
+        c = db.execute(
+            f"INSERT INTO deals (store_number, sku, stage, probability, "
+            f"next_action_date, expected_units, owner_rep, next_action, notes, source) "
+            f"VALUES ({ph},{ph},'tasting_scheduled',40,{ph},{ph},{ph},'Tasting',{ph},'manual')",
+            (store_number, sku, sched, expected_units, rep, notes),
+        )
+        new_id = c.lastrowid
+        db.commit()
+
+    try:
+        _log_event('tasting_booked', rep, store_number, sku,
+                   {'scheduled_date': sched, 'expected_units': expected_units, 'notes': notes[:200]})
+    except Exception:
+        pass
+
+    return jsonify({'status': 'booked', 'deal_id': new_id, 'scheduled_date': sched, 'rep': rep})
+
+
+@app.route('/api/crm/tastings/upcoming', methods=['GET'])
+def api_crm_tastings_upcoming():
+    """List upcoming tasting bookings. Query: ?days=14&rep=Ikshit (rep optional).
+
+    Joins to stores for full store info so the rep card shows where + when + with whom.
+    """
+    days = int(request.args.get('days', 14))
+    rep = (request.args.get('rep') or '').strip()
+    today = _toronto_today().isoformat()
+    until = (_toronto_today() + timedelta(days=days)).isoformat()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = [
+        "d.stage='tasting_scheduled'",
+        f"d.next_action_date >= {ph}",
+        f"d.next_action_date <= {ph}",
+        "(d.closed_at IS NULL)",
+    ]
+    params = [today, until]
+    if rep:
+        where.append(f"d.owner_rep = {ph}")
+        params.append(rep)
+
+    sql = f"""
+        SELECT d.id, d.store_number, d.sku, d.next_action_date, d.expected_units,
+               d.owner_rep, d.notes, d.created_at,
+               COALESCE(s.account,'') AS account,
+               COALESCE(s.address,'') AS address,
+               COALESCE(s.city,'') AS city,
+               COALESCE(s.postal,'') AS postal,
+               COALESCE(s.manager_name,'') AS manager_name,
+               COALESCE(s.manager_phone, s.phone, '') AS phone,
+               COALESCE(t.name,'') AS territory_name,
+               COALESCE(t.color,'#888') AS territory_color
+        FROM deals d
+        LEFT JOIN stores s ON s.store_number = d.store_number
+        LEFT JOIN territories t ON t.id = s.territory_id
+        WHERE {' AND '.join(where)}
+        ORDER BY d.next_action_date ASC, d.owner_rep
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, params).fetchall()
+
+    bookings = [
+        {
+            'deal_id': r[0],
+            'store_number': r[1],
+            'sku': r[2] or '',
+            'scheduled_date': str(r[3]) if r[3] else None,
+            'expected_units': int(r[4] or 0),
+            'rep': r[5] or '',
+            'notes': r[6] or '',
+            'booked_at': str(r[7]) if r[7] else None,
+            'account': r[8],
+            'address': r[9],
+            'city': r[10],
+            'postal': r[11],
+            'manager_name': r[12],
+            'phone': r[13],
+            'territory_name': r[14],
+            'territory_color': r[15],
+        }
+        for r in rows
+    ]
+    return jsonify({
+        'window': {'from': today, 'to': until, 'days': days},
+        'rep': rep or '(all)',
+        'count': len(bookings),
+        'bookings': bookings,
+    })
+
+
+@app.route('/api/crm/calendar/<rep_name>.ics', methods=['GET'])
+def api_crm_calendar_ics(rep_name):
+    """iCal export of upcoming tastings for one rep. Subscribe to this URL in
+    Google Calendar / Apple Calendar to see all bookings on the rep's phone.
+    """
+    days = int(request.args.get('days', 60))
+    today = _toronto_today().isoformat()
+    until = (_toronto_today() + timedelta(days=days)).isoformat()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    sql = f"""
+        SELECT d.id, d.store_number, d.sku, d.next_action_date, d.notes,
+               COALESCE(s.account,''), COALESCE(s.address,''), COALESCE(s.city,''),
+               COALESCE(s.manager_name,''), COALESCE(s.manager_phone, s.phone, '')
+        FROM deals d
+        LEFT JOIN stores s ON s.store_number = d.store_number
+        WHERE d.stage='tasting_scheduled'
+          AND d.closed_at IS NULL
+          AND d.owner_rep = {ph}
+          AND d.next_action_date >= {ph}
+          AND d.next_action_date <= {ph}
+        ORDER BY d.next_action_date ASC
+    """
+    params = (rep_name, today, until)
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, params).fetchall()
+
+    # Build .ics
+    lines = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//Anu Spirits//LCBO Tracker//EN',
+        'CALSCALE:GREGORIAN',
+        f'X-WR-CALNAME:Anu Tastings — {rep_name}',
+        'X-WR-TIMEZONE:America/Toronto',
+    ]
+    for r in rows:
+        d_id, store_no, sku, sched, notes, account, address, city, manager, phone = r
+        date_str = str(sched).replace('-', '')
+        summary = f"Tasting #{store_no} {account or ''}".strip()
+        descr_parts = []
+        if sku:
+            descr_parts.append(f"SKU: {sku}")
+        if manager:
+            descr_parts.append(f"Manager: {manager}")
+        if phone:
+            descr_parts.append(f"Phone: {phone}")
+        if notes:
+            descr_parts.append(f"Notes: {notes}")
+        descr = '\\n'.join(descr_parts).replace(',', '\\,').replace(';', '\\;')
+        loc = f"{address}, {city}".strip(', ').replace(',', '\\,').replace(';', '\\;')
+        lines += [
+            'BEGIN:VEVENT',
+            f'UID:tasting-{d_id}@anu-lcbo',
+            f'DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}',
+            f'DTSTART;VALUE=DATE:{date_str}',
+            f'DTEND;VALUE=DATE:{date_str}',
+            f'SUMMARY:{summary}',
+            f'DESCRIPTION:{descr}',
+            f'LOCATION:{loc}',
+            'END:VEVENT',
+        ]
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(lines), 200, {
+        'Content-Type': 'text/calendar; charset=utf-8',
+        'Content-Disposition': f'attachment; filename="anu-tastings-{rep_name}.ics"',
+    }
+
+
+def _send_tasting_digest_email(when='tomorrow'):
+    """Email tomorrow's tasting schedule to TASTING_DIGEST_TO. Falls back to
+    ALERT_EMAIL_TO if TASTING_DIGEST_TO is not set. Best-effort.
+    """
+    if when == 'tomorrow':
+        target_date = (_toronto_today() + timedelta(days=1)).isoformat()
+        when_label = 'Tomorrow'
+    elif when == 'today':
+        target_date = _toronto_today().isoformat()
+        when_label = "Today"
+    else:
+        target_date = when
+        when_label = when
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    sql = f"""
+        SELECT d.store_number, d.sku, d.expected_units, d.owner_rep, d.notes,
+               COALESCE(s.account,''), COALESCE(s.address,''), COALESCE(s.city,''),
+               COALESCE(s.manager_name,''), COALESCE(s.manager_phone, s.phone, '')
+        FROM deals d
+        LEFT JOIN stores s ON s.store_number = d.store_number
+        WHERE d.stage='tasting_scheduled'
+          AND d.closed_at IS NULL
+          AND d.next_action_date = {ph}
+        ORDER BY d.owner_rep, d.store_number
+    """
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, (target_date,))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, (target_date,)).fetchall()
+
+    # Email config
+    to_addr = (
+        os.environ.get('TASTING_DIGEST_TO', '').strip()
+        or os.environ.get('ALERT_EMAIL_TO', '').strip()
+    )
+    resend_key = os.environ.get('RESEND_API_KEY', '').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+
+    if not (resend_key and to_addr and http_requests):
+        print("[tasting-digest] skipped — RESEND_API_KEY or TASTING_DIGEST_TO not configured")
+        return False
+
+    if not rows:
+        # Still send a "no tastings" email so user knows the digest is alive.
+        body_text = f"No tastings booked for {when_label} ({target_date}).\n\nUse /api/crm/tasting-booking to book new tastings."
+        subject = f"[Anu LCBO] {when_label}'s tastings — none booked ({target_date})"
+    else:
+        # Group by rep
+        by_rep = {}
+        for r in rows:
+            store_no, sku, units, rep, notes, account, address, city, manager, phone = r
+            by_rep.setdefault(rep, []).append({
+                'store_number': store_no, 'sku': sku, 'units': units,
+                'account': account, 'address': address, 'city': city,
+                'manager': manager, 'phone': phone, 'notes': notes,
+            })
+        lines = [f"{when_label}'s tastings — {target_date}", '=' * 50, '']
+        for rep, items in sorted(by_rep.items()):
+            lines.append(f"📋 {rep} ({len(items)} tasting{'s' if len(items)!=1 else ''}):")
+            for i, it in enumerate(items, 1):
+                lines.append(f"  {i}. #{it['store_number']} {it['account']}")
+                if it['address']:
+                    lines.append(f"     📍 {it['address']}, {it['city']}")
+                if it['manager']:
+                    lines.append(f"     👤 {it['manager']}{' · ' + it['phone'] if it['phone'] else ''}")
+                if it['sku']:
+                    lines.append(f"     🍷 SKU {it['sku']}{' (' + str(it['units']) + ' units)' if it['units'] else ''}")
+                if it['notes']:
+                    lines.append(f"     📝 {it['notes']}")
+                lines.append('')
+            lines.append('')
+        body_text = '\n'.join(lines)
+        subject = f"[Anu LCBO] {when_label}'s tastings — {len(rows)} booked ({target_date})"
+
+    try:
+        r = http_requests.post(
+            'https://api.resend.com/emails',
+            headers={'Authorization': f'Bearer {resend_key}', 'Content-Type': 'application/json'},
+            json={
+                'from': from_addr,
+                'to': [a.strip() for a in to_addr.split(',') if a.strip()],
+                'subject': subject,
+                'text': body_text,
+            },
+            timeout=20,
+        )
+        if r.status_code in (200, 201, 202):
+            print(f"[tasting-digest] sent {len(rows)} tastings for {target_date}")
+            return True
+        else:
+            print(f"[tasting-digest] resend failed {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[tasting-digest] exception: {e}")
+    return False
+
+
+@app.route('/api/admin/send-tasting-digest', methods=['POST', 'GET'])
+def api_admin_send_tasting_digest():
+    """Manually trigger the tomorrow's-tastings digest email.
+    Useful for testing or if you missed the 06:30 ET cron.
+    """
+    when = request.args.get('when', 'tomorrow')
+    ok = _send_tasting_digest_email(when=when)
+    return jsonify({
+        'status': 'sent' if ok else 'skipped',
+        'when': when,
+        'to': os.environ.get('TASTING_DIGEST_TO', os.environ.get('ALERT_EMAIL_TO', '(not set)')),
+    })
+
+
+_tasting_digest_scheduler = None
+
+
+def start_tasting_digest_scheduler():
+    """Daily 06:30 ET email of tomorrow's tasting schedule. Recipients via
+    TASTING_DIGEST_TO env var (comma-separated). Falls back to ALERT_EMAIL_TO.
+    """
+    global _tasting_digest_scheduler
+    if _tasting_digest_scheduler is not None:
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[tasting-digest] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+
+        sched.add_job(
+            lambda: _send_tasting_digest_email('tomorrow'),
+            CronTrigger(hour=6, minute=30),  # 06:30 ET — after morning health check
+            id='daily_tasting_digest',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600 * 6,
+        )
+        sched.start()
+        _tasting_digest_scheduler = sched
+        print('[tasting-digest] Daily tasting digest scheduled at 06:30 ET (emails to TASTING_DIGEST_TO)')
+    except Exception as e:
+        print(f'[tasting-digest] scheduler failed: {e}')
+
+
 def _json_safe(v):
     """Make a DB value JSON-friendly."""
     if v is None:
@@ -8304,10 +8693,8 @@ def api_crm_cities():
 def api_crm_store_search():
     """Typeahead lookup: match by store_number, account name, address, OR city.
 
-    Used by the rep "Quick Log" sheet so reps can paste either a number or any
-    fragment of the store name/address. Returns up to 10 matches with the same
-    fields the StoreLookup card needs (autopopulate name + address + phone +
-    manager).
+    Each match includes the LAST conversation/activity (rep + date + notes)
+    so the rep sees context immediately. Powers the rep "Quick Log" search bar.
     """
     q = (request.args.get('q') or '').strip()
     if len(q) < 2:
@@ -8315,15 +8702,26 @@ def api_crm_store_search():
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
     like = f'%{q}%'
-    # If the query is a digit, prefer exact + prefix store_number matches
-    digits = q.isdigit()
     sql = f"""
         SELECT s.id, s.store_number, COALESCE(s.account, ''), COALESCE(s.address, ''),
                COALESCE(s.city, ''), COALESCE(s.postal, ''),
                COALESCE(s.phone, ''), COALESCE(s.manager_phone, ''),
                COALESCE(s.manager_name, ''), COALESCE(s.rep, ''),
-               COALESCE(s.lat, 0), COALESCE(s.lng, 0)
+               COALESCE(s.lat, 0), COALESCE(s.lng, 0),
+               la.last_activity_at, la.last_activity_type,
+               la.last_activity_rep, la.last_activity_notes
         FROM stores s
+        LEFT JOIN LATERAL (
+            SELECT a.created_at AS last_activity_at,
+                   a.activity_type AS last_activity_type,
+                   COALESCE(a.rep, r.name, '') AS last_activity_rep,
+                   COALESCE(a.notes, '') AS last_activity_notes
+            FROM activities a
+            LEFT JOIN reps r ON r.id = a.rep_id
+            WHERE a.store_id = s.id AND a.deleted_at IS NULL
+            ORDER BY a.created_at DESC
+            LIMIT 1
+        ) la ON TRUE
         WHERE (
               CAST(s.store_number AS TEXT) LIKE {ph}
            OR LOWER(s.account) LIKE LOWER({ph})
@@ -8335,18 +8733,81 @@ def api_crm_store_search():
           CASE WHEN CAST(s.store_number AS TEXT) = {ph} THEN 0
                WHEN CAST(s.store_number AS TEXT) LIKE {ph} THEN 1
                ELSE 2 END,
+          la.last_activity_at DESC NULLS LAST,
           s.store_number
         LIMIT 10
     """
     params = (like, like, like, like, like, q, f'{q}%')
-    if USE_POSTGRES:
-        cur = db.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cur.close()
-    else:
-        # SQLite uses ? placeholders identically
-        rows = db.execute(sql, params).fetchall()
+    rows = []
+    try:
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            # SQLite doesn't support LATERAL JOIN — fall back to a simpler subquery
+            sql_sqlite = f"""
+                SELECT s.id, s.store_number, COALESCE(s.account, ''), COALESCE(s.address, ''),
+                       COALESCE(s.city, ''), COALESCE(s.postal, ''),
+                       COALESCE(s.phone, ''), COALESCE(s.manager_phone, ''),
+                       COALESCE(s.manager_name, ''), COALESCE(s.rep, ''),
+                       COALESCE(s.lat, 0), COALESCE(s.lng, 0),
+                       (SELECT created_at FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                       (SELECT activity_type FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                       (SELECT COALESCE(rep,'') FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                       (SELECT COALESCE(notes,'') FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1)
+                FROM stores s
+                WHERE (
+                      CAST(s.store_number AS TEXT) LIKE ?
+                   OR LOWER(s.account) LIKE LOWER(?)
+                   OR LOWER(s.address) LIKE LOWER(?)
+                   OR LOWER(s.city) LIKE LOWER(?)
+                   OR LOWER(s.postal) LIKE LOWER(?)
+                )
+                ORDER BY
+                  CASE WHEN CAST(s.store_number AS TEXT) = ? THEN 0
+                       WHEN CAST(s.store_number AS TEXT) LIKE ? THEN 1
+                       ELSE 2 END,
+                  s.store_number
+                LIMIT 10
+            """
+            rows = db.execute(sql_sqlite, params).fetchall()
+    except Exception as e:
+        # Schema-evolution safety: if the activities table or its columns aren't
+        # quite right yet (bootstrap), gracefully fall back to base store match.
+        print(f"[store-search] LATERAL join failed, falling back: {e}")
+        sql_fallback = f"""
+            SELECT s.id, s.store_number, COALESCE(s.account, ''), COALESCE(s.address, ''),
+                   COALESCE(s.city, ''), COALESCE(s.postal, ''),
+                   COALESCE(s.phone, ''), COALESCE(s.manager_phone, ''),
+                   COALESCE(s.manager_name, ''), COALESCE(s.rep, ''),
+                   COALESCE(s.lat, 0), COALESCE(s.lng, 0),
+                   NULL, NULL, '', ''
+            FROM stores s
+            WHERE (
+                  CAST(s.store_number AS TEXT) LIKE {ph}
+               OR LOWER(s.account) LIKE LOWER({ph})
+               OR LOWER(s.address) LIKE LOWER({ph})
+               OR LOWER(s.city) LIKE LOWER({ph})
+               OR LOWER(s.postal) LIKE LOWER({ph})
+            )
+            ORDER BY s.store_number
+            LIMIT 10
+        """
+        try:
+            if USE_POSTGRES:
+                db.rollback()
+                cur = db.cursor()
+                cur.execute(sql_fallback, (like, like, like, like, like))
+                rows = cur.fetchall()
+                cur.close()
+            else:
+                rows = db.execute(sql_fallback, (like, like, like, like, like)).fetchall()
+        except Exception as e2:
+            print(f"[store-search] fallback also failed: {e2}")
+            return jsonify({'matches': [], 'query': q, 'error': str(e2)[:200]})
+
     matches = [
         {
             'id': r[0],
@@ -8361,6 +8822,10 @@ def api_crm_store_search():
             'rep': r[9],
             'lat': float(r[10]) if r[10] else 0,
             'lng': float(r[11]) if r[11] else 0,
+            'last_activity_at': str(r[12]) if r[12] else None,
+            'last_activity_type': r[13] or None,
+            'last_activity_rep': r[14] or '',
+            'last_activity_notes': (r[15] or '')[:200],  # truncate for typeahead
         }
         for r in rows
     ]
@@ -10938,6 +11403,9 @@ start_health_scheduler()
 # Sprint 6: daily backup-to-email at 02:00 ET so data is recoverable even if
 # the host AND the DB die (worst-case disaster recovery via email attachment).
 start_backup_scheduler()
+# Sprint 7: daily tasting digest at 06:30 ET — emails tomorrow's bookings
+# to ikshit@anuspirits.com / sales@anuspirits.com (via TASTING_DIGEST_TO).
+start_tasting_digest_scheduler()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
