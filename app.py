@@ -4252,7 +4252,7 @@ def _sod_freshness():
     Keys:
       latest_snapshot: 'YYYY-MM-DD' or None
       snapshot_age_days: int or None
-      is_stale: bool (True if age > 2 days)
+      is_stale: bool (True if age > 1 day — emails an alert at the next health check)
       last_run_age_hours: float or None
     """
     snap = _max_snapshot_date()
@@ -4268,7 +4268,7 @@ def _sod_freshness():
     return {
         'latest_snapshot': snap.isoformat() if snap else None,
         'snapshot_age_days': age_days,
-        'is_stale': (age_days is not None and age_days > 2),
+        'is_stale': (age_days is not None and age_days > 1),
         'last_run_age_hours': round(last_run, 2) if last_run is not None else None,
     }
 
@@ -4457,8 +4457,8 @@ def api_sod_health():
     """Lightweight health check: is the DATA fresh? For monitoring.
 
     Returns:
-      200 + status='healthy' if snapshot is <= 2 days old.
-      503 + status='stale' if snapshot is > 2 days old.
+      200 + status='healthy' if snapshot is <= 1 day old.
+      503 + status='stale' if snapshot is > 1 day old.
       503 + status='never_synced' if no data ingested yet.
     """
     fresh_info = _sod_freshness()
@@ -4470,7 +4470,7 @@ def api_sod_health():
             'configured': bool(SOD_USER and SOD_PASSWORD),
             'last_run_age_hours': round(age_hours, 2) if age_hours is not None else None,
         }), 503
-    is_fresh = age_days <= 2
+    is_fresh = age_days <= 1
     return jsonify({
         'status': 'healthy' if is_fresh else 'stale',
         'snapshot_date': fresh_info['latest_snapshot'],
@@ -4483,13 +4483,13 @@ def api_sod_health():
 
 @app.route('/healthz', methods=['GET'])
 def api_healthz():
-    """Standard health probe used by Render / uptime monitors. 503 if data > 2d stale."""
+    """Standard health probe used by Render / uptime monitors. 503 if data > 1d stale."""
     fresh = _sod_freshness()
     age_days = fresh['snapshot_age_days']
-    healthy = age_days is not None and age_days <= 2
+    healthy = age_days is not None and age_days <= 1
     return jsonify({
         'status': 'healthy' if healthy else 'unhealthy',
-        'build': 'route-planner-anu-import-cities-v2',
+        'build': 'finder-stale-1d-v3',
         **fresh,
     }), 200 if healthy else 503
 
@@ -4540,7 +4540,8 @@ def _daily_health_check(auto_recover=True):
         except Exception as e:
             recovered.append(f'sod_refresh_failed:{e}')
 
-    # 2. Last successful sync per source within 36h
+    # 2. Last successful sync per source within 24h (lowered from 36h — user wants
+    #    to know if data goes stale > 1 day)
     for source in ('daily_a', 'daily_b'):
         row = db_fetchone(
             "SELECT MAX(run_at) FROM sod_sync_runs "
@@ -4563,8 +4564,8 @@ def _daily_health_check(auto_recover=True):
         if last_at and hasattr(last_at, 'tzinfo') and last_at.tzinfo:
             last_at = last_at.replace(tzinfo=None)
         hours = ((datetime.utcnow() - last_at).total_seconds() / 3600) if last_at else None
-        check(f'last_success_{source}_within_36h',
-              hours is not None and hours <= 36,
+        check(f'last_success_{source}_within_24h',
+              hours is not None and hours <= 24,
               f'hours_since_last_success={round(hours,1) if hours is not None else None}')
 
     # 3. Each tracked SKU has data in its OWN latest snapshot (within last 3 days).
@@ -4596,8 +4597,9 @@ def _daily_health_check(auto_recover=True):
             except Exception:
                 pass
         sku_age = (today - sku_latest_date).days if sku_latest_date else None
-        # Healthy if SKU has ANY data within last 3 days
-        ok = total_rows > 0 and sku_age is not None and sku_age <= 3
+        # Healthy if SKU has data within last 1 day (lowered from 3 — user wants
+        # tighter alerting on stale data)
+        ok = total_rows > 0 and sku_age is not None and sku_age <= 1
         check(f'tracked_sku_data_{sku}', ok,
               f'{brand} {name}: latest_snapshot={sku_latest} age={sku_age}d total_rows={total_rows}')
 
@@ -4736,9 +4738,61 @@ def start_health_scheduler():
             coalesce=True,
             misfire_grace_time=3600 * 2,
         )
+
+        # Proactive stale-data watcher — fires HOURLY, alerts (with 6h cooldown
+        # so we don't spam) the moment data goes stale > 24h. Doesn't run any
+        # auto-recovery — that's the daily job's job.
+        _last_stale_alert_at = {'ts': None}
+
+        def _stale_watch():
+            try:
+                from datetime import datetime as _dt
+                fresh = _sod_freshness()
+                age_days = fresh.get('snapshot_age_days')
+                last_hours = fresh.get('last_run_age_hours')
+                stale_by_snapshot = age_days is not None and age_days > 1
+                stale_by_run = last_hours is not None and last_hours > 24
+                if stale_by_snapshot or stale_by_run:
+                    last = _last_stale_alert_at.get('ts')
+                    now = _dt.utcnow()
+                    cooldown_hours = 6
+                    if last and (now - last).total_seconds() < cooldown_hours * 3600:
+                        return  # still in cooldown
+                    body_lines = [
+                        f"Proactive stale-data alert at {now.isoformat()}Z",
+                        '',
+                        f"Latest SOD snapshot: {fresh.get('latest_snapshot')} "
+                        f"({age_days}d old)" if age_days is not None else "Latest snapshot: never",
+                        f"Last successful sync: {last_hours}h ago"
+                        if last_hours is not None else "Last successful sync: never",
+                        '',
+                        f"Threshold: snapshot must be ≤1d old AND last sync ≤24h ago.",
+                        '',
+                        f"Auto-recovery will attempt at the next 06:00 / 14:00 ET health check.",
+                        f"Manual trigger: POST /api/sod/sync",
+                    ]
+                    send_alert(
+                        subject=f"⚠️ SOD data stale: snapshot {age_days}d old, last sync {last_hours}h ago",
+                        body='\n'.join(body_lines),
+                        level='warning',
+                    )
+                    _last_stale_alert_at['ts'] = now
+            except Exception as e:
+                print(f"[stale-watch] error: {e}")
+
+        sched.add_job(
+            _stale_watch,
+            CronTrigger(minute=15),  # every hour at :15
+            id='hourly_stale_watch',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=600,
+        )
+
         sched.start()
         _health_scheduler = sched
-        print('[health] Daily health check scheduled at 06:00 + 14:00 ET')
+        print('[health] Daily health check scheduled at 06:00 + 14:00 ET; hourly stale-watch at :15')
     except Exception as e:
         print(f'[health] scheduler failed: {e}')
 
@@ -8993,6 +9047,149 @@ def api_crm_store_search():
         for r in rows
     ]
     return jsonify({'matches': matches, 'query': q})
+
+
+@app.route('/api/crm/stores-finder', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=('city', 'rep', 'territory_id', 'priority'))
+def api_crm_stores_finder():
+    """Full directory of all stores with their address, manager, phone, territory,
+    and last-interaction summary. Powers the /finder page — one-shot load of all
+    766 stores so the client can do snappy local search/filter.
+
+    Query params (all optional):
+      city, rep, territory_id, priority — filter
+      include_inactive=1 — include soft-deleted stores (default: hide)
+
+    Response:
+      { count, stores: [{store_number, account, address, city, postal,
+        phone, manager_name, manager_phone, store_email, rep, priority,
+        territory_id, territory_name, territory_color, lat, lng,
+        last_activity_at, last_activity_type, last_activity_rep,
+        last_activity_notes, total_activities, total_deals, open_deals }, ...]
+        freshness: {...} }
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    where = ['1=1']
+    params = []
+    city = (request.args.get('city') or '').strip()
+    rep = (request.args.get('rep') or '').strip()
+    territory_id = request.args.get('territory_id', type=int)
+    priority = (request.args.get('priority') or '').strip()
+    if city:
+        where.append(f"LOWER(s.city) = LOWER({ph})")
+        params.append(city)
+    if rep:
+        where.append(f"s.rep = {ph}")
+        params.append(rep)
+    if territory_id:
+        where.append(f"s.territory_id = {ph}")
+        params.append(territory_id)
+    if priority:
+        where.append(f"s.priority = {ph}")
+        params.append(priority)
+
+    if USE_POSTGRES:
+        sql = f"""
+            SELECT s.id, s.store_number, COALESCE(s.account,''), COALESCE(s.address,''),
+                   COALESCE(s.city,''), COALESCE(s.postal,''),
+                   COALESCE(s.phone,''), COALESCE(s.manager_phone,''),
+                   COALESCE(s.manager_name,''), COALESCE(s.asst_manager_name,''),
+                   COALESCE(s.store_email,''), COALESCE(s.rep,''),
+                   COALESCE(s.priority,''), s.territory_id,
+                   COALESCE(t.name,'Unassigned'), COALESCE(t.color,'#888'),
+                   COALESCE(s.lat,0), COALESCE(s.lng,0),
+                   la.last_activity_at, la.last_activity_type,
+                   la.last_activity_rep, la.last_activity_notes,
+                   ac.total_activities, dc.total_deals, dc.open_deals
+            FROM stores s
+            LEFT JOIN territories t ON t.id = s.territory_id
+            LEFT JOIN LATERAL (
+                SELECT a.created_at AS last_activity_at,
+                       a.activity_type AS last_activity_type,
+                       COALESCE(a.rep, r.name, '') AS last_activity_rep,
+                       COALESCE(a.notes, '') AS last_activity_notes
+                FROM activities a
+                LEFT JOIN reps r ON r.id = a.rep_id
+                WHERE a.store_id = s.id AND a.deleted_at IS NULL
+                ORDER BY a.created_at DESC
+                LIMIT 1
+            ) la ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS total_activities
+                FROM activities a2
+                WHERE a2.store_id = s.id AND a2.deleted_at IS NULL
+            ) ac ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS total_deals,
+                       SUM(CASE WHEN closed_at IS NULL THEN 1 ELSE 0 END) AS open_deals
+                FROM deals d
+                WHERE d.store_number = s.store_number
+            ) dc ON TRUE
+            WHERE {' AND '.join(where)}
+            ORDER BY
+              CASE WHEN la.last_activity_at IS NOT NULL THEN 0 ELSE 1 END,
+              la.last_activity_at DESC NULLS LAST,
+              s.store_number
+        """
+        cur = db.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        except Exception as e:
+            db.rollback()
+            cur.close()
+            return jsonify({'error': str(e)[:300]}), 500
+        cur.close()
+    else:
+        # SQLite fallback (LATERAL JOIN unsupported)
+        sql = f"""
+            SELECT s.id, s.store_number, COALESCE(s.account,''), COALESCE(s.address,''),
+                   COALESCE(s.city,''), COALESCE(s.postal,''),
+                   COALESCE(s.phone,''), COALESCE(s.manager_phone,''),
+                   COALESCE(s.manager_name,''), COALESCE(s.asst_manager_name,''),
+                   COALESCE(s.store_email,''), COALESCE(s.rep,''),
+                   COALESCE(s.priority,''), s.territory_id,
+                   COALESCE(t.name,'Unassigned'), COALESCE(t.color,'#888'),
+                   COALESCE(s.lat,0), COALESCE(s.lng,0),
+                   (SELECT created_at FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                   (SELECT activity_type FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                   (SELECT COALESCE(rep,'') FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                   (SELECT COALESCE(notes,'') FROM activities WHERE store_id=s.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1),
+                   (SELECT COUNT(*) FROM activities WHERE store_id=s.id AND deleted_at IS NULL),
+                   (SELECT COUNT(*) FROM deals WHERE store_number=s.store_number),
+                   (SELECT COUNT(*) FROM deals WHERE store_number=s.store_number AND closed_at IS NULL)
+            FROM stores s
+            LEFT JOIN territories t ON t.id = s.territory_id
+            WHERE {' AND '.join(where)}
+            ORDER BY s.store_number
+        """
+        rows = db.execute(sql, params).fetchall()
+
+    stores = []
+    for r in rows:
+        stores.append({
+            'id': r[0], 'store_number': r[1], 'account': r[2], 'address': r[3],
+            'city': r[4], 'postal': r[5], 'phone': r[6], 'manager_phone': r[7],
+            'manager_name': r[8], 'asst_manager_name': r[9],
+            'store_email': r[10], 'rep': r[11], 'priority': r[12],
+            'territory_id': r[13], 'territory_name': r[14], 'territory_color': r[15],
+            'lat': float(r[16]) if r[16] else 0, 'lng': float(r[17]) if r[17] else 0,
+            'last_activity_at': str(r[18]) if r[18] else None,
+            'last_activity_type': r[19] or None,
+            'last_activity_rep': r[20] or '',
+            'last_activity_notes': (r[21] or '')[:300],
+            'total_activities': int(r[22] or 0),
+            'total_deals': int(r[23] or 0),
+            'open_deals': int(r[24] or 0),
+        })
+    return jsonify({
+        'count': len(stores),
+        'stores': stores,
+        'filters': {'city': city or None, 'rep': rep or None,
+                    'territory_id': territory_id, 'priority': priority or None},
+        'freshness': _sod_freshness(),
+    })
 
 
 @app.route('/api/crm/nearby', methods=['GET'])
