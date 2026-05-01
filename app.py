@@ -181,6 +181,8 @@ def api_admin_cache_stats():
 
 @app.route('/api/admin/cache-clear', methods=['POST'])
 def api_admin_cache_clear():
+    if not _admin_token_ok():
+        return jsonify({'error': 'forbidden — set X-Admin-Token header'}), 403
     with _cache_lock:
         n = len(_cache_store)
         _cache_store.clear()
@@ -6253,13 +6255,41 @@ def _admin_token_ok() -> bool:
     """Verify X-Admin-Token header against ADMIN_TOKEN env var.
 
     If ADMIN_TOKEN is not set, only allow from localhost (dev convenience).
+    Constant-time comparison to defeat timing attacks.
     """
     expected = os.environ.get('ADMIN_TOKEN', '').strip()
     if not expected:
         # Dev-only: allow if request looks local
         return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
     got = request.headers.get('X-Admin-Token', '').strip()
-    return bool(expected) and got == expected
+    if not got:
+        # Fall back to query param ?admin_token= for browser UX (still validated)
+        got = (request.args.get('admin_token') or '').strip()
+    if not got or len(got) != len(expected):
+        return False
+    # Constant-time compare
+    import hmac
+    return hmac.compare_digest(got, expected)
+
+
+def require_admin_token(fn):
+    """Decorator for endpoints that mutate data or expose secrets. Returns 403
+    if the X-Admin-Token header (or ?admin_token= query param) doesn't match
+    ADMIN_TOKEN. All ADMIN_TOKEN usage here is constant-time compared.
+    """
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not _admin_token_ok():
+            return jsonify({
+                'error': 'forbidden',
+                'detail': 'Provide a valid X-Admin-Token header (or ?admin_token= query param). '
+                          'Set ADMIN_TOKEN env var on the host to enable.',
+            }), 403
+        return fn(*args, **kwargs)
+
+    return wrapped
 
 
 @app.route('/api/admin/export', methods=['GET'])
@@ -6422,6 +6452,359 @@ def api_admin_import():
             'rows_skipped': sum(r.get('skipped', 0) for r in results.values()),
         },
     })
+
+
+@app.route('/api/admin/data-integrity', methods=['GET'])
+def api_admin_data_integrity():
+    """Comprehensive data-accuracy audit. Read-only, no auth (just diagnostic).
+
+    Returns per-tracked-SKU report:
+      - latest_snapshot_date + age_days
+      - SOD store counts: total / listed (L) / will-delist (D) / fully-delisted (F)
+      - lcbo.com store_count (live scrape — most recent inventory_history)
+      - drift: stores where SOD says listed but lcbo.com shows 0, or vice versa
+      - LCBO_LIVE_ONLY discoveries (lcbo.com live, SOD missing/F) in last 30d
+      - listing-flip events in last 30d (D→L, L→D, F→L, etc.)
+      - duplicate detection (same sku/store/date with multiple rows)
+      - integrity_grade: A (no drift), B (≤5% drift), C (≤15%), D (>15%), F (data missing)
+    Plus global sanity checks (orphaned stores, stuck sync runs, scheduler status).
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    today = _toronto_today()
+    since_30d = (today - timedelta(days=30)).isoformat()
+
+    report = {
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'today_toronto': today.isoformat(),
+        'global': {},
+        'per_sku': [],
+        'global_grade': 'A',
+    }
+
+    def _safe_count(sql, params=()):
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(sql, params)
+                v = cur.fetchone()[0]
+                cur.close()
+                return int(v or 0)
+            return int((db.execute(sql, params).fetchone() or [0])[0])
+        except Exception as e:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            return f'ERR: {str(e)[:120]}'
+
+    # ---- Global ----
+    # Stuck running rows (sync started but never finished)
+    if USE_POSTGRES:
+        stuck_sql = "SELECT COUNT(*) FROM sod_sync_runs WHERE status='running' AND run_at < NOW() - INTERVAL '6 hours'"
+        failed_sql = "SELECT COUNT(*) FROM sod_sync_runs WHERE status='failed' AND run_at >= NOW() - INTERVAL '7 days'"
+    else:
+        stuck_sql = "SELECT COUNT(*) FROM sod_sync_runs WHERE status='running' AND run_at < datetime('now', '-6 hours')"
+        failed_sql = "SELECT COUNT(*) FROM sod_sync_runs WHERE status='failed' AND run_at >= datetime('now', '-7 days')"
+    report['global']['stuck_sync_runs'] = _safe_count(stuck_sql)
+    report['global']['failed_runs_7d'] = _safe_count(failed_sql)
+    # Orphaned inventory rows (sku/store_number with no matching tracked SKU)
+    if USE_POSTGRES:
+        cur = db.cursor()
+        try:
+            cur.execute(
+                "SELECT COUNT(DISTINCT sku) FROM sod_inventory "
+                "WHERE sku NOT IN %s",
+                (tuple(SOD_TRACKED_SKUS.keys()) or ('',),)
+            )
+            report['global']['untracked_skus_in_inventory'] = int(cur.fetchone()[0] or 0)
+        except Exception as e:
+            db.rollback()
+            report['global']['untracked_skus_in_inventory'] = f'ERR: {str(e)[:80]}'
+        cur.close()
+    # Scheduler status
+    report['global']['sod_scheduler_running'] = _sod_scheduler_running()
+    # Latest run by source
+    runs_by_src = {}
+    try:
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT source, MAX(run_at), MAX(CASE WHEN status='success' THEN run_at END) "
+                "FROM sod_sync_runs GROUP BY source"
+            )
+            for r in cur.fetchall():
+                runs_by_src[r[0]] = {
+                    'last_attempt': r[1].isoformat() if r[1] else None,
+                    'last_success': r[2].isoformat() if r[2] else None,
+                }
+            cur.close()
+        else:
+            for r in db.execute(
+                "SELECT source, MAX(run_at), MAX(CASE WHEN status='success' THEN run_at END) "
+                "FROM sod_sync_runs GROUP BY source"
+            ).fetchall():
+                runs_by_src[r[0]] = {'last_attempt': r[1], 'last_success': r[2]}
+    except Exception as e:
+        if USE_POSTGRES:
+            try: db.rollback()
+            except Exception: pass
+    report['global']['runs_by_source'] = runs_by_src
+
+    # ---- Per-tracked-SKU integrity ----
+    drift_total = 0
+    listed_total = 0
+    for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+        s = {'sku': sku, 'brand': brand, 'product_name': name}
+        # Latest snapshot for THIS sku
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                latest = cur.fetchone()[0]
+                cur.close()
+            else:
+                latest = db.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)).fetchone()[0]
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            latest = None
+        s['latest_snapshot'] = latest.isoformat() if hasattr(latest, 'isoformat') else (str(latest) if latest else None)
+        try:
+            if isinstance(latest, str):
+                latest_d = datetime.strptime(latest, '%Y-%m-%d').date()
+            elif hasattr(latest, 'isoformat'):
+                latest_d = latest if hasattr(latest, 'days') is False and not isinstance(latest, datetime) else (latest.date() if isinstance(latest, datetime) else latest)
+            else:
+                latest_d = latest
+            s['snapshot_age_days'] = (today - latest_d).days if latest_d else None
+        except Exception:
+            s['snapshot_age_days'] = None
+
+        # Status counts at latest snapshot
+        if latest:
+            try:
+                if USE_POSTGRES:
+                    cur = db.cursor()
+                    cur.execute(
+                        "SELECT status, COUNT(*), COALESCE(SUM(on_hand),0) FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s GROUP BY status",
+                        (sku, latest),
+                    )
+                    rows = cur.fetchall()
+                    cur.close()
+                else:
+                    rows = db.execute(
+                        "SELECT status, COUNT(*), COALESCE(SUM(on_hand),0) FROM sod_inventory "
+                        "WHERE sku=? AND snapshot_date=?",
+                        (sku, latest),
+                    ).fetchall()
+                status_counts = {r[0]: int(r[1]) for r in rows}
+                onhand = sum(int(r[2] or 0) for r in rows if r[0] == 'L')
+                s['status_counts'] = {
+                    'L': status_counts.get('L', 0),
+                    'D': status_counts.get('D', 0),
+                    'F': status_counts.get('F', 0),
+                    'total': sum(status_counts.values()),
+                }
+                s['on_hand_units'] = onhand
+            except Exception as e:
+                if USE_POSTGRES:
+                    try: db.rollback()
+                    except Exception: pass
+                s['status_counts'] = {'error': str(e)[:120]}
+                s['on_hand_units'] = 0
+        else:
+            s['status_counts'] = {'L': 0, 'D': 0, 'F': 0, 'total': 0}
+            s['on_hand_units'] = 0
+
+        # LCBO.com live store count (latest inventory_history per sku)
+        try:
+            sku_clean = sku.lstrip('0')
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute("SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1", (sku_clean,))
+                prow = cur.fetchone()
+                cur.close()
+            else:
+                prow = db.execute("SELECT id FROM products WHERE lcbo_sku=? LIMIT 1", (sku_clean,)).fetchone()
+            pid = prow[0] if prow else None
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            pid = None
+        if pid:
+            try:
+                if USE_POSTGRES:
+                    cur = db.cursor()
+                    cur.execute(
+                        "SELECT COUNT(DISTINCT store_number), COALESCE(SUM(quantity),0) "
+                        "FROM inventory_history WHERE product_id=%s AND quantity > 0 "
+                        "AND recorded_at >= NOW() - INTERVAL '24 hours'",
+                        (pid,),
+                    )
+                    row = cur.fetchone()
+                    cur.close()
+                else:
+                    row = db.execute(
+                        "SELECT COUNT(DISTINCT store_number), COALESCE(SUM(quantity),0) "
+                        "FROM inventory_history WHERE product_id=? AND quantity > 0 "
+                        "AND recorded_at >= datetime('now','-24 hours')",
+                        (pid,),
+                    ).fetchone()
+                s['lcbo_live_24h'] = {
+                    'stores_with_inventory': int(row[0] or 0),
+                    'total_units': int(row[1] or 0),
+                }
+            except Exception:
+                if USE_POSTGRES:
+                    try: db.rollback()
+                    except Exception: pass
+                s['lcbo_live_24h'] = None
+        else:
+            s['lcbo_live_24h'] = None
+
+        # LCBO_LIVE_ONLY discoveries last 30d
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) FROM sod_store_sku_changes "
+                    "WHERE sku=%s AND change_type='LCBO_LIVE_ONLY' AND change_date >= %s",
+                    (sku, since_30d),
+                )
+                s['lcbo_only_discoveries_30d'] = int(cur.fetchone()[0] or 0)
+                cur.close()
+            else:
+                s['lcbo_only_discoveries_30d'] = int((db.execute(
+                    "SELECT COUNT(*) FROM sod_store_sku_changes "
+                    "WHERE sku=? AND change_type='LCBO_LIVE_ONLY' AND change_date >= ?",
+                    (sku, since_30d),
+                ).fetchone() or [0])[0])
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            s['lcbo_only_discoveries_30d'] = None
+
+        # Listing-flip events last 30d (NEW_LISTING, DELISTING_NOW, etc.)
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    "SELECT change_type, COUNT(*) FROM sod_store_sku_changes "
+                    "WHERE sku=%s AND change_date >= %s GROUP BY change_type",
+                    (sku, since_30d),
+                )
+                s['flips_30d'] = {r[0]: int(r[1]) for r in cur.fetchall()}
+                cur.close()
+            else:
+                s['flips_30d'] = dict((r[0], int(r[1])) for r in db.execute(
+                    "SELECT change_type, COUNT(*) FROM sod_store_sku_changes "
+                    "WHERE sku=? AND change_date >= ? GROUP BY change_type",
+                    (sku, since_30d),
+                ).fetchall())
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            s['flips_30d'] = None
+
+        # Duplicate row detection (sku/store/date with > 1 row)
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT sku, store_number, snapshot_date, COUNT(*) AS c "
+                    "  FROM sod_inventory WHERE sku=%s "
+                    "  GROUP BY sku, store_number, snapshot_date HAVING COUNT(*) > 1"
+                    ") d",
+                    (sku,),
+                )
+                s['duplicate_rows'] = int(cur.fetchone()[0] or 0)
+                cur.close()
+            else:
+                s['duplicate_rows'] = int((db.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT sku, store_number, snapshot_date, COUNT(*) AS c "
+                    "  FROM sod_inventory WHERE sku=? "
+                    "  GROUP BY sku, store_number, snapshot_date HAVING c > 1"
+                    ")",
+                    (sku,),
+                ).fetchone() or [0])[0])
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+            s['duplicate_rows'] = None
+
+        # Drift: SOD says listed but lcbo.com 0; or SOD missing/F but lcbo.com > 0
+        sod_listed = s.get('status_counts', {}).get('L', 0) if isinstance(s.get('status_counts'), dict) else 0
+        lcbo_live = s.get('lcbo_live_24h', {}).get('stores_with_inventory', 0) if isinstance(s.get('lcbo_live_24h'), dict) else 0
+        if isinstance(sod_listed, int) and isinstance(lcbo_live, int) and (sod_listed + lcbo_live) > 0:
+            drift = abs(sod_listed - lcbo_live)
+            drift_pct = drift / max(sod_listed, lcbo_live, 1) * 100
+            s['drift'] = {
+                'sod_listed_count': sod_listed,
+                'lcbo_live_24h_count': lcbo_live,
+                'difference': sod_listed - lcbo_live,
+                'drift_pct': round(drift_pct, 1),
+            }
+            drift_total += drift
+            listed_total += sod_listed
+        else:
+            s['drift'] = None
+
+        # Per-SKU grade
+        age = s.get('snapshot_age_days')
+        dups = s.get('duplicate_rows') or 0
+        drift_pct = (s.get('drift') or {}).get('drift_pct') or 0
+        if not s.get('latest_snapshot'):
+            s['integrity_grade'] = 'F'
+            s['grade_reason'] = 'no_snapshot'
+        elif age is not None and age > 2:
+            s['integrity_grade'] = 'D'
+            s['grade_reason'] = f'snapshot_{age}d_old'
+        elif dups > 0:
+            s['integrity_grade'] = 'C'
+            s['grade_reason'] = f'{dups}_duplicate_rows'
+        elif drift_pct > 25:
+            s['integrity_grade'] = 'C'
+            s['grade_reason'] = f'drift_{drift_pct}pct'
+        elif drift_pct > 10:
+            s['integrity_grade'] = 'B'
+            s['grade_reason'] = f'drift_{drift_pct}pct'
+        elif age is not None and age > 1:
+            s['integrity_grade'] = 'B'
+            s['grade_reason'] = f'snapshot_{age}d_old'
+        else:
+            s['integrity_grade'] = 'A'
+            s['grade_reason'] = 'all_checks_pass'
+
+        report['per_sku'].append(s)
+
+    # Global grade (worst per-SKU grade caps the global)
+    grades = [s.get('integrity_grade', 'F') for s in report['per_sku']]
+    if 'F' in grades:
+        report['global_grade'] = 'F'
+    elif 'D' in grades:
+        report['global_grade'] = 'D'
+    elif 'C' in grades:
+        report['global_grade'] = 'C'
+    elif 'B' in grades:
+        report['global_grade'] = 'B'
+    else:
+        report['global_grade'] = 'A'
+
+    # Aggregate drift
+    if listed_total > 0:
+        report['global']['aggregate_drift_pct'] = round(drift_total / listed_total * 100, 1)
+    else:
+        report['global']['aggregate_drift_pct'] = None
+
+    return jsonify(report)
 
 
 @app.route('/api/admin/db-stats', methods=['GET'])
@@ -10099,6 +10482,7 @@ def api_crm_deals_create():
 
 
 @app.route('/api/crm/admin/backfill-closed-deals', methods=['POST'])
+@require_admin_token
 def api_crm_backfill_closed_deals():
     """One-shot fix: set closed_at on any 'listed' or 'lost' deal where it's NULL.
 
@@ -10728,6 +11112,7 @@ def api_crm_admin_roster_get():
 
 
 @app.route('/api/crm/admin/set-roster', methods=['POST'])
+@require_admin_token
 def api_crm_admin_set_roster():
     """Normalize the rep roster across stores + territories.
 
@@ -10800,6 +11185,7 @@ def api_crm_admin_set_roster():
 
 
 @app.route('/api/crm/admin/bulk-reassign-rep', methods=['POST'])
+@require_admin_token
 def api_crm_admin_bulk_reassign_rep():
     """Move every store from one rep to another in one shot.
 
