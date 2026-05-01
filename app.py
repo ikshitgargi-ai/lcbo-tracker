@@ -3533,16 +3533,29 @@ _sod_last_result = {'daily_a': None, 'daily_b': None}
 
 
 def _sod_run_if_stale(sources, max_age_hours=6):
-    """Fire a sync ONLY if the last successful sync is older than max_age_hours
-    OR the data itself is > 1 day old.
+    """Fire a sync if the last successful sync is older than max_age_hours
+    OR the data itself is at least 1 day old (fixed: was '> 1' which missed
+    the common case of pulling yesterday's file at 03 ET because LCBO hadn't
+    published today's yet, then never re-trying).
 
-    Used by the 07:00/12:00/18:00 ET catch-up jobs so we don't re-run
-    unnecessarily when the 03:00 main job succeeded.
+    Catch-up jobs at 07/12/18 ET use this so we don't re-run unnecessarily
+    when the 03 ET main sync got TODAY's file. But if 03 ET only got
+    yesterday's file (LCBO publishes ~01-02 ET, so race is real), we WILL
+    re-try at 07 ET, which is when LCBO is reliably published.
     """
     run_age = _last_successful_run_age_hours_safe()
     data_age = _sod_data_age_days()
+    # Fire if:
+    #   - no successful run yet
+    #   - last run was longer ago than threshold
+    #   - data is at least 1 day old (we want today's data)
+    #   - AND we haven't tried in the last hour (avoid hammering)
+    has_recent_attempt = run_age is not None and run_age < 1.0
+    stale_data = data_age is None or data_age >= 1
     needs_sync = (
-        run_age is None or run_age > max_age_hours or data_age is None or data_age > 1
+        run_age is None
+        or run_age > max_age_hours
+        or (stale_data and not has_recent_attempt)
     )
     if needs_sync:
         print(f'[SOD] catch-up firing (run_age={run_age}h, data_age={data_age}d, threshold={max_age_hours}h)')
@@ -6740,27 +6753,38 @@ def api_admin_data_integrity():
                 except Exception: pass
             s['duplicate_rows'] = None
 
-        # Drift: SOD says listed but lcbo.com 0; or SOD missing/F but lcbo.com > 0
+        # Drift: SOD says listed but lcbo.com 0; or SOD missing/F but lcbo.com > 0.
+        # ONLY compute drift when BOTH sources have recent data — if lcbo.com hasn't
+        # been scraped recently, skip drift comparison (would otherwise show a
+        # false 100% drift just because lcbo_live_24h is empty).
         sod_listed = s.get('status_counts', {}).get('L', 0) if isinstance(s.get('status_counts'), dict) else 0
-        lcbo_live = s.get('lcbo_live_24h', {}).get('stores_with_inventory', 0) if isinstance(s.get('lcbo_live_24h'), dict) else 0
-        if isinstance(sod_listed, int) and isinstance(lcbo_live, int) and (sod_listed + lcbo_live) > 0:
-            drift = abs(sod_listed - lcbo_live)
-            drift_pct = drift / max(sod_listed, lcbo_live, 1) * 100
-            s['drift'] = {
-                'sod_listed_count': sod_listed,
-                'lcbo_live_24h_count': lcbo_live,
-                'difference': sod_listed - lcbo_live,
-                'drift_pct': round(drift_pct, 1),
-            }
-            drift_total += drift
-            listed_total += sod_listed
+        lcbo_live_data = s.get('lcbo_live_24h')
+        if isinstance(lcbo_live_data, dict) and lcbo_live_data.get('stores_with_inventory') is not None:
+            lcbo_live = lcbo_live_data.get('stores_with_inventory', 0)
+            # Only compute drift if lcbo.com has SOME data (otherwise scrape may not have run)
+            if lcbo_live > 0 or sod_listed == 0:
+                drift = abs(sod_listed - lcbo_live)
+                drift_pct = drift / max(sod_listed, lcbo_live, 1) * 100
+                s['drift'] = {
+                    'sod_listed_count': sod_listed,
+                    'lcbo_live_24h_count': lcbo_live,
+                    'difference': sod_listed - lcbo_live,
+                    'drift_pct': round(drift_pct, 1),
+                }
+                drift_total += drift
+                listed_total += sod_listed
+            else:
+                # lcbo.com data unavailable — skip drift, don't penalize
+                s['drift'] = {'note': 'lcbo.com scrape data unavailable in last 24h — drift not computed'}
         else:
             s['drift'] = None
 
         # Per-SKU grade
         age = s.get('snapshot_age_days')
         dups = s.get('duplicate_rows') or 0
-        drift_pct = (s.get('drift') or {}).get('drift_pct') or 0
+        drift_obj = s.get('drift') or {}
+        # Only penalize for drift if it was actually computed (not "skipped because no lcbo data")
+        drift_pct = drift_obj.get('drift_pct') if 'drift_pct' in drift_obj else None
         if not s.get('latest_snapshot'):
             s['integrity_grade'] = 'F'
             s['grade_reason'] = 'no_snapshot'
@@ -6770,10 +6794,10 @@ def api_admin_data_integrity():
         elif dups > 0:
             s['integrity_grade'] = 'C'
             s['grade_reason'] = f'{dups}_duplicate_rows'
-        elif drift_pct > 25:
+        elif drift_pct is not None and drift_pct > 25:
             s['integrity_grade'] = 'C'
             s['grade_reason'] = f'drift_{drift_pct}pct'
-        elif drift_pct > 10:
+        elif drift_pct is not None and drift_pct > 10:
             s['integrity_grade'] = 'B'
             s['grade_reason'] = f'drift_{drift_pct}pct'
         elif age is not None and age > 1:
