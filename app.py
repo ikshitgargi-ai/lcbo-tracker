@@ -3049,29 +3049,35 @@ def parse_sod_dat(raw_bytes):
             yield row
 
 
-def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False):
+def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False, progress_every=200_000):
     """Streaming parser + aggregator for a SOD .zip download.
 
-    Iterates the .dat member line-by-line via zipfile.open() + TextIOWrapper
-    so the 75MB .dat text is NEVER held in RAM. Retains only:
-      - per-sku aggregates keyed by (snapshot_date, sku)  (small: ~700 SKUs)
-      - rows for tracked SKUs (~155 rows for Daily A), or all rows when
-        keep_all_rows is True (~1,400 rows for Daily B)
+    OPTIMIZED for low-memory hosts (Render Starter 512MB):
+      - Only builds per-SKU aggregates for TRACKED SKUs (was: all 21k SKUs).
+        Untracked SKUs only count toward the global total + dates_seen.
+      - Logs progress every `progress_every` rows so we can see where ingest
+        stalls (was: silent until completion).
+      - Caps `rows_to_persist` to tracked-only when keep_all_rows=False.
 
     Returns dict with: dat_name, total, per_sku_by_date, rows_to_persist,
-    dates_seen, tracked_row_count.
+    dates_seen, tracked_row_count, untracked_row_count, untracked_sku_count.
     """
     per_sku_by_date = {}   # {date: {sku: {'name', 'status_counts', 'store_count', 'total_on_hand'}}}
     rows_to_persist = []   # only tracked rows (or all, for Daily B)
     dates_seen = set()
+    untracked_skus_seen = set()  # for stats only
     total = 0
     tracked_row_count = 0
+    untracked_row_count = 0
+    last_logged = 0
+    started = datetime.utcnow()
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         members = zf.namelist()
         if not members:
             raise RuntimeError("Zip is empty")
         dat_name = members[0]
+        print(f"[SOD-parse] streaming {dat_name} ({len(zip_bytes):,}B compressed)…")
         with zf.open(dat_name) as raw_stream:
             text_stream = io.TextIOWrapper(raw_stream, encoding='latin-1', errors='replace', newline='')
             for line in text_stream:
@@ -3086,25 +3092,46 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False):
                 total += 1
                 d = row['snapshot_date']
                 dates_seen.add(d)
-                date_bucket = per_sku_by_date.setdefault(d, {})
-                agg = date_bucket.get(row['sku'])
-                if agg is None:
-                    agg = {
-                        'name': row['product_name'],
-                        'status_counts': {},
-                        'store_count': 0,
-                        'total_on_hand': 0,
-                    }
-                    date_bucket[row['sku']] = agg
-                agg['status_counts'][row['status']] = agg['status_counts'].get(row['status'], 0) + 1
-                agg['store_count'] += 1
-                agg['total_on_hand'] += row['on_hand']
-
                 is_tracked = row['sku'] in tracked_skus
+
+                if is_tracked or keep_all_rows:
+                    # Build per-SKU aggregates for tracked SKUs (and all SKUs in keep-all mode)
+                    date_bucket = per_sku_by_date.setdefault(d, {})
+                    agg = date_bucket.get(row['sku'])
+                    if agg is None:
+                        agg = {
+                            'name': row['product_name'],
+                            'status_counts': {},
+                            'store_count': 0,
+                            'total_on_hand': 0,
+                        }
+                        date_bucket[row['sku']] = agg
+                    agg['status_counts'][row['status']] = agg['status_counts'].get(row['status'], 0) + 1
+                    agg['store_count'] += 1
+                    agg['total_on_hand'] += row['on_hand']
+                else:
+                    # Untracked SKU on a daily_a run — just count, don't aggregate
+                    # (saves ~95% of dict memory on the global file)
+                    untracked_row_count += 1
+                    untracked_skus_seen.add(row['sku'])
+
                 if is_tracked:
                     tracked_row_count += 1
                 if keep_all_rows or is_tracked:
                     rows_to_persist.append(row)
+
+                # Progress every N rows (about every 1-2s on Render Starter)
+                if total - last_logged >= progress_every:
+                    elapsed = (datetime.utcnow() - started).total_seconds()
+                    rate = total / max(elapsed, 0.001)
+                    print(f"[SOD-parse] {total:>9,} rows ({elapsed:.1f}s, {rate:,.0f}/s, "
+                          f"tracked={tracked_row_count}, persist_buf={len(rows_to_persist)})")
+                    last_logged = total
+
+    elapsed = (datetime.utcnow() - started).total_seconds()
+    print(f"[SOD-parse] DONE: {total:,} rows in {elapsed:.1f}s "
+          f"(tracked={tracked_row_count}, untracked={untracked_row_count}, "
+          f"untracked_skus={len(untracked_skus_seen)})")
 
     return {
         'dat_name': dat_name,
@@ -3113,6 +3140,8 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False):
         'rows_to_persist': rows_to_persist,
         'dates_seen': dates_seen,
         'tracked_row_count': tracked_row_count,
+        'untracked_row_count': untracked_row_count,
+        'untracked_sku_count': len(untracked_skus_seen),
     }
 
 
@@ -3162,6 +3191,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
 
         # 1) Download zip bytes (small — ~9MB for Daily A, ~8KB for Daily B)
         # download_zip_bytes now walks back up to 7 days and validates freshness.
+        print(f"[SOD-{source}] step 1/8: downloading zip…")
         client = client or SODClient()
         download_result = client.download_zip_bytes(source, filename=filename)
         # Tolerate both old (2-tuple) and new (3-tuple) signatures
@@ -3170,14 +3200,18 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         else:
             zip_bytes, zip_name = download_result
             peeked_snapshot = ''
+        print(f"[SOD-{source}] step 1/8 done: {zip_name} ({len(zip_bytes):,}B)")
 
         # 2) Stream-parse directly from the zip. NEVER materializes the 75MB .dat text
         #    or the 1.5M-row list. Only keeps small aggregates + tracked rows.
+        print(f"[SOD-{source}] step 2/8: parsing rows (will log progress)…")
         keep_all = (source != 'daily_a')  # Daily B is already agent-filtered (~1,400 rows)
         parsed = stream_parse_sod_zip(zip_bytes, SOD_TRACKED_SKUS, keep_all_rows=keep_all)
         # Free the zip bytes ASAP
         del zip_bytes
         gc.collect()
+        print(f"[SOD-{source}] step 2/8 done: {parsed['total']:,} rows parsed, "
+              f"{parsed['tracked_row_count']} tracked")
 
         dat_name = parsed['dat_name']
         total = parsed['total']
@@ -3195,9 +3229,26 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         parsed = None
         gc.collect()
 
-        # 4) Pull prior sod_products state to compute SKU-level listing changes
-        cur.execute("SELECT sku, current_status FROM sod_products")
-        prior = {row[0]: row[1] for row in cur.fetchall()}
+        # 4) Pull prior sod_products state to compute SKU-level listing changes.
+        # OPTIMIZATION: only fetch the SKUs that appear in this snapshot (was: full
+        # 21k-row table scan every sync). Cuts memory + query time on Render Starter.
+        print(f"[SOD-{source}] step 3/8: loading prior status for {len(per_sku)} SKUs…")
+        prior = {}
+        if per_sku:
+            sku_list = list(per_sku.keys())
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT sku, current_status FROM sod_products WHERE sku = ANY(%s)",
+                    (sku_list,),
+                )
+            else:
+                ph_list = ','.join(['?'] * len(sku_list))
+                cur.execute(
+                    f"SELECT sku, current_status FROM sod_products WHERE sku IN ({ph_list})",
+                    sku_list,
+                )
+            prior = {row[0]: row[1] for row in cur.fetchall()}
+        print(f"[SOD-{source}] step 4/8: computing SKU-level changes…")
         new_listings = 0
         new_delistings = 0
         change_inserts = []
@@ -3229,6 +3280,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 else:
                     change_inserts.append((sku, None, snapshot_date, old, status, 'STATUS_FLIP'))
 
+        print(f"[SOD-{source}] step 4/8 done: {len(change_inserts)} SKU-level changes")
         # 4b) PER-STORE per-SKU change detection for our tracked SKUs.
         # Answers "which stores added Red Admiral last week" — the rep workflow.
         # Compare current snapshot per-(sku,store) status to the most-recent PRIOR
@@ -3305,6 +3357,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         # latest_rows is already filtered correctly by the streaming parser:
         #   - Daily A: only tracked-SKU rows (~155)
         #   - Daily B: all rows (~1,400, already agent-filtered server-side)
+        print(f"[SOD-{source}] step 5/8: upserting {len(latest_rows)} sod_inventory rows…")
         rows_to_persist = latest_rows
 
         if rows_to_persist:
@@ -3339,7 +3392,9 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                       r['on_hand'], r['product_name'], source) for r in rows_to_persist],
                 )
 
+        print(f"[SOD-{source}] step 5/8 done")
         # 6) Upsert sod_products rollup
+        print(f"[SOD-{source}] step 6/8: upserting {len(per_sku)} sod_products rollups…")
         for sku, agg in per_sku.items():
             brand, display_name = SOD_TRACKED_SKUS.get(sku, ('', agg['name']))
             is_tracked = sku in SOD_TRACKED_SKUS
@@ -3381,7 +3436,10 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                      agg['store_count'], agg['total_on_hand'], 1 if is_tracked else 0, brand),
                 )
 
+        print(f"[SOD-{source}] step 6/8 done")
         # 7) Insert detected listing changes (SKU-level)
+        print(f"[SOD-{source}] step 7/8: writing {len(change_inserts)} SKU + "
+              f"{len(store_change_inserts)} per-store change events…")
         if change_inserts:
             if USE_POSTGRES:
                 psycopg2.extras.execute_values(
@@ -3419,7 +3477,9 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                     store_change_inserts,
                 )
 
+        print(f"[SOD-{source}] step 7/8 done")
         # 8) Also stamp a summary inventory_history row per tracked SKU (for legacy views)
+        print(f"[SOD-{source}] step 8/8: stamping inventory_history summaries…")
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
             agg = per_sku.get(sku)
             if not agg:
@@ -4626,7 +4686,7 @@ def _daily_health_check(auto_recover=True):
     stuck = (list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
     check('no_stuck_running_rows', stuck == 0, f'{stuck} stuck')
     if stuck > 0 and auto_recover:
-        n = _cleanup_orphaned_sod_runs(max_age_hours=6)
+        n = _cleanup_orphaned_sod_runs(max_age_hours=1)
         recovered.append(f'cleaned_{n}_stuck_runs')
 
     # 5. Per-store changes table has data
@@ -12159,8 +12219,9 @@ seed_data()
 seed_territories()
 refresh_sod_product_categories()
 # Sprint 0: cleanup orphaned 'running' SOD runs from prior crashes (e.g. OOM kills).
-# This makes /api/sod/status accurate and avoids stuck rows polluting the dashboard.
-_cleanup_orphaned_sod_runs(max_age_hours=6)
+# Lowered to 1h (was 6h) so we surface hangs faster — gunicorn has --timeout=1800
+# (30 min) so anything still 'running' after 1h is definitely a crash, not progress.
+_cleanup_orphaned_sod_runs(max_age_hours=1)
 # Sprint 4: backfill per-store SKU change events from historical snapshots so the
 # /distribution-additions + brand drill-downs have data immediately on first deploy.
 # Idempotent: re-running is safe (UNIQUE constraint).
