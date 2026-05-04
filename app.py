@@ -10888,6 +10888,171 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@app.route('/api/crm/eod-brief', methods=['GET'])
+def api_crm_eod_brief():
+    """End-of-day brief for a rep — summary text ready to paste into WhatsApp/text.
+
+    ?rep=Namit  &date=YYYY-MM-DD (default today, Toronto)
+
+    Counts visits, calls, emails, tastings against daily targets:
+      - Target: 8-10 store visits + 6-8 calls/emails (= 14-18 activities)
+
+    Returns:
+      - rep, date, totals, per-store breakdown, deals_advanced
+      - whatsapp_text: pre-formatted message ready to share
+      - whatsapp_url: deep-link `https://wa.me/?text=...`
+      - meets_target: bool
+    """
+    rep = (request.args.get('rep') or '').strip()
+    date_str = (request.args.get('date') or _toronto_today().isoformat()).strip()
+    if not rep:
+        return jsonify({'error': 'rep required'}), 400
+    try:
+        target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    date_expr = "a.created_at::date" if USE_POSTGRES else "DATE(a.created_at)"
+
+    # Pull all activities by this rep for that date
+    sql = (
+        f"SELECT a.id, a.activity_type, a.notes, a.outcome, a.duration_minutes, "
+        f"a.rating, a.visit_date, a.created_at, "
+        f"s.store_number, COALESCE(s.account,''), COALESCE(s.city,'') "
+        f"FROM activities a "
+        f"LEFT JOIN stores s ON s.id = a.store_id "
+        f"WHERE a.deleted_at IS NULL "
+        f"AND COALESCE(LOWER(TRIM(a.rep)),'') = LOWER(TRIM({ph})) "
+        f"AND COALESCE(a.visit_date, {date_expr}) = {ph} "
+        f"ORDER BY a.created_at"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, (rep, target_date.isoformat()))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, (rep, target_date.isoformat())).fetchall()
+
+    # Categorize
+    VISIT_TYPES = {'store_visit', 'visit', 'tasting', 'sample_drop'}
+    CALL_TYPES = {'call', 'phone'}
+    EMAIL_TYPES = {'email', 'mail'}
+    visits = []
+    calls = []
+    emails = []
+    others = []
+    for r in rows:
+        rec = {
+            'id': r[0], 'activity_type': r[1] or '', 'notes': r[2] or '',
+            'outcome': r[3] or '', 'duration_minutes': int(r[4] or 0),
+            'rating': int(r[5] or 0), 'visit_date': str(r[6]) if r[6] else None,
+            'created_at': str(r[7]) if r[7] else None,
+            'store_number': r[8], 'account': r[9], 'city': r[10],
+        }
+        at = (rec['activity_type'] or '').lower()
+        if at in VISIT_TYPES: visits.append(rec)
+        elif at in CALL_TYPES: calls.append(rec)
+        elif at in EMAIL_TYPES: emails.append(rec)
+        else: others.append(rec)
+
+    # Pull deals advanced today
+    deal_sql = (
+        f"SELECT d.id, d.store_number, d.sku, d.stage, d.notes, d.expected_units "
+        f"FROM deals d WHERE LOWER(TRIM(d.owner_rep)) = LOWER(TRIM({ph})) "
+        f"AND ((d.created_at::date = {ph}) OR (d.closed_at::date = {ph})) "
+    ) if USE_POSTGRES else (
+        f"SELECT id, store_number, sku, stage, notes, expected_units "
+        f"FROM deals WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(?)) "
+        f"AND (DATE(created_at) = ? OR DATE(closed_at) = ?)"
+    )
+    try:
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(deal_sql, (rep, target_date.isoformat(), target_date.isoformat()))
+            deals = [{'id': r[0], 'store_number': r[1], 'sku': r[2], 'stage': r[3],
+                      'notes': r[4] or '', 'expected_units': int(r[5] or 0)}
+                     for r in cur.fetchall()]
+            cur.close()
+        else:
+            deals = [{'id': r[0], 'store_number': r[1], 'sku': r[2], 'stage': r[3],
+                      'notes': r[4] or '', 'expected_units': int(r[5] or 0)}
+                     for r in db.execute(deal_sql, (rep, target_date.isoformat(), target_date.isoformat())).fetchall()]
+    except Exception:
+        if USE_POSTGRES:
+            try: db.rollback()
+            except Exception: pass
+        deals = []
+
+    # Targets
+    TARGET_VISITS_MIN = 8
+    TARGET_VISITS_MAX = 10
+    TARGET_CALLS_EMAILS_MIN = 6
+    TARGET_CALLS_EMAILS_MAX = 8
+    n_visits = len(visits)
+    n_calls = len(calls)
+    n_emails = len(emails)
+    n_calls_emails = n_calls + n_emails
+    visits_ok = n_visits >= TARGET_VISITS_MIN
+    calls_ok = n_calls_emails >= TARGET_CALLS_EMAILS_MIN
+    meets_target = visits_ok and calls_ok
+
+    # Build WhatsApp text
+    lines = [
+        f"📋 EOD — {rep} — {target_date.strftime('%a %b %d')}",
+        "",
+        f"✅ Visits: {n_visits} (target {TARGET_VISITS_MIN}-{TARGET_VISITS_MAX})"
+        + (" 👍" if visits_ok else " ⚠️ short"),
+        f"📞 Calls + emails: {n_calls_emails} ({n_calls} calls + {n_emails} emails) "
+        f"(target {TARGET_CALLS_EMAILS_MIN}-{TARGET_CALLS_EMAILS_MAX})"
+        + (" 👍" if calls_ok else " ⚠️ short"),
+    ]
+    if visits:
+        lines.append("")
+        lines.append("Stores visited:")
+        for v in visits[:12]:
+            tag = f" — {v['outcome']}" if v.get('outcome') else ""
+            lines.append(f"  • #{v['store_number']} {v['account'][:25]}{tag}")
+    if deals:
+        lines.append("")
+        lines.append(f"Pipeline updates: {len(deals)}")
+        for d in deals[:6]:
+            lines.append(f"  • #{d['store_number']} → {d['stage']}"
+                         + (f" ({d['expected_units']}u)" if d['expected_units'] else ""))
+    if not (visits or calls or emails or deals):
+        lines.append("")
+        lines.append("No activity logged today.")
+
+    text = "\n".join(lines)
+    import urllib.parse as _up
+    whatsapp_url = f"https://wa.me/?text={_up.quote(text)}"
+
+    return jsonify({
+        'rep': rep,
+        'date': target_date.isoformat(),
+        'totals': {
+            'visits': n_visits,
+            'calls': n_calls,
+            'emails': n_emails,
+            'calls_emails_combined': n_calls_emails,
+            'other_activities': len(others),
+            'deals_touched': len(deals),
+        },
+        'targets': {
+            'visits_min': TARGET_VISITS_MIN, 'visits_max': TARGET_VISITS_MAX,
+            'calls_emails_min': TARGET_CALLS_EMAILS_MIN, 'calls_emails_max': TARGET_CALLS_EMAILS_MAX,
+        },
+        'meets_target': meets_target,
+        'visits_ok': visits_ok, 'calls_emails_ok': calls_ok,
+        'visits': visits, 'calls': calls, 'emails': emails, 'others': others,
+        'deals_touched': deals,
+        'whatsapp_text': text,
+        'whatsapp_url': whatsapp_url,
+    })
+
+
 @app.route('/api/crm/priority-targets', methods=['GET'])
 @cached_response(ttl_seconds=120, key_args=('rep', 'max_skus', 'days'))
 def api_crm_priority_targets():
