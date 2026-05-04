@@ -10888,6 +10888,64 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@app.route('/api/admin/bulk-geocode', methods=['POST'])
+@require_admin_token
+def api_admin_bulk_geocode():
+    """Bulk-update lat/lng for many stores in one call. Auth: X-Admin-Token.
+
+    Body: {"updates": [{"store_number": 4, "lat": 43.67, "lng": -79.35}, ...]}
+    Idempotent: re-running with same data is safe (UPDATE only).
+    """
+    body = request.get_json(silent=True) or {}
+    updates = body.get('updates') or []
+    if not isinstance(updates, list) or not updates:
+        return jsonify({'error': 'updates: [{store_number, lat, lng}, ...] required'}), 400
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    succeeded = 0
+    failed = 0
+    errors = []
+    for u in updates:
+        try:
+            sn = int(u.get('store_number'))
+            lat = float(u.get('lat'))
+            lng = float(u.get('lng'))
+            if not (lat and lng) or abs(lat) > 90 or abs(lng) > 180:
+                raise ValueError("invalid coords")
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    f"UPDATE stores SET lat=%s, lng=%s WHERE store_number=%s",
+                    (lat, lng, sn),
+                )
+                rc = cur.rowcount
+                cur.close()
+            else:
+                rc = db.execute(
+                    "UPDATE stores SET lat=?, lng=? WHERE store_number=?",
+                    (lat, lng, sn),
+                ).rowcount
+            if rc > 0:
+                succeeded += 1
+            else:
+                failed += 1
+                errors.append(f"#{sn}: not found")
+        except Exception as e:
+            failed += 1
+            errors.append(f"#{u.get('store_number')}: {e}")
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+    db.commit()
+    return jsonify({
+        'updates_received': len(updates),
+        'succeeded': succeeded,
+        'failed': failed,
+        'errors': errors[:20],
+    })
+
+
 @app.route('/api/crm/eod-brief', methods=['GET'])
 def api_crm_eod_brief():
     """End-of-day brief for a rep — summary text ready to paste into WhatsApp/text.
