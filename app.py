@@ -10910,21 +10910,45 @@ def api_crm_territory_plan():
     days = max(1, min(int(request.args.get('days', 14)), 21))
     max_per_day = max(5, min(int(request.args.get('max_per_day', 9)), 14))
 
-    # Define each rep's territory by postal prefixes (in priority order)
+    # 5-REP TERRITORY MAP — covers all of Ontario, postal-prefix clustered
+    # for fuel-efficient driving. Each rep's territory targets ~7-day cycle
+    # at 8-10 stops/day (56-70 stores/week).
     TERRITORY = {
         'Namit': {
-            'name': 'GTA — Toronto Core + adjacent 905',
-            'postal_prefixes': ['M'],  # Toronto core M* — 112 stores
-            'fallback_l_cities': ['Mississauga', 'Brampton', 'Markham', 'Vaughan'],  # add only if M < target
+            'name': 'Toronto Core (M* postal)',
+            'postal_prefixes': ['M'],  # 112 stores — full Toronto downtown
             'target_min': 90, 'target_max': 110,
+        },
+        'Ikshit': {
+            'name': 'GTA West (Mississauga/Brampton/Halton)',
+            'postal_prefixes': ['L5', 'L6', 'L7'],
+            'fallback_cities': ['Burlington', 'Oakville', 'Milton', 'Georgetown'],
+            'target_min': 50, 'target_max': 75,
+        },
+        'Virat': {
+            'name': 'GTA East + Durham (Pickering/Ajax/Markham/Whitby)',
+            'postal_prefixes': ['L1', 'L3'],
+            'fallback_cities': ['Pickering', 'Ajax', 'Whitby', 'Oshawa',
+                                'Markham', 'Stouffville', 'Bowmanville'],
+            'target_min': 50, 'target_max': 75,
         },
         'Surya': {
             'name': 'Ottawa + Eastern Ontario',
-            'postal_prefixes': ['K1', 'K2'],  # Ottawa core
+            'postal_prefixes': ['K1', 'K2'],  # Ottawa core (34 stores)
             'fallback_cities': ['Kingston', 'Brockville', 'Cornwall', 'Stittsville',
                                 'Carleton Place', 'Gananoque', 'Rockland', 'Embrun',
                                 'Kanata', 'Nepean', 'Orleans'],
             'target_min': 40, 'target_max': 60,
+        },
+        'Neeraj': {
+            'name': 'South-Western Ontario (Hamilton/Niagara/Kitchener/London)',
+            'postal_prefixes': ['N'],  # 148 stores in N* postal
+            'fallback_cities': ['Hamilton', 'Burlington', 'Niagara Falls',
+                                'St. Catharines', 'Welland', 'Kitchener',
+                                'Waterloo', 'Cambridge', 'Guelph', 'London',
+                                'Brantford', 'Woodstock', 'Stratford', 'Sarnia',
+                                'Windsor', 'Chatham'],
+            'target_min': 100, 'target_max': 150,
         },
     }
     if rep not in TERRITORY:
