@@ -11212,14 +11212,55 @@ def api_crm_priority_targets():
             'skus_listed_count': int(r[14]),
         })
 
-    # Cluster into days using FSA buckets + nearest-neighbor TSP
+    # Cluster into days. STRATEGY: dense urban-first, rural last.
+    #   1. Group by FSA (first 3 postal chars)
+    #   2. For each FSA, compute centroid + neighborhood density (avg distance
+    #      between stores in the FSA) — DENSE = small avg distance
+    #   3. Sort FSAs by density (densest first) so Day 1 = tightest cluster
+    #   4. Pack into days with max_per_day cap
+    #   5. Within each day, run nearest-neighbor TSP from centroid
     from collections import defaultdict
     from math import radians, sin, cos, asin, sqrt
+
+    def hv(a, b):
+        if not (a.get('lat') and a.get('lng') and b.get('lat') and b.get('lng')):
+            return 999
+        lat1, lng1, lat2, lng2 = map(radians, (a['lat'], a['lng'], b['lat'], b['lng']))
+        dlat = lat2 - lat1; dlng = lng2 - lng1
+        h = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
+        return 2 * 6371 * asin(sqrt(h))
+
     by_fsa = defaultdict(list)
     for s in stores:
         fsa = s['postal'][:3] if s['postal'] else 'UNK'
         by_fsa[fsa].append(s)
-    sorted_fsas = sorted(by_fsa.keys(), key=lambda k: (-len(by_fsa[k]), k))
+
+    def fsa_density_score(fsa_stores):
+        """Lower score = denser cluster (better for fuel efficiency)."""
+        with_gps = [s for s in fsa_stores if s.get('lat') and s.get('lng')]
+        if len(with_gps) < 2:
+            return 0  # single store = treat as zero spread
+        # Average pairwise distance (proxy for density)
+        total = 0
+        n = 0
+        for i in range(len(with_gps)):
+            for j in range(i+1, len(with_gps)):
+                d = hv(with_gps[i], with_gps[j])
+                if d < 999:
+                    total += d
+                    n += 1
+        return total / max(n, 1)
+
+    # Sort FSAs: prefer larger clusters that are also TIGHT (small avg distance)
+    # Key: density_score / store_count → smaller is better (dense + populated)
+    def fsa_priority(fsa):
+        n = len(by_fsa[fsa])
+        density = fsa_density_score(by_fsa[fsa])
+        # Score: density per store (lower = better)
+        return density / max(n, 1)
+
+    sorted_fsas = sorted(by_fsa.keys(), key=fsa_priority)
+
     day_buckets = []
     cur_day = []
     for fsa in sorted_fsas:
@@ -11230,14 +11271,6 @@ def api_crm_priority_targets():
                 cur_day = []
     if cur_day:
         day_buckets.append(cur_day)
-
-    def hv(a, b):
-        if not (a.get('lat') and a.get('lng') and b.get('lat') and b.get('lng')):
-            return 999
-        lat1, lng1, lat2, lng2 = map(radians, (a['lat'], a['lng'], b['lat'], b['lng']))
-        dlat = lat2 - lat1; dlng = lng2 - lng1
-        h = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
-        return 2 * 6371 * asin(sqrt(h))
 
     today = _toronto_today()
     plan = []
