@@ -590,12 +590,37 @@ def init_db():
             )
         ''')
         # Idempotency guard: re-running the same day's sync used to duplicate
-        # change events. Add a unique key (NULLs treated as -1 via COALESCE
-        # since store_number is nullable for SKU-level rollups).
-        cur.execute('''
-            CREATE UNIQUE INDEX IF NOT EXISTS uniq_sod_listing_changes
-              ON sod_listing_changes (sku, COALESCE(store_number, -1), change_date, change_type)
-        ''')
+        # change events. Connection is autocommit=True (line 386), so each
+        # statement is independent. We:
+        #   1. Dedupe existing rows (only if the unique index doesn't exist)
+        #   2. Create the unique index
+        #   3. The insert path uses ON CONFLICT so future dupes are ignored
+        # Wrapped in try/except so a transient failure can't kill startup.
+        try:
+            cur.execute("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'uniq_sod_listing_changes'
+            """)
+            already_indexed = cur.fetchone() is not None
+            if not already_indexed:
+                # Dedupe: keep MIN(id) per (sku, COALESCE(store_number,-1), change_date, change_type)
+                cur.execute("""
+                    DELETE FROM sod_listing_changes a USING sod_listing_changes b
+                    WHERE a.id > b.id
+                      AND a.sku = b.sku
+                      AND COALESCE(a.store_number, -1) = COALESCE(b.store_number, -1)
+                      AND a.change_date = b.change_date
+                      AND a.change_type = b.change_type
+                """)
+                deleted = cur.rowcount or 0
+                if deleted:
+                    print(f"[init_db] Deduped {deleted} sod_listing_changes rows before index creation")
+            cur.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_sod_listing_changes
+                  ON sod_listing_changes (sku, COALESCE(store_number, -1), change_date, change_type)
+            ''')
+        except Exception as _idx_err:
+            print(f"[init_db] uniq_sod_listing_changes setup skipped: {_idx_err}")
         # Per-(store, sku) change tracking for our tracked SKUs:
         # answers "which stores added/dropped Red Admiral last week?"
         cur.execute('''
@@ -3459,15 +3484,29 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 # Idempotent UPSERT — backed by the uniq_sod_listing_changes
                 # unique index (sku, COALESCE(store_number,-1), change_date, change_type).
                 # Re-running the same snapshot used to duplicate every event.
-                psycopg2.extras.execute_values(
-                    cur,
-                    """INSERT INTO sod_listing_changes
-                       (sku, store_number, change_date, old_status, new_status, change_type)
-                       VALUES %s
-                       ON CONFLICT (sku, COALESCE(store_number, -1), change_date, change_type)
-                       DO NOTHING""",
-                    change_inserts,
-                )
+                # FALLBACK: if the index doesn't exist (e.g. dedupe step on a
+                # massive history table didn't complete), ON CONFLICT raises;
+                # we catch and fall back to plain INSERT to keep the daily
+                # sync from breaking.
+                try:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_listing_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES %s
+                           ON CONFLICT (sku, COALESCE(store_number, -1), change_date, change_type)
+                           DO NOTHING""",
+                        change_inserts,
+                    )
+                except psycopg2.errors.InvalidColumnReference:
+                    print(f"[SOD-{source}] uniq index missing, falling back to plain INSERT")
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_listing_changes
+                           (sku, store_number, change_date, old_status, new_status, change_type)
+                           VALUES %s""",
+                        change_inserts,
+                    )
             else:
                 cur.executemany(
                     """INSERT OR IGNORE INTO sod_listing_changes
