@@ -11092,7 +11092,7 @@ def api_crm_rep_performance():
     since = (today - timedelta(days=days)).isoformat()
 
     # Always include the official roster, even with 0 activity
-    OFFICIAL_REPS = ['Ikshit', 'Virat', 'Namit', 'Surya']
+    OFFICIAL_REPS = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
 
     out = {rep: {
         'rep': rep,
@@ -11641,7 +11641,7 @@ def api_crm_manager_dashboard():
     })
 
 
-REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya']
+REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
 
 
 @app.route('/api/crm/admin/roster', methods=['GET'])
@@ -12676,6 +12676,31 @@ init_db()
 seed_data()
 seed_territories()
 refresh_sod_product_categories()
+# Ensure all 5 official reps exist in the reps table on every boot.
+# Without this, /api/reps returns only reps that have already logged activity
+# (chicken-and-egg) and the dropdown is missing names. Idempotent.
+try:
+    _conn = _sod_get_conn()
+    _cur = _conn.cursor()
+    for _r in REP_ROSTER_DEFAULT:
+        if USE_POSTGRES:
+            _cur.execute(
+                "INSERT INTO reps (name) SELECT %s WHERE NOT EXISTS "
+                "(SELECT 1 FROM reps WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)))",
+                (_r, _r),
+            )
+        else:
+            _cur.execute(
+                "INSERT INTO reps (name) SELECT ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM reps WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)))",
+                (_r, _r),
+            )
+    _conn.commit()
+    _cur.close()
+    _conn.close()
+    print(f"[startup] Ensured {len(REP_ROSTER_DEFAULT)} official reps in DB: {REP_ROSTER_DEFAULT}")
+except Exception as _e:
+    print(f"[startup] rep seeding skipped: {_e}")
 # Sprint 0: cleanup orphaned 'running' SOD runs from prior crashes (e.g. OOM kills).
 # Lowered to 1h (was 6h) so we surface hangs faster — gunicorn has --timeout=1800
 # (30 min) so anything still 'running' after 1h is definitely a crash, not progress.
