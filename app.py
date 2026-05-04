@@ -10915,30 +10915,42 @@ def api_crm_territory_plan():
     # at 8-10 stops/day (56-70 stores/week).
     TERRITORY = {
         'Namit': {
-            'name': 'Toronto Core (M* postal)',
-            'postal_prefixes': ['M'],  # 112 stores — full Toronto downtown
-            'target_min': 90, 'target_max': 110,
+            # Toronto downtown/core/mid + North York + Etobicoke + Scarborough (all M*)
+            # PLUS Woodbridge / Vaughan / Markham / Newmarket
+            'name': 'Toronto + Vaughan + Markham + Newmarket',
+            'postal_prefixes': ['M'],  # All Toronto (112 stores)
+            'fallback_cities': ['Woodbridge', 'Vaughan', 'Maple', 'Markham',
+                                'Stouffville', 'Newmarket', 'Aurora',
+                                'Richmond Hill', 'Thornhill', 'Concord', 'Kleinburg'],
+            'target_min': 120, 'target_max': 160,
         },
         'Ikshit': {
             'name': 'GTA West (Mississauga/Brampton/Halton)',
             'postal_prefixes': ['L5', 'L6', 'L7'],
-            'fallback_cities': ['Burlington', 'Oakville', 'Milton', 'Georgetown'],
-            'target_min': 50, 'target_max': 75,
+            'fallback_cities': ['Burlington', 'Oakville', 'Milton', 'Georgetown',
+                                'Mississauga', 'Brampton'],
+            'target_min': 50, 'target_max': 80,
         },
         'Virat': {
-            'name': 'GTA East + Durham (Pickering/Ajax/Markham/Whitby)',
-            'postal_prefixes': ['L1', 'L3'],
+            # GTA East + Durham (excluding Markham which is Namit's now)
+            'name': 'GTA East + Durham (Pickering/Ajax/Whitby/Oshawa)',
+            'postal_prefixes': ['L1'],
             'fallback_cities': ['Pickering', 'Ajax', 'Whitby', 'Oshawa',
-                                'Markham', 'Stouffville', 'Bowmanville'],
-            'target_min': 50, 'target_max': 75,
+                                'Bowmanville', 'Courtice', 'Clarington',
+                                'Port Perry', 'Uxbridge'],
+            'target_min': 30, 'target_max': 50,
         },
         'Surya': {
-            'name': 'Ottawa + Eastern Ontario',
-            'postal_prefixes': ['K1', 'K2'],  # Ottawa core (34 stores)
+            # ALL stores in and around Ottawa — every K* postal code (city + rural)
+            'name': 'Ottawa region + ALL K* (Eastern Ontario)',
+            'postal_prefixes': ['K'],  # All K — Ottawa region + eastern rural
             'fallback_cities': ['Kingston', 'Brockville', 'Cornwall', 'Stittsville',
                                 'Carleton Place', 'Gananoque', 'Rockland', 'Embrun',
-                                'Kanata', 'Nepean', 'Orleans'],
-            'target_min': 40, 'target_max': 60,
+                                'Kanata', 'Nepean', 'Orleans', 'Manotick',
+                                'Almonte', 'Smiths Falls', 'Perth', 'Renfrew',
+                                'Pembroke', 'Petawawa', 'Arnprior', 'Belleville',
+                                'Trenton', 'Picton', 'Napanee'],
+            'target_min': 80, 'target_max': 150,
         },
         'Neeraj': {
             'name': 'South-Western Ontario (Hamilton/Niagara/Kitchener/London)',
