@@ -9783,27 +9783,560 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').strip()
 AI_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')
 
 
+# ===================================================================
+# FREE deterministic answer engine — no LLM, no API cost.
+# Pattern-matches the question against a fixed set of intents and
+# emits a real SQL query + plain-English narrative answer.
+# Used as the primary path so /ask works without Anthropic credits.
+# ===================================================================
+
+_SKU_ALIASES = {
+    # NB Distillers (priority)
+    'red admiral': '0020187',
+    'red admiral vodka': '0020187',
+    'admiral': '0020187',
+    'chak de': '0022246',
+    'chakde': '0022246',
+    'chak de whisky': '0022246',
+    'chak de canadian whisky': '0022246',
+    # Anu Import
+    'goenchi cashew': '0046340',
+    'cashew feni': '0046340',
+    'goenchi coconut': '0046343',
+    'coconut feni': '0046343',
+    'goenchi': '0046340',  # default to cashew
+    'feni': '0046340',
+    'fratelli shiraz': '0046282',
+    'classic shiraz': '0046282',
+    'shiraz': '0046282',
+    'fratelli chenin': '0046285',
+    'chenin': '0046285',
+    'fratelli sauv': '0046286',
+    'sauvignon blanc': '0046286',
+    'sauvignon': '0046286',
+    'fratelli cabernet': '0046287',
+    'cabernet': '0046287',
+    'cabernet sauvignon': '0046287',
+}
+
+_REP_NAMES = ['ikshit', 'namit', 'virat', 'surya', 'neeraj']
+
+_CITY_ALIASES = [
+    'toronto', 'ottawa', 'mississauga', 'brampton', 'hamilton',
+    'london', 'kitchener', 'waterloo', 'guelph', 'cambridge',
+    'oakville', 'burlington', 'milton', 'caledon', 'newmarket',
+    'aurora', 'richmond hill', 'markham', 'vaughan', 'kingston',
+    'windsor', 'barrie', 'sudbury', 'thunder bay', 'st. catharines',
+    'niagara falls', 'oshawa', 'whitby', 'pickering',
+]
+
+
+def _detect_sku(q):
+    """Return SKU code if question references one of our tracked SKUs, else None."""
+    ql = q.lower()
+    # Match longest alias first
+    for alias in sorted(_SKU_ALIASES.keys(), key=len, reverse=True):
+        if alias in ql:
+            return _SKU_ALIASES[alias]
+    # Direct SKU code (7 digits)
+    m = re.search(r'\b(\d{7})\b', q)
+    if m and m.group(1) in SOD_TRACKED_SKUS:
+        return m.group(1)
+    return None
+
+
+def _detect_rep(q):
+    ql = q.lower()
+    for r in _REP_NAMES:
+        # word-boundary match so "namit" doesn't match "namite" etc
+        if re.search(r'\b' + r + r'\b', ql):
+            return r.capitalize()
+    return None
+
+
+def _detect_city(q):
+    ql = q.lower()
+    for c in _CITY_ALIASES:
+        if c in ql:
+            return c.title()
+    return None
+
+
+def _detect_store_number(q):
+    """Match a 1-4 digit number when the word 'store' is present."""
+    if 'store' not in q.lower():
+        return None
+    # Avoid SKU codes (7 digits) — only 1-4 digit nums
+    m = re.search(r'\bstore\s*#?\s*(\d{1,4})\b', q.lower())
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _run_select(sql, params=None):
+    """Run a read-only SELECT with timeout and return (rows_dict, columns)."""
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SET statement_timeout = 5000')
+                cur.execute(sql, params or ())
+                rows = cur.fetchmany(1000)
+                cols = [d[0] for d in cur.description] if cur.description else []
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(sql.replace('%s', '?'), params or [])
+            rows = cur.fetchmany(1000)
+            cols = [d[0] for d in cur.description] if cur.description else []
+        finally:
+            conn.close()
+    rows_dict = [
+        {cols[i]: _json_safe(v) for i, v in enumerate(row)} for row in rows
+    ]
+    return rows_dict, cols
+
+
+def _summarize_sku(sku):
+    """Plain-English summary for a single tracked SKU."""
+    brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+
+    # Latest snapshot rollup
+    sql = """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'L')::int AS listed,
+            COUNT(*) FILTER (WHERE status = 'D')::int AS delisting,
+            COUNT(*) FILTER (WHERE status = 'F')::int AS fully_delisted,
+            COALESCE(SUM(on_hand) FILTER (WHERE status = 'L'), 0)::int AS units_on_shelf,
+            MAX(snapshot_date)::text AS as_of
+        FROM sod_inventory
+        WHERE sku = %s
+          AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+    """
+    rows, cols = _run_select(sql, (sku, sku))
+    if not rows:
+        return None
+    r = rows[0]
+    listed = r.get('listed') or 0
+    delist = r.get('delisting') or 0
+    fully = r.get('fully_delisted') or 0
+    units = r.get('units_on_shelf') or 0
+    as_of = r.get('as_of') or 'unknown'
+
+    # Recent listing changes (7d)
+    sql2 = """
+        SELECT change_type, COUNT(*)::int AS n
+        FROM sod_listing_changes
+        WHERE sku = %s
+          AND change_date >= CURRENT_DATE - INTERVAL '7 days'
+          AND change_type IN ('NEW_LISTING', 'DELISTED', 'RELISTED')
+        GROUP BY change_type
+    """
+    changes, _ = _run_select(sql2, (sku,))
+    chg_map = {c['change_type']: c['n'] for c in changes}
+    new_l = chg_map.get('NEW_LISTING', 0)
+    deli = chg_map.get('DELISTED', 0)
+    relist = chg_map.get('RELISTED', 0)
+
+    # Top 5 cities by store count
+    sql3 = """
+        SELECT s.city, COUNT(DISTINCT s.store_number)::int AS stores
+        FROM sod_inventory i
+        JOIN stores s ON s.store_number = i.store_number
+        WHERE i.sku = %s AND i.status = 'L'
+          AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+          AND s.city IS NOT NULL AND s.city <> ''
+        GROUP BY s.city
+        ORDER BY stores DESC
+        LIMIT 5
+    """
+    cities, _ = _run_select(sql3, (sku, sku))
+    city_phrase = ''
+    if cities:
+        city_phrase = ' Top cities: ' + ', '.join(
+            f"{c['city']} ({c['stores']})" for c in cities
+        ) + '.'
+
+    # Build narrative
+    parts = [
+        f"{name} ({brand}, SKU {sku}) is currently listed in {listed} LCBO stores",
+        f"with {units:,} units on shelf as of {as_of}.",
+    ]
+    if delist or fully:
+        parts.append(
+            f"Watch list: {delist} stores marked Delisting and {fully} marked Fully Delisted."
+        )
+    if new_l or deli or relist:
+        parts.append(
+            f"Last 7 days: {new_l} new listings, {deli} delistings, {relist} relistings."
+        )
+    parts.append(city_phrase)
+    answer = ' '.join(p for p in parts if p).strip()
+
+    # Combined rows for the table view (city breakdown is most useful)
+    return answer, sql3.strip(), cities, ['city', 'stores']
+
+
+def _summarize_rep(rep_name):
+    """Plain-English summary for a rep's recent activity."""
+    # Visits in last 7 / 30 days
+    sql = """
+        SELECT
+            COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS visits_7d,
+            COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS visits_30d,
+            COUNT(DISTINCT store_id) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS unique_stores_30d,
+            MAX(created_at)::text AS last_visit
+        FROM activities
+        WHERE rep = %s
+    """
+    rows, _ = _run_select(sql, (rep_name,))
+    r = (rows or [{}])[0]
+    v7 = r.get('visits_7d') or 0
+    v30 = r.get('visits_30d') or 0
+    uniq = r.get('unique_stores_30d') or 0
+    last = r.get('last_visit') or 'never'
+
+    # Stores in territory
+    sql2 = """
+        SELECT COUNT(*)::int AS territory_size
+        FROM stores
+        WHERE rep = %s
+    """
+    trows, _ = _run_select(sql2, (rep_name,))
+    territory = (trows or [{'territory_size': 0}])[0].get('territory_size') or 0
+
+    # Top 5 most-visited stores in last 30d
+    sql3 = """
+        SELECT s.store_number, s.account, s.city,
+               COUNT(*)::int AS visits
+        FROM activities a
+        JOIN stores s ON s.id = a.store_id
+        WHERE a.rep = %s
+          AND a.created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY s.store_number, s.account, s.city
+        ORDER BY visits DESC
+        LIMIT 5
+    """
+    top, _ = _run_select(sql3, (rep_name,))
+
+    coverage_pct = round((uniq / territory * 100), 1) if territory else 0
+    parts = [
+        f"{rep_name} has {territory} stores in territory.",
+        f"Last 7 days: {v7} visits. Last 30 days: {v30} visits across {uniq} unique stores ({coverage_pct}% coverage).",
+        f"Last visit logged: {last}.",
+    ]
+    answer = ' '.join(parts)
+    return answer, sql3.strip(), top, ['store_number', 'account', 'city', 'visits']
+
+
+def _summarize_store(store_number):
+    """Plain-English summary for a single store."""
+    sql = """
+        SELECT s.store_number, s.account, s.address, s.city, s.postal,
+               s.rep, s.priority, s.manager_name, s.phone
+        FROM stores s
+        WHERE s.store_number = %s
+        LIMIT 1
+    """
+    rows, _ = _run_select(sql, (store_number,))
+    if not rows:
+        return f"No store found with number {store_number}.", sql.strip(), [], []
+    s = rows[0]
+
+    # Listings of our SKUs at this store
+    sql2 = """
+        SELECT i.sku, i.product_name, i.status, i.on_hand
+        FROM sod_inventory i
+        WHERE i.store_number = %s
+          AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
+          AND i.sku IN ({})
+        ORDER BY i.sku
+    """.format(','.join("'%s'" % k for k in SOD_TRACKED_SKUS.keys()))
+    listings, _ = _run_select(sql2, (store_number,))
+    listed = [l for l in listings if l.get('status') == 'L']
+
+    # Last visit
+    sql3 = """
+        SELECT a.rep, a.created_at::text AS at, a.notes
+        FROM activities a
+        JOIN stores st ON st.id = a.store_id
+        WHERE st.store_number = %s
+        ORDER BY a.created_at DESC
+        LIMIT 1
+    """
+    last, _ = _run_select(sql3, (store_number,))
+
+    addr = f"{s.get('address') or ''}, {s.get('city') or ''}".strip(', ')
+    parts = [
+        f"Store #{s.get('store_number')} — {s.get('account') or 'LCBO'} ({addr}).",
+        f"Rep: {s.get('rep') or 'unassigned'}. Priority: {s.get('priority') or 'none'}.",
+    ]
+    if s.get('manager_name'):
+        parts.append(f"Manager: {s['manager_name']}.")
+    if listed:
+        names = [l.get('product_name') or l.get('sku') for l in listed]
+        parts.append(f"Currently listing {len(listed)}/{len(SOD_TRACKED_SKUS)} of our tracked SKUs: {', '.join(names)}.")
+    else:
+        parts.append(f"Currently listing 0/{len(SOD_TRACKED_SKUS)} of our tracked SKUs — high-priority pitch target.")
+    if last:
+        parts.append(f"Last visit: {last[0].get('rep')} at {last[0].get('at')}.")
+    else:
+        parts.append("No visits logged yet.")
+
+    return ' '.join(parts), sql2.strip(), listings, ['sku', 'product_name', 'status', 'on_hand']
+
+
+def _summarize_portfolio():
+    """Roll-up across all 8 tracked SKUs."""
+    sql = """
+        SELECT i.sku, p.product_name,
+               COUNT(*) FILTER (WHERE i.status = 'L')::int AS listed,
+               COUNT(*) FILTER (WHERE i.status = 'D')::int AS delisting,
+               COALESCE(SUM(i.on_hand) FILTER (WHERE i.status = 'L'), 0)::int AS units
+        FROM sod_inventory i
+        LEFT JOIN sod_products p ON p.sku = i.sku
+        WHERE i.sku IN ({})
+          AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
+        GROUP BY i.sku, p.product_name
+        ORDER BY listed DESC
+    """.format(','.join("'%s'" % k for k in SOD_TRACKED_SKUS.keys()))
+    rows, _ = _run_select(sql)
+    if not rows:
+        return "No SOD inventory data loaded yet.", sql.strip(), [], []
+
+    total_listed = sum(r.get('listed') or 0 for r in rows)
+    total_delist = sum(r.get('delisting') or 0 for r in rows)
+    total_units = sum(r.get('units') or 0 for r in rows)
+    leader = max(rows, key=lambda r: r.get('listed') or 0)
+    leader_name = leader.get('product_name') or SOD_TRACKED_SKUS.get(leader.get('sku'), ('', ''))[1]
+
+    parts = [
+        f"Portfolio rollup across {len(rows)} tracked SKUs:",
+        f"{total_listed} total store-listings, {total_units:,} units on shelf, {total_delist} flagged delisting.",
+        f"Top performer: {leader_name} with {leader.get('listed')} stores.",
+    ]
+    return ' '.join(parts), sql.strip(), rows, ['sku', 'product_name', 'listed', 'delisting', 'units']
+
+
+def _count_stores_listing(sku, city=None):
+    brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+    if city:
+        sql = """
+            SELECT COUNT(DISTINCT i.store_number)::int AS stores
+            FROM sod_inventory i
+            JOIN stores s ON s.store_number = i.store_number
+            WHERE i.sku = %s AND i.status = 'L'
+              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+              AND s.city ILIKE %s
+        """
+        rows, _ = _run_select(sql, (sku, sku, f'%{city}%'))
+        n = (rows or [{'stores': 0}])[0].get('stores') or 0
+        return f"{n} LCBO stores in {city} are currently listing {name}.", sql.strip(), rows, ['stores']
+    sql = """
+        SELECT COUNT(DISTINCT store_number)::int AS stores
+        FROM sod_inventory
+        WHERE sku = %s AND status = 'L'
+          AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+    """
+    rows, _ = _run_select(sql, (sku, sku))
+    n = (rows or [{'stores': 0}])[0].get('stores') or 0
+    return f"{n} LCBO stores are currently listing {name} ({brand}).", sql.strip(), rows, ['stores']
+
+
+def _top_stores_for_sku(sku, limit=10, city=None):
+    brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+    if city:
+        sql = """
+            SELECT s.store_number, s.account, s.city, i.on_hand
+            FROM sod_inventory i
+            JOIN stores s ON s.store_number = i.store_number
+            WHERE i.sku = %s AND i.status = 'L'
+              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+              AND s.city ILIKE %s
+            ORDER BY i.on_hand DESC NULLS LAST
+            LIMIT %s
+        """
+        rows, _ = _run_select(sql, (sku, sku, f'%{city}%', limit))
+    else:
+        sql = """
+            SELECT s.store_number, s.account, s.city, i.on_hand
+            FROM sod_inventory i
+            JOIN stores s ON s.store_number = i.store_number
+            WHERE i.sku = %s AND i.status = 'L'
+              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+            ORDER BY i.on_hand DESC NULLS LAST
+            LIMIT %s
+        """
+        rows, _ = _run_select(sql, (sku, sku, limit))
+
+    if not rows:
+        scope = f" in {city}" if city else ''
+        return f"No stores currently list {name}{scope}.", sql.strip(), rows, ['store_number', 'account', 'city', 'on_hand']
+    top = rows[0]
+    scope = f" in {city}" if city else ''
+    return (
+        f"Top {len(rows)} stores for {name}{scope} by on-hand inventory. "
+        f"Leader: store #{top['store_number']} ({top.get('city','')}) with {top.get('on_hand') or 0} units."
+    ), sql.strip(), rows, ['store_number', 'account', 'city', 'on_hand']
+
+
+def _list_delisting(sku=None):
+    if sku:
+        brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+        sql = """
+            SELECT s.store_number, s.account, s.city, i.on_hand
+            FROM sod_inventory i
+            JOIN stores s ON s.store_number = i.store_number
+            WHERE i.sku = %s AND i.status = 'D'
+              AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku = %s)
+            ORDER BY i.on_hand DESC NULLS LAST
+            LIMIT 50
+        """
+        rows, _ = _run_select(sql, (sku, sku))
+        return (
+            f"{len(rows)} stores currently flagged Delisting for {name}. "
+            f"These are urgent saves — every one rescued is a kept listing."
+        ), sql.strip(), rows, ['store_number', 'account', 'city', 'on_hand']
+    # Across portfolio
+    sql = """
+        SELECT i.sku, p.product_name, COUNT(*)::int AS delisting_stores
+        FROM sod_inventory i
+        LEFT JOIN sod_products p ON p.sku = i.sku
+        WHERE i.status = 'D'
+          AND i.sku IN ({})
+          AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
+        GROUP BY i.sku, p.product_name
+        ORDER BY delisting_stores DESC
+    """.format(','.join("'%s'" % k for k in SOD_TRACKED_SKUS.keys()))
+    rows, _ = _run_select(sql)
+    total = sum(r.get('delisting_stores') or 0 for r in rows)
+    return (
+        f"{total} store-SKU combinations across our portfolio are flagged Delisting. "
+        f"Saving these is the fastest revenue-protection move."
+    ), sql.strip(), rows, ['sku', 'product_name', 'delisting_stores']
+
+
+def _free_answer(question):
+    """Try to answer the question deterministically.
+    Returns (answer, sql, rows, columns) on success, None on no match."""
+    q = question.strip()
+    ql = q.lower()
+
+    sku = _detect_sku(q)
+    rep = _detect_rep(q)
+    city = _detect_city(q)
+    store_num = _detect_store_number(q)
+
+    is_summary = any(w in ql for w in [
+        'summarize', 'summary', 'overview', 'how is', "how's", 'report on',
+        'tell me about', 'status of', 'how are', 'recap',
+    ])
+    is_count = any(w in ql for w in ['how many', 'count', 'number of'])
+    is_top = any(w in ql for w in ['top', 'best', 'most', 'largest', 'biggest'])
+    is_delisting = 'delist' in ql
+    is_listing = ('listing' in ql or 'listed' in ql or 'carry' in ql or 'carrying' in ql or 'sell' in ql)
+    is_portfolio = any(w in ql for w in [
+        'portfolio', 'all skus', 'all products', 'everything', 'all brands',
+        'whole', 'entire', 'tracked skus', 'tracked products',
+    ])
+
+    # Priority 1: store-specific summary
+    if store_num is not None:
+        return _summarize_store(store_num)
+
+    # Priority 2: rep summary
+    if rep and (is_summary or 'doing' in ql or 'visit' in ql or 'activity' in ql):
+        return _summarize_rep(rep)
+
+    # Priority 3: portfolio rollup
+    if is_portfolio or (is_summary and not sku and not rep):
+        return _summarize_portfolio()
+
+    # Priority 4: SKU-level questions
+    if sku:
+        if is_delisting:
+            return _list_delisting(sku)
+        if is_count and (is_listing or 'store' in ql):
+            return _count_stores_listing(sku, city)
+        if is_top:
+            return _top_stores_for_sku(sku, 10, city)
+        # Default to SKU summary
+        return _summarize_sku(sku)
+
+    # Priority 5: generic delisting question without SKU
+    if is_delisting:
+        return _list_delisting(None)
+
+    # Priority 6: rep without summary keyword
+    if rep:
+        return _summarize_rep(rep)
+
+    return None
+
+
+_FREE_ANSWER_HELP = (
+    "I can answer questions like: 'Summarize Red Admiral', 'How is Namit doing?', "
+    "'Summarize store 217', 'How many stores list Chak De in Toronto?', "
+    "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary'."
+)
+
+
 @app.route('/api/ai/ask', methods=['POST'])
 def api_ai_ask():
-    """Claude-powered natural-language query over CRM data.
+    """Natural-language Q&A over CRM data.
 
-    Strategy: we ship Claude a SCHEMA + sample data and the user's question; Claude
-    generates a single read-only SQL query (SELECT only); we run it; we ship the
-    result back to Claude for natural-language summarization. Returns:
-      { question, sql, rows, answer, model }
+    Two paths:
+      1. FREE deterministic engine (always tries first) — pattern matches the
+         question to a fixed set of intents (summarize SKU/rep/store/portfolio,
+         count, top-N, delisting list) and emits a real SQL query + plain-English
+         narrative. No external API cost.
+      2. Claude fallback (only if ANTHROPIC_API_KEY is set AND free engine
+         can't match) — generates SQL via Claude, runs it, summarizes.
 
+    Returns: { question, sql, rows, columns, row_count, answer, model }
     Safety:
-      - Only SELECT queries allowed (regex-checked + we run on a separate connection
-        with autocommit+timeout)
-      - Only whitelisted tables exposed in the schema prompt
+      - Only SELECT queries allowed
       - Hard row limit of 1000
+      - Statement timeout 5s
     """
-    if not ANTHROPIC_API_KEY:
-        return jsonify({'error': 'ANTHROPIC_API_KEY env var not set'}), 503
     body = request.get_json(silent=True) or {}
     question = (body.get('question') or '').strip()
     if not question or len(question) > 500:
         return jsonify({'error': 'question must be 1-500 chars'}), 400
+
+    # ── Path 1: free deterministic engine ──
+    try:
+        free = _free_answer(question)
+    except Exception as e:
+        return jsonify({'error': f'Free engine error: {e}'}), 500
+    if free is not None:
+        answer, sql, rows, cols = free
+        return jsonify({
+            'question': question,
+            'sql': sql,
+            'rows': rows,
+            'columns': cols,
+            'row_count': len(rows),
+            'answer': answer,
+            'model': 'anu-rules-v1 (free)',
+        })
+
+    # ── Path 2: Claude fallback (only if API key set + funded) ──
+    if not ANTHROPIC_API_KEY:
+        return jsonify({
+            'question': question,
+            'sql': '',
+            'rows': [],
+            'columns': [],
+            'row_count': 0,
+            'answer': (
+                "I couldn't match that to a known pattern. " + _FREE_ANSWER_HELP
+            ),
+            'model': 'anu-rules-v1 (free)',
+        })
 
     schema = """
     Tables (PostgreSQL, all read-only):
