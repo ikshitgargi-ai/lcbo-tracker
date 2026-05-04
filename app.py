@@ -11235,29 +11235,37 @@ def api_crm_priority_targets():
         fsa = s['postal'][:3] if s['postal'] else 'UNK'
         by_fsa[fsa].append(s)
 
-    def fsa_density_score(fsa_stores):
-        """Lower score = denser cluster (better for fuel efficiency)."""
-        with_gps = [s for s in fsa_stores if s.get('lat') and s.get('lng')]
-        if len(with_gps) < 2:
-            return 0  # single store = treat as zero spread
-        # Average pairwise distance (proxy for density)
-        total = 0
-        n = 0
-        for i in range(len(with_gps)):
-            for j in range(i+1, len(with_gps)):
-                d = hv(with_gps[i], with_gps[j])
-                if d < 999:
-                    total += d
-                    n += 1
-        return total / max(n, 1)
+    # Sort FSAs by URBAN-CORE-FIRST. Strategy:
+    #   1. Compute global centroid of all stores in the rep's territory
+    #   2. For each FSA, compute its centroid + distance to global centroid
+    #   3. Larger FSAs (more stores) sorted before smaller; among same size,
+    #      closer to global centroid wins
+    # This makes Day 1 = the densest urban cluster nearest to "the middle" of
+    # the territory, with rural overflow pushed to later days.
+    all_with_gps = [s for s in stores if s.get('lat') and s.get('lng')]
+    if all_with_gps:
+        gcx = sum(s['lat'] for s in all_with_gps) / len(all_with_gps)
+        gcy = sum(s['lng'] for s in all_with_gps) / len(all_with_gps)
+    else:
+        gcx = gcy = 0
 
-    # Sort FSAs: prefer larger clusters that are also TIGHT (small avg distance)
-    # Key: density_score / store_count → smaller is better (dense + populated)
     def fsa_priority(fsa):
-        n = len(by_fsa[fsa])
-        density = fsa_density_score(by_fsa[fsa])
-        # Score: density per store (lower = better)
-        return density / max(n, 1)
+        fsa_stores = by_fsa[fsa]
+        n = len(fsa_stores)
+        # Tiny FSAs (1-2 stores) = rural overflow, do later
+        if n < 3:
+            return (1, 0)  # tier 2 (rural)
+        # FSA centroid
+        with_gps = [s for s in fsa_stores if s.get('lat') and s.get('lng')]
+        if not with_gps:
+            return (2, 0)  # tier 3 (no GPS)
+        cx = sum(s['lat'] for s in with_gps) / len(with_gps)
+        cy = sum(s['lng'] for s in with_gps) / len(with_gps)
+        # Distance from global centroid (urban-core proxy)
+        dist_from_centroid = hv({'lat': cx, 'lng': cy}, {'lat': gcx, 'lng': gcy})
+        # Tier 0 (urban dense): -n biases toward bigger clusters first; then
+        # closer-to-centroid wins
+        return (0, -n, dist_from_centroid)
 
     sorted_fsas = sorted(by_fsa.keys(), key=fsa_priority)
 
