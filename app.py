@@ -9858,7 +9858,17 @@ def api_ai_ask():
             },
             timeout=30,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Surface Anthropic's actual error message (billing, model, etc.)
+            try:
+                err_body = r.json()
+                err_msg = err_body.get('error', {}).get('message') or err_body
+            except Exception:
+                err_msg = r.text[:500]
+            return jsonify({
+                'error': f'Anthropic API error ({r.status_code}): {err_msg}',
+                'model': AI_MODEL,
+            }), 502
         sql = r.json()['content'][0]['text'].strip()
         # Strip code-fence if Claude added one
         if sql.startswith('```'):
@@ -9923,8 +9933,15 @@ def api_ai_ask():
             },
             timeout=30,
         )
-        r2.raise_for_status()
-        answer = r2.json()['content'][0]['text'].strip()
+        if r2.status_code >= 400:
+            try:
+                err_body = r2.json()
+                err_msg = err_body.get('error', {}).get('message') or err_body
+            except Exception:
+                err_msg = r2.text[:500]
+            answer = f"(Summary skipped — Anthropic {r2.status_code}: {err_msg})"
+        else:
+            answer = r2.json()['content'][0]['text'].strip()
     except Exception as e:
         answer = f"(AI summarization failed: {e})"
 

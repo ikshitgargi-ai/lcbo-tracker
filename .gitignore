@@ -4,6 +4,7 @@ lcbo_tracker.db
 .env
 .env.fly
 .env.local
+.admin-token.local
 .DS_Store
 *.db-journal
 *.db-wal
