@@ -10888,6 +10888,464 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@app.route('/api/crm/territory-plan', methods=['GET'])
+@cached_response(ttl_seconds=300, key_args=('rep', 'days'))
+def api_crm_territory_plan():
+    """Build a 14-day route plan for a rep's territory.
+
+    Two predefined territories:
+      - rep=Namit  → GTA core (postal M*) — Toronto downtown + nearby
+      - rep=Surya  → Ottawa region (postal K1, K2, K6, K7) + Kingston
+
+    Algorithm:
+      1. Pull all stores in territory (filtered by postal prefix)
+      2. Cluster by city + postal FSA (first 3 chars) for fuel-efficient day groups
+      3. Within each day cluster, run nearest-neighbor TSP from cluster centroid
+      4. Cap each day at `max_per_day` stops (default 9)
+      5. Return 14-day plan starting from today
+
+    Query: ?rep=Namit&days=14&max_per_day=9
+    """
+    rep = (request.args.get('rep') or '').strip()
+    days = max(1, min(int(request.args.get('days', 14)), 21))
+    max_per_day = max(5, min(int(request.args.get('max_per_day', 9)), 14))
+
+    # Define each rep's territory by postal prefixes (in priority order)
+    TERRITORY = {
+        'Namit': {
+            'name': 'GTA — Toronto Core + adjacent 905',
+            'postal_prefixes': ['M'],  # Toronto core M* — 112 stores
+            'fallback_l_cities': ['Mississauga', 'Brampton', 'Markham', 'Vaughan'],  # add only if M < target
+            'target_min': 90, 'target_max': 110,
+        },
+        'Surya': {
+            'name': 'Ottawa + Eastern Ontario',
+            'postal_prefixes': ['K1', 'K2'],  # Ottawa core
+            'fallback_cities': ['Kingston', 'Brockville', 'Cornwall', 'Stittsville',
+                                'Carleton Place', 'Gananoque', 'Rockland', 'Embrun',
+                                'Kanata', 'Nepean', 'Orleans'],
+            'target_min': 40, 'target_max': 60,
+        },
+    }
+    if rep not in TERRITORY:
+        return jsonify({'error': f'No predefined territory for rep {rep!r}. '
+                                  f'Defined: {list(TERRITORY.keys())}'}), 400
+
+    cfg = TERRITORY[rep]
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Pull all stores in territory
+    prefixes = cfg['postal_prefixes']
+    where_parts = []
+    params = []
+    for pfx in prefixes:
+        where_parts.append(f"REPLACE(UPPER(s.postal),' ','') LIKE {ph}")
+        params.append(f"{pfx}%")
+    where_sql = "(" + " OR ".join(where_parts) + ")"
+
+    # Optional fallback cities for tighter targeting
+    fb_cities = cfg.get('fallback_cities', [])
+    if fb_cities:
+        city_phs = ','.join([ph] * len(fb_cities))
+        where_sql = f"({where_sql} OR LOWER(TRIM(s.city)) IN ({city_phs}))"
+        params.extend(c.lower().strip() for c in fb_cities)
+
+    sql = (
+        f"SELECT s.id, s.store_number, COALESCE(s.account,''), COALESCE(s.address,''), "
+        f"COALESCE(s.city,''), COALESCE(s.postal,''), COALESCE(s.priority,''), "
+        f"COALESCE(s.lat,0), COALESCE(s.lng,0), "
+        f"COALESCE(s.manager_name,''), COALESCE(s.manager_phone, s.phone, ''), "
+        f"COALESCE(s.rep,''), COALESCE(t.name,''), COALESCE(t.color,'#888'), "
+        f"la.last_visit_at "
+        f"FROM stores s "
+        f"LEFT JOIN territories t ON t.id = s.territory_id "
+        f"LEFT JOIN ("
+        f"  SELECT store_id, MAX(created_at) AS last_visit_at "
+        f"  FROM activities WHERE deleted_at IS NULL GROUP BY store_id"
+        f") la ON la.store_id = s.id "
+        f"WHERE {where_sql} "
+        f"ORDER BY s.city, REPLACE(UPPER(s.postal),' ','')"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, params).fetchall()
+
+    stores_raw = [{
+        'id': r[0], 'store_number': r[1], 'account': r[2], 'address': r[3],
+        'city': r[4], 'postal': (r[5] or '').strip().upper().replace(' ',''),
+        'priority': r[6],
+        'lat': float(r[7]) if r[7] else 0, 'lng': float(r[8]) if r[8] else 0,
+        'manager_name': r[9], 'phone': r[10],
+        'rep_assigned': r[11], 'territory_name': r[12], 'territory_color': r[13],
+        'last_visit_at': str(r[14]) if r[14] else None,
+    } for r in rows]
+
+    # Cluster by FSA (first 3 chars of postal) — fuel-efficient day groups
+    from collections import defaultdict
+    by_fsa = defaultdict(list)
+    for s in stores_raw:
+        fsa = s['postal'][:3] if s['postal'] else 'UNK'
+        by_fsa[fsa].append(s)
+
+    # Order FSAs by store count desc (visit busiest neighborhoods first)
+    sorted_fsas = sorted(by_fsa.keys(), key=lambda k: (-len(by_fsa[k]), k))
+
+    # Pack into days: max_per_day per day, prefer keeping FSAs together
+    day_buckets = []
+    current_day = []
+    for fsa in sorted_fsas:
+        for s in by_fsa[fsa]:
+            current_day.append(s)
+            if len(current_day) >= max_per_day:
+                day_buckets.append(current_day)
+                current_day = []
+    if current_day:
+        day_buckets.append(current_day)
+
+    # Within each day bucket, run nearest-neighbor TSP from cluster centroid
+    # to minimize travel. Use haversine distance.
+    def hv(a, b):
+        from math import radians, sin, cos, asin, sqrt
+        if not (a['lat'] and a['lng'] and b['lat'] and b['lng']):
+            return 999  # missing GPS — push to end
+        lat1, lng1, lat2, lng2 = map(radians, (a['lat'], a['lng'], b['lat'], b['lng']))
+        dlat = lat2 - lat1; dlng = lng2 - lng1
+        h = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
+        return 2 * 6371 * asin(sqrt(h))
+
+    optimized_days = []
+    today = _toronto_today()
+    for day_idx, bucket in enumerate(day_buckets[:days]):
+        if not bucket:
+            continue
+        # Centroid
+        with_gps = [s for s in bucket if s['lat'] and s['lng']]
+        if with_gps:
+            cx = sum(s['lat'] for s in with_gps) / len(with_gps)
+            cy = sum(s['lng'] for s in with_gps) / len(with_gps)
+            start = {'lat': cx, 'lng': cy}
+        else:
+            start = {'lat': 0, 'lng': 0}
+        # Nearest-neighbor from start
+        remaining = list(bucket)
+        ordered = []
+        cur = start
+        while remaining:
+            nxt = min(remaining, key=lambda s: hv(cur, s))
+            ordered.append(nxt)
+            remaining.remove(nxt)
+            cur = nxt
+        # Compute leg distances + total
+        total_km = 0.0
+        for i in range(1, len(ordered)):
+            d = hv(ordered[i-1], ordered[i])
+            ordered[i]['leg_km'] = round(d, 1) if d < 999 else None
+            if d < 999:
+                total_km += d
+        ordered[0]['leg_km'] = 0
+        plan_date = (today + timedelta(days=day_idx)).isoformat()
+        optimized_days.append({
+            'day': day_idx + 1,
+            'date': plan_date,
+            'stops': len(ordered),
+            'total_km_est': round(total_km, 1),
+            'cluster_label': bucket[0].get('city', ''),
+            'stores': ordered,
+        })
+
+    return jsonify({
+        'rep': rep,
+        'territory_name': cfg['name'],
+        'days_in_plan': len(optimized_days),
+        'total_stores_in_territory': len(stores_raw),
+        'stores_in_plan': sum(d['stops'] for d in optimized_days),
+        'max_per_day': max_per_day,
+        'plan': optimized_days,
+    })
+
+
+@app.route('/api/crm/rep-performance', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=('days',))
+def api_crm_rep_performance():
+    """Per-rep KPI scoreboard. ?days=7|30|90 (default 30).
+
+    Returns for each rep in the official roster:
+      - activities: total + breakdown by type (visit/call/tasting/sample/email)
+      - stores_covered: distinct stores visited in window
+      - days_active: distinct days with at least 1 activity
+      - deals: total / open / won (listed) / lost
+      - listings_won: deals reached 'listed' stage in window
+      - tasting_to_listing_rate: %
+      - last_activity_at + last_activity_store
+    Plus the 4 official-roster reps even if they have 0 activity (so manager
+    sees the full team, not just the active ones).
+    """
+    days = int(request.args.get('days', 30))
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    today = _toronto_today()
+    since = (today - timedelta(days=days)).isoformat()
+
+    # Always include the official roster, even with 0 activity
+    OFFICIAL_REPS = ['Ikshit', 'Virat', 'Namit', 'Surya']
+
+    out = {rep: {
+        'rep': rep,
+        'activities_total': 0,
+        'activities_by_type': {},
+        'stores_covered': 0,
+        'days_active': 0,
+        'deals_open': 0,
+        'deals_listed': 0,
+        'deals_lost': 0,
+        'listings_won_in_window': 0,
+        'last_activity_at': None,
+        'last_activity_store': None,
+        'last_activity_type': None,
+    } for rep in OFFICIAL_REPS}
+
+    # Activity totals + breakdown
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT COALESCE(rep, '') AS rep, COALESCE(activity_type,'') AS at, COUNT(*) "
+            "FROM activities WHERE deleted_at IS NULL AND COALESCE(visit_date, created_at::date) >= %s "
+            "GROUP BY rep, at",
+            (since,),
+        )
+        for r in cur.fetchall():
+            rep = (r[0] or '').strip()
+            at = r[1] or 'unknown'
+            cnt = int(r[2])
+            if not rep:
+                continue
+            entry = out.setdefault(rep, dict(out.get(OFFICIAL_REPS[0], {}), rep=rep))
+            entry['activities_total'] = entry.get('activities_total', 0) + cnt
+            entry['activities_by_type'] = dict(entry.get('activities_by_type', {}))
+            entry['activities_by_type'][at] = entry['activities_by_type'].get(at, 0) + cnt
+        cur.close()
+    else:
+        for r in db.execute(
+            "SELECT COALESCE(rep,'') AS rep, COALESCE(activity_type,'') AS at, COUNT(*) "
+            "FROM activities WHERE deleted_at IS NULL AND COALESCE(visit_date, DATE(created_at)) >= ? "
+            "GROUP BY rep, at",
+            (since,),
+        ).fetchall():
+            rep = (r[0] or '').strip()
+            at = r[1] or 'unknown'
+            cnt = int(r[2])
+            if not rep:
+                continue
+            entry = out.setdefault(rep, {})
+            entry.setdefault('rep', rep)
+            entry['activities_total'] = entry.get('activities_total', 0) + cnt
+            entry['activities_by_type'] = entry.get('activities_by_type') or {}
+            entry['activities_by_type'][at] = entry['activities_by_type'].get(at, 0) + cnt
+
+    # Distinct stores visited + days active + last activity
+    date_expr = "created_at::date" if USE_POSTGRES else "DATE(created_at)"
+    sql = (
+        f"SELECT COALESCE(rep,'') AS rep, COUNT(DISTINCT store_id), "
+        f"COUNT(DISTINCT COALESCE(visit_date, {date_expr})), MAX(created_at) "
+        f"FROM activities WHERE deleted_at IS NULL "
+        f"AND COALESCE(visit_date, {date_expr}) >= {ph} GROUP BY rep"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, (since,))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, (since,)).fetchall()
+    for r in rows:
+        rep = (r[0] or '').strip()
+        if not rep or rep not in out:
+            continue
+        out[rep]['stores_covered'] = int(r[1] or 0)
+        out[rep]['days_active'] = int(r[2] or 0)
+        out[rep]['last_activity_at'] = str(r[3]) if r[3] else None
+
+    # Last activity store/type
+    for rep in list(out.keys()):
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute(
+                    "SELECT s.store_number, a.activity_type FROM activities a "
+                    "LEFT JOIN stores s ON s.id = a.store_id "
+                    "WHERE COALESCE(a.rep,'') = %s AND a.deleted_at IS NULL "
+                    "ORDER BY a.created_at DESC LIMIT 1",
+                    (rep,),
+                )
+                lr = cur.fetchone()
+                cur.close()
+            else:
+                lr = db.execute(
+                    "SELECT s.store_number, a.activity_type FROM activities a "
+                    "LEFT JOIN stores s ON s.id = a.store_id "
+                    "WHERE COALESCE(a.rep,'') = ? AND a.deleted_at IS NULL "
+                    "ORDER BY a.created_at DESC LIMIT 1",
+                    (rep,),
+                ).fetchone()
+            if lr:
+                out[rep]['last_activity_store'] = lr[0]
+                out[rep]['last_activity_type'] = lr[1]
+        except Exception:
+            if USE_POSTGRES:
+                try: db.rollback()
+                except Exception: pass
+
+    # Deal counts
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT COALESCE(owner_rep,'') AS rep, "
+            "  SUM(CASE WHEN closed_at IS NULL THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='listed' THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='lost' THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='listed' AND closed_at IS NOT NULL AND closed_at >= %s THEN 1 ELSE 0 END) "
+            "FROM deals GROUP BY owner_rep",
+            (since,),
+        )
+        for r in cur.fetchall():
+            rep = (r[0] or '').strip()
+            if not rep or rep not in out:
+                continue
+            out[rep]['deals_open'] = int(r[1] or 0)
+            out[rep]['deals_listed'] = int(r[2] or 0)
+            out[rep]['deals_lost'] = int(r[3] or 0)
+            out[rep]['listings_won_in_window'] = int(r[4] or 0)
+        cur.close()
+    else:
+        for r in db.execute(
+            "SELECT COALESCE(owner_rep,'') AS rep, "
+            "  SUM(CASE WHEN closed_at IS NULL THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='listed' THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='lost' THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN stage='listed' AND closed_at IS NOT NULL AND closed_at >= ? THEN 1 ELSE 0 END) "
+            "FROM deals GROUP BY owner_rep",
+            (since,),
+        ).fetchall():
+            rep = (r[0] or '').strip()
+            if not rep or rep not in out:
+                continue
+            out[rep]['deals_open'] = int(r[1] or 0)
+            out[rep]['deals_listed'] = int(r[2] or 0)
+            out[rep]['deals_lost'] = int(r[3] or 0)
+            out[rep]['listings_won_in_window'] = int(r[4] or 0)
+
+    # Tasting → listing conversion rate per rep
+    for rep, e in out.items():
+        tastings = (e.get('activities_by_type') or {}).get('tasting', 0) + \
+                   (e.get('activities_by_type') or {}).get('sample_drop', 0)
+        wins = e.get('listings_won_in_window', 0)
+        e['tasting_to_listing_rate_pct'] = round(wins * 100 / tastings, 1) if tastings > 0 else None
+
+    return jsonify({
+        'window_days': days,
+        'since': since,
+        'reps': list(out.values()),
+        'totals': {
+            'activities': sum(e.get('activities_total', 0) for e in out.values()),
+            'stores_covered': sum(e.get('stores_covered', 0) for e in out.values()),
+            'listings_won': sum(e.get('listings_won_in_window', 0) for e in out.values()),
+            'open_deals': sum(e.get('deals_open', 0) for e in out.values()),
+        },
+    })
+
+
+@app.route('/api/crm/daily-log', methods=['GET'])
+@cached_response(ttl_seconds=30, key_args=('date', 'days'))
+def api_crm_daily_log():
+    """Daily activity log — every activity logged on a given date.
+
+    ?date=YYYY-MM-DD (default today)  ?days=1 (default 1, max 14)
+
+    Used by the /daily-log page so a manager can see exactly what happened
+    each day, who did it, and where. Sourced from activities + event_log
+    (audit trail of state changes), unioned and sorted by timestamp DESC.
+    """
+    target_date = (request.args.get('date') or _toronto_today().isoformat()).strip()
+    days = max(1, min(int(request.args.get('days', 1)), 14))
+    try:
+        end = datetime.strptime(target_date, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
+    start = (end - timedelta(days=days - 1)).isoformat()
+    end_iso = end.isoformat()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    date_expr = "a.created_at::date" if USE_POSTGRES else "DATE(a.created_at)"
+    sql = (
+        f"SELECT a.id, a.created_at, COALESCE(a.visit_date, {date_expr}), "
+        f"COALESCE(a.rep,''), COALESCE(a.activity_type,''), "
+        f"COALESCE(a.notes,''), COALESCE(a.outcome,''), "
+        f"COALESCE(a.duration_minutes,0), COALESCE(a.rating,0), "
+        f"s.store_number, COALESCE(s.account,''), "
+        f"COALESCE(s.city,''), COALESCE(s.address,''), "
+        f"COALESCE(t.name,'Unassigned'), COALESCE(t.color,'#888') "
+        f"FROM activities a "
+        f"LEFT JOIN stores s ON s.id = a.store_id "
+        f"LEFT JOIN territories t ON t.id = s.territory_id "
+        f"WHERE a.deleted_at IS NULL "
+        f"AND COALESCE(a.visit_date, {date_expr}) BETWEEN {ph} AND {ph} "
+        f"ORDER BY a.created_at DESC LIMIT 500"
+    )
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql, (start, end_iso))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(sql, (start, end_iso)).fetchall()
+
+    activities = [{
+        'id': r[0],
+        'created_at': str(r[1]) if r[1] else None,
+        'visit_date': str(r[2]) if r[2] else None,
+        'rep': r[3],
+        'activity_type': r[4],
+        'notes': r[5],
+        'outcome': r[6],
+        'duration_minutes': int(r[7]),
+        'rating': int(r[8]),
+        'store_number': r[9],
+        'account': r[10],
+        'city': r[11],
+        'address': r[12],
+        'territory_name': r[13],
+        'territory_color': r[14],
+    } for r in rows]
+
+    # Per-rep summary
+    by_rep = {}
+    for a in activities:
+        rep = a['rep'] or '(unassigned)'
+        b = by_rep.setdefault(rep, {'rep': rep, 'count': 0, 'by_type': {}, 'stores': set()})
+        b['count'] += 1
+        b['by_type'][a['activity_type']] = b['by_type'].get(a['activity_type'], 0) + 1
+        if a['store_number']:
+            b['stores'].add(a['store_number'])
+    by_rep_list = [{
+        'rep': v['rep'], 'count': v['count'],
+        'by_type': v['by_type'], 'stores_visited': len(v['stores']),
+    } for v in by_rep.values()]
+    by_rep_list.sort(key=lambda x: -x['count'])
+
+    return jsonify({
+        'window': {'start': start, 'end': end_iso, 'days': days},
+        'count': len(activities),
+        'activities': activities,
+        'by_rep': by_rep_list,
+    })
+
+
 @app.route('/api/crm/manager-dashboard', methods=['GET'])
 @cached_response(ttl_seconds=60, key_args=())
 def api_crm_manager_dashboard():
@@ -11183,7 +11641,7 @@ def api_crm_manager_dashboard():
     })
 
 
-REP_ROSTER_DEFAULT = ['Neeraj', 'Virat', 'Namit', 'Ikshit']
+REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya']
 
 
 @app.route('/api/crm/admin/roster', methods=['GET'])
