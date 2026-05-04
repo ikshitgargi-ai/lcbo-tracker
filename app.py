@@ -9999,7 +9999,7 @@ def _summarize_rep(rep_name):
     uniq = r.get('unique_stores_30d') or 0
     last = r.get('last_visit') or 'never'
 
-    # Stores in territory
+    # Stores in territory (assignment lives in stores.rep column when seeded)
     sql2 = """
         SELECT COUNT(*)::int AS territory_size
         FROM stores
@@ -10022,12 +10022,26 @@ def _summarize_rep(rep_name):
     """
     top, _ = _run_select(sql3, (rep_name,))
 
-    coverage_pct = round((uniq / territory * 100), 1) if territory else 0
-    parts = [
-        f"{rep_name} has {territory} stores in territory.",
-        f"Last 7 days: {v7} visits. Last 30 days: {v30} visits across {uniq} unique stores ({coverage_pct}% coverage).",
-        f"Last visit logged: {last}.",
-    ]
+    parts = []
+    # Territory size only printed when stores.rep column actually has data —
+    # otherwise it's 0 because territory is assigned dynamically via FSA at
+    # routing time, and the narrative would mislead.
+    if territory > 0:
+        coverage_pct = round((uniq / territory * 100), 1) if territory else 0
+        parts.append(f"{rep_name} has {territory} stores in territory ({coverage_pct}% covered in last 30d).")
+    parts.append(
+        f"Last 7 days: {v7} visits. Last 30 days: {v30} visits across {uniq} unique stores."
+    )
+    if last and last != 'never':
+        parts.append(f"Last visit logged: {last}.")
+    else:
+        parts.append("No visits logged yet.")
+    if top:
+        leader = top[0]
+        parts.append(
+            f"Most-visited stop: store #{leader.get('store_number')} "
+            f"({leader.get('city','')}) — {leader.get('visits')} visits."
+        )
     answer = ' '.join(parts)
     return answer, sql3.strip(), top, ['store_number', 'account', 'city', 'visits']
 
