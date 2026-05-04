@@ -11134,8 +11134,13 @@ def api_crm_priority_targets():
         'Virat': {'prefixes': ['L1'],
                   'cities': ['Pickering','Ajax','Whitby','Oshawa','Bowmanville','Courtice',
                              'Clarington','Port Perry','Uxbridge']},
-        'Surya': {'prefixes': ['K'],
-                  'cities': ['Kingston','Brockville','Cornwall','Belleville','Trenton','Picton','Napanee']},
+        'Surya': {
+            # IN + AROUND OTTAWA ONLY (no Kingston/Brockville/Belleville/Petawawa)
+            'prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
+            'cities': ['Ottawa','Kanata','Nepean','Orleans','Stittsville',
+                       'Manotick','Rockland','Embrun','Carleton Place',
+                       'Almonte','Smiths Falls','Gloucester','Vanier',
+                       'Russell','Kemptville','Cumberland','Greely']},
         'Neeraj': {'prefixes': ['N'],
                    'cities': ['Hamilton','Burlington','Niagara Falls','St. Catharines','Welland',
                               'Kitchener','Waterloo','Cambridge','Guelph','London','Brantford',
@@ -11372,16 +11377,17 @@ def api_crm_territory_plan():
             'target_min': 30, 'target_max': 50,
         },
         'Surya': {
-            # ALL stores in and around Ottawa — every K* postal code (city + rural)
-            'name': 'Ottawa region + ALL K* (Eastern Ontario)',
-            'postal_prefixes': ['K'],  # All K — Ottawa region + eastern rural
-            'fallback_cities': ['Kingston', 'Brockville', 'Cornwall', 'Stittsville',
-                                'Carleton Place', 'Gananoque', 'Rockland', 'Embrun',
-                                'Kanata', 'Nepean', 'Orleans', 'Manotick',
-                                'Almonte', 'Smiths Falls', 'Perth', 'Renfrew',
-                                'Pembroke', 'Petawawa', 'Arnprior', 'Belleville',
-                                'Trenton', 'Picton', 'Napanee'],
-            'target_min': 80, 'target_max': 150,
+            # IN + AROUND OTTAWA ONLY — Ottawa core (K1*, K2*) + immediate
+            # surrounding (K0A rural Ottawa, K4* Orleans/Cumberland).
+            # NOT: Kingston/Brockville/Belleville/Petawawa/Renfrew (too far).
+            'name': 'Ottawa + immediate surroundings',
+            'postal_prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
+            'fallback_cities': ['Ottawa', 'Kanata', 'Nepean', 'Orleans',
+                                'Stittsville', 'Manotick', 'Rockland', 'Embrun',
+                                'Carleton Place', 'Almonte', 'Smiths Falls',
+                                'Gloucester', 'Vanier', 'Russell', 'Kemptville',
+                                'Cumberland', 'Greely'],
+            'target_min': 40, 'target_max': 70,
         },
         'Neeraj': {
             'name': 'South-Western Ontario (Hamilton/Niagara/Kitchener/London)',
