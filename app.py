@@ -589,6 +589,13 @@ def init_db():
                 detected_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        # Idempotency guard: re-running the same day's sync used to duplicate
+        # change events. Add a unique key (NULLs treated as -1 via COALESCE
+        # since store_number is nullable for SKU-level rollups).
+        cur.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_sod_listing_changes
+              ON sod_listing_changes (sku, COALESCE(store_number, -1), change_date, change_type)
+        ''')
         # Per-(store, sku) change tracking for our tracked SKUs:
         # answers "which stores added/dropped Red Admiral last week?"
         cur.execute('''
@@ -1343,6 +1350,7 @@ def api_store_detail(store_id):
 
 
 @app.route('/api/stores/<int:store_id>', methods=['PUT'])
+@require_app_origin
 def api_store_update(store_id):
     data = request.json
     fields = ['account', 'address', 'city', 'postal', 'phone', 'email', 'contacts',
@@ -1410,6 +1418,7 @@ def api_reps():
 
 
 @app.route('/api/activities', methods=['POST'])
+@require_app_origin
 def api_activity_create():
     data = request.json
     store_id = data.get('store_id')
@@ -1648,6 +1657,7 @@ def api_followups():
 
 
 @app.route('/api/followups/<int:followup_id>/complete', methods=['POST'])
+@require_app_origin
 def api_followup_complete(followup_id):
     """Mark a follow-up as completed — data is NEVER deleted, only status changes"""
     db_execute("UPDATE followups SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=?", [followup_id])
@@ -1656,6 +1666,7 @@ def api_followup_complete(followup_id):
 
 
 @app.route('/api/followups/<int:followup_id>/reschedule', methods=['POST'])
+@require_app_origin
 def api_followup_reschedule(followup_id):
     """Reschedule a follow-up — never delete, only update date"""
     data = request.json
@@ -1691,6 +1702,7 @@ def api_products():
 
 
 @app.route('/api/products', methods=['POST'])
+@require_app_origin
 def api_product_create():
     data = request.json
     if USE_POSTGRES:
@@ -1924,6 +1936,7 @@ def api_inventory_check(sku):
 
 
 @app.route('/api/inventory/refresh-all', methods=['POST'])
+@require_app_origin
 def api_inventory_refresh_all():
     """Refresh inventories for ALL tracked products from live LCBO.com — run daily via cron."""
     if not http_requests:
@@ -2466,6 +2479,7 @@ def export_backup():
 
 
 @app.route('/api/geocode', methods=['POST'])
+@require_app_origin
 def api_geocode_stores():
     """Geocode stores using Nominatim (OpenStreetMap) - batch process"""
     if not http_requests:
@@ -3442,16 +3456,21 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
               f"{len(store_change_inserts)} per-store change events…")
         if change_inserts:
             if USE_POSTGRES:
+                # Idempotent UPSERT — backed by the uniq_sod_listing_changes
+                # unique index (sku, COALESCE(store_number,-1), change_date, change_type).
+                # Re-running the same snapshot used to duplicate every event.
                 psycopg2.extras.execute_values(
                     cur,
                     """INSERT INTO sod_listing_changes
                        (sku, store_number, change_date, old_status, new_status, change_type)
-                       VALUES %s""",
+                       VALUES %s
+                       ON CONFLICT (sku, COALESCE(store_number, -1), change_date, change_type)
+                       DO NOTHING""",
                     change_inserts,
                 )
             else:
                 cur.executemany(
-                    """INSERT INTO sod_listing_changes
+                    """INSERT OR IGNORE INTO sod_listing_changes
                        (sku, store_number, change_date, old_status, new_status, change_type)
                        VALUES (?,?,?,?,?,?)""",
                     change_inserts,
@@ -3712,6 +3731,7 @@ def api_sod_status():
 
 
 @app.route('/api/sod/refresh-snapshot', methods=['POST'])
+@require_app_origin
 def api_sod_refresh_snapshot():
     """Force a SOD sync RIGHT NOW with multi-day walkback enabled.
 
@@ -3737,6 +3757,7 @@ def api_sod_refresh_snapshot():
 
 
 @app.route('/api/sod/sync', methods=['POST'])
+@require_app_origin
 def api_sod_sync():
     """Kick off an async sync for one or both sources."""
     if not SOD_USER or not SOD_PASSWORD:
@@ -5322,6 +5343,7 @@ def api_crm_territories():
 
 
 @app.route('/api/crm/territories/<int:territory_id>', methods=['PUT'])
+@require_app_origin
 def api_crm_territory_update(territory_id):
     """Update a territory — typically to assign a rep_name."""
     data = request.get_json() or {}
@@ -5347,6 +5369,7 @@ def api_crm_territory_update(territory_id):
 
 
 @app.route('/api/crm/territories/reassign', methods=['POST'])
+@require_app_origin
 def api_crm_territories_reassign():
     """Re-run the FSA-based classifier for ALL stores (force reassignment)."""
     seed_territories()
@@ -5422,6 +5445,7 @@ def api_crm_stores():
 
 
 @app.route('/api/crm/stores/<int:store_id>/territory', methods=['PUT'])
+@require_app_origin
 def api_crm_store_set_territory(store_id):
     """Manually override a store's territory."""
     data = request.get_json() or {}
@@ -5838,6 +5862,7 @@ def api_crm_goals_list():
 
 
 @app.route('/api/crm/goals', methods=['POST'])
+@require_app_origin
 def api_crm_goals_create():
     data = request.get_json() or {}
     required = ['scope', 'scope_key', 'period_start', 'period_end']
@@ -5884,6 +5909,7 @@ def api_crm_goals_create():
 
 
 @app.route('/api/crm/goals/<int:goal_id>', methods=['DELETE'])
+@require_app_origin
 def api_crm_goals_delete(goal_id):
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
@@ -6076,6 +6102,7 @@ def api_crm_horeca_list():
 
 
 @app.route('/api/crm/horeca', methods=['POST'])
+@require_app_origin
 def api_crm_horeca_create():
     data = request.get_json() or {}
     if not data.get('name'):
@@ -6129,6 +6156,7 @@ def api_crm_horeca_create():
 
 
 @app.route('/api/crm/horeca/<int:hid>', methods=['PUT'])
+@require_app_origin
 def api_crm_horeca_update(hid):
     data = request.get_json() or {}
     allowed = ('name', 'account_type', 'address', 'city', 'postal', 'phone', 'email',
@@ -6158,6 +6186,7 @@ def api_crm_horeca_update(hid):
 
 
 @app.route('/api/crm/horeca/<int:hid>', methods=['DELETE'])
+@require_app_origin
 def api_crm_horeca_delete(hid):
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
@@ -6361,6 +6390,67 @@ def require_admin_token(fn):
                           'Set ADMIN_TOKEN env var on the host to enable.',
             }), 403
         return fn(*args, **kwargs)
+
+    return wrapped
+
+
+# ── Mutation gate (Origin/Referer-based — frontend pays no UX cost) ─────────
+# Stops random internet curl from POST/PUT/DELETE-ing CRM data without
+# requiring tokens in every fetch. Verified domains pass; everything else 403s.
+# Admin token (when present) is the escape hatch for cron/scripts.
+_ALLOWED_ORIGINS = {
+    'https://lcbo-tracker-web.vercel.app',
+    'https://lcbo.anu-spirits.com',
+    # Local-dev convenience
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3000',
+}
+
+
+def _request_origin_ok() -> bool:
+    """Return True if the request's Origin or Referer is on the allowlist."""
+    origin = (request.headers.get('Origin') or '').strip().rstrip('/')
+    referer = (request.headers.get('Referer') or '').strip()
+    if origin and origin in _ALLOWED_ORIGINS:
+        return True
+    # Vercel preview deploys get a generated subdomain — accept any *.vercel.app
+    if origin.endswith('.vercel.app'):
+        return True
+    if referer:
+        # Pull scheme://host from referer (drop path)
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(referer)
+            host_root = f"{p.scheme}://{p.netloc}".rstrip('/')
+            if host_root in _ALLOWED_ORIGINS or host_root.endswith('.vercel.app'):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def require_app_origin(fn):
+    """Decorator for mutating CRM endpoints. Requires the request to come from
+    an allow-listed origin (Vercel + production custom domain) OR carry a valid
+    X-Admin-Token header. Blocks random internet curl from wiping CRM data.
+
+    Frontend pays zero cost — browsers automatically attach Origin to fetch().
+    Cron/scripts pass via X-Admin-Token.
+    """
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if _request_origin_ok():
+            return fn(*args, **kwargs)
+        if _admin_token_ok():
+            return fn(*args, **kwargs)
+        return jsonify({
+            'error': 'forbidden',
+            'detail': 'This endpoint is callable only from the Anu CRM frontend or '
+                      'with a valid X-Admin-Token. Origin not on allowlist.',
+        }), 403
 
     return wrapped
 
@@ -7104,6 +7194,7 @@ def api_admin_run_backup_now():
 # ============================================================================
 
 @app.route('/api/crm/tasting-booking', methods=['POST'])
+@require_app_origin
 def api_crm_book_tasting():
     """Book a future tasting. Body:
       { store_number: int, rep: str, scheduled_date: 'YYYY-MM-DD',
@@ -7821,6 +7912,7 @@ def _backfill_store_sku_changes():
 
 
 @app.route('/api/crm/backfill-store-changes', methods=['POST'])
+@require_app_origin
 def api_crm_backfill_store_changes():
     """Manually trigger backfill of per-store changes from historical snapshots."""
     n = _backfill_store_sku_changes()
@@ -7828,6 +7920,7 @@ def api_crm_backfill_store_changes():
 
 
 @app.route('/api/crm/log-listing', methods=['POST'])
+@require_app_origin
 def api_crm_log_listing():
     """Manual listing event — rep marks a NEW_LISTING they know about before SOD detects it.
 
@@ -10424,13 +10517,37 @@ def api_ai_ask():
     except Exception as e:
         return jsonify({'error': f'AI generation failed: {e}'}), 502
 
-    # Safety: SELECT-only
-    sql_lower = sql.lower().lstrip()
-    if not sql_lower.startswith('select') and not sql_lower.startswith('with'):
+    # Safety: SELECT-only — multi-layered, audited 2026-05.
+    # Strip block comments + line comments first so they can't smuggle DML.
+    sql_clean = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+    sql_clean = re.sub(r'--[^\n]*', ' ', sql_clean)
+    sql_lower = sql_clean.lower().strip()
+
+    # 1. Must START with SELECT or WITH (CTE)
+    if not (sql_lower.startswith('select') or sql_lower.startswith('with')):
         return jsonify({'error': 'AI returned non-SELECT', 'sql': sql}), 422
-    forbidden = ['insert ', 'update ', 'delete ', 'drop ', 'alter ', 'truncate ', 'create ', 'grant ', 'revoke ', '; ', ';\n']
-    if any(f in sql_lower for f in forbidden):
-        return jsonify({'error': 'AI returned dangerous SQL', 'sql': sql}), 422
+
+    # 2. NO semicolons anywhere (was: only flagged "; " or ";\n" — bypassable).
+    #    Trailing single ; is stripped first since some libraries add it.
+    sql_no_trailing = sql_clean.rstrip().rstrip(';').rstrip()
+    if ';' in sql_no_trailing:
+        return jsonify({'error': 'AI returned multi-statement SQL', 'sql': sql}), 422
+
+    # 3. Whole-word DML/DDL keyword scan (works regardless of whitespace, including
+    #    CTE-with-DML attacks like  WITH x AS (DELETE FROM t RETURNING *) SELECT ...).
+    sql_word_lower = ' ' + re.sub(r'\s+', ' ', sql_clean.lower()) + ' '
+    forbidden_words = [
+        'insert', 'update', 'delete', 'drop', 'alter', 'truncate',
+        'create', 'grant', 'revoke', 'merge', 'replace', 'copy',
+        'vacuum', 'analyze', 'reindex', 'cluster', 'lock',
+        'do', 'execute', 'call', 'prepare', 'discard', 'listen', 'notify',
+        'set', 'reset', 'load', 'comment',
+        'pg_read_file', 'pg_ls_dir', 'pg_sleep', 'pg_terminate_backend',
+        'dblink', 'dblink_exec', 'lo_import', 'lo_export',
+    ]
+    for w in forbidden_words:
+        if f' {w} ' in sql_word_lower or sql_word_lower.startswith(f' {w} '):
+            return jsonify({'error': f'AI returned dangerous SQL (keyword: {w})', 'sql': sql}), 422
 
     # Run on a fresh autocommit connection so we can't poison the request transaction.
     rows: list = []
@@ -11075,6 +11192,7 @@ def api_crm_deals_list():
 
 
 @app.route('/api/crm/deals', methods=['POST'])
+@require_app_origin
 def api_crm_deals_create():
     d = request.get_json() or {}
     if not d.get('sku'):
@@ -11199,6 +11317,7 @@ def api_crm_deals_update(deal_id):
 
 
 @app.route('/api/crm/deals/<int:deal_id>', methods=['DELETE'])
+@require_app_origin
 def api_crm_deals_delete(deal_id):
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
@@ -11271,6 +11390,7 @@ def api_crm_activities_list():
 
 
 @app.route('/api/crm/activities', methods=['POST'])
+@require_app_origin
 def api_crm_activities_create():
     """Log an activity (visit, call, email, tasting, sample-drop, POSM).
 
@@ -12824,6 +12944,7 @@ def api_crm_admin_bulk_reassign_rep():
 
 
 @app.route('/api/crm/territories/<int:territory_id>/assign-stores', methods=['POST'])
+@require_app_origin
 def api_crm_territory_assign_stores(territory_id):
     """Bulk-assign stores to a territory + optionally set the rep_name on the territory.
 
@@ -12985,6 +13106,7 @@ def api_crm_quotas_list():
 
 
 @app.route('/api/crm/quotas', methods=['POST'])
+@require_app_origin
 def api_crm_quotas_upsert():
     d = request.get_json() or {}
     rep = (d.get('rep') or '').strip()
@@ -13661,6 +13783,7 @@ def api_crm_lcbo_live_discoveries():
 
 
 @app.route('/api/crm/lcbo-rescan', methods=['POST'])
+@require_app_origin
 def api_crm_lcbo_rescan():
     """Manually trigger an immediate lcbo.com scrape + reconcile."""
     if _sod_sync_lock.locked():
