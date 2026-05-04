@@ -11235,37 +11235,28 @@ def api_crm_priority_targets():
         fsa = s['postal'][:3] if s['postal'] else 'UNK'
         by_fsa[fsa].append(s)
 
-    # Sort FSAs by URBAN-CORE-FIRST. Strategy:
-    #   1. Compute global centroid of all stores in the rep's territory
-    #   2. For each FSA, compute its centroid + distance to global centroid
-    #   3. Larger FSAs (more stores) sorted before smaller; among same size,
-    #      closer to global centroid wins
-    # This makes Day 1 = the densest urban cluster nearest to "the middle" of
-    # the territory, with rural overflow pushed to later days.
-    all_with_gps = [s for s in stores if s.get('lat') and s.get('lng')]
-    if all_with_gps:
-        gcx = sum(s['lat'] for s in all_with_gps) / len(all_with_gps)
-        gcy = sum(s['lng'] for s in all_with_gps) / len(all_with_gps)
-    else:
-        gcx = gcy = 0
+    # Sort FSAs by distance from each rep's HOME BASE (densest urban centre).
+    # Day 1 = closest cluster to home (urban core), later days = farther rural.
+    REP_HOME = {
+        'Namit':  {'lat': 43.6532, 'lng': -79.3832, 'name': 'Downtown Toronto'},
+        'Ikshit': {'lat': 43.5890, 'lng': -79.6441, 'name': 'Mississauga'},
+        'Virat':  {'lat': 43.8975, 'lng': -78.9429, 'name': 'Whitby/Oshawa'},
+        'Surya':  {'lat': 45.4215, 'lng': -75.6972, 'name': 'Downtown Ottawa'},
+        'Neeraj': {'lat': 43.2557, 'lng': -79.8711, 'name': 'Hamilton'},
+    }
+    home = REP_HOME.get(rep, {'lat': 43.65, 'lng': -79.38})
 
     def fsa_priority(fsa):
         fsa_stores = by_fsa[fsa]
-        n = len(fsa_stores)
-        # Tiny FSAs (1-2 stores) = rural overflow, do later
-        if n < 3:
-            return (1, 0)  # tier 2 (rural)
-        # FSA centroid
         with_gps = [s for s in fsa_stores if s.get('lat') and s.get('lng')]
         if not with_gps:
-            return (2, 0)  # tier 3 (no GPS)
+            return (10000, 0)  # no GPS → push to end
         cx = sum(s['lat'] for s in with_gps) / len(with_gps)
         cy = sum(s['lng'] for s in with_gps) / len(with_gps)
-        # Distance from global centroid (urban-core proxy)
-        dist_from_centroid = hv({'lat': cx, 'lng': cy}, {'lat': gcx, 'lng': gcy})
-        # Tier 0 (urban dense): -n biases toward bigger clusters first; then
-        # closer-to-centroid wins
-        return (0, -n, dist_from_centroid)
+        dist_from_home = hv({'lat': cx, 'lng': cy}, home)
+        # Closer to home = lower score = comes first.
+        # Tie-break: bigger FSA wins (more stops in one trip)
+        return (dist_from_home, -len(fsa_stores))
 
     sorted_fsas = sorted(by_fsa.keys(), key=fsa_priority)
 
