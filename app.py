@@ -225,6 +225,93 @@ if _sentry_dsn:
     except Exception as e:
         print(f'[Sentry] init failed: {e}')
 
+# ── Auth helpers (defined early so decorators below can reference them) ───
+# These need to live above the first @require_admin_token / @require_app_origin
+# decorator usage. Python evaluates decorators at module-import time, so
+# referencing an undefined symbol → NameError → gunicorn worker dies → deploy fails.
+
+def _admin_token_ok() -> bool:
+    """Verify X-Admin-Token header against ADMIN_TOKEN env var.
+    If ADMIN_TOKEN is not set, only allow from localhost (dev convenience).
+    Constant-time comparison to defeat timing attacks.
+    """
+    expected = os.environ.get('ADMIN_TOKEN', '').strip()
+    if not expected:
+        return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
+    got = request.headers.get('X-Admin-Token', '').strip()
+    if not got:
+        got = (request.args.get('admin_token') or '').strip()
+    if not got or len(got) != len(expected):
+        return False
+    import hmac
+    return hmac.compare_digest(got, expected)
+
+
+def require_admin_token(fn):
+    """Decorator for endpoints that mutate data or expose secrets."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not _admin_token_ok():
+            return jsonify({
+                'error': 'forbidden',
+                'detail': 'Provide a valid X-Admin-Token header (or ?admin_token= query param).',
+            }), 403
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+# Mutation gate (Origin/Referer-based — frontend pays no UX cost).
+# Stops random internet curl from wiping CRM data without requiring tokens
+# in every fetch. Verified domains pass; everything else 403s.
+_ALLOWED_ORIGINS = {
+    'https://lcbo-tracker-web.vercel.app',
+    'https://lcbo.anu-spirits.com',
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3000',
+}
+
+
+def _request_origin_ok() -> bool:
+    """Return True if the request's Origin or Referer is on the allowlist."""
+    origin = (request.headers.get('Origin') or '').strip().rstrip('/')
+    referer = (request.headers.get('Referer') or '').strip()
+    if origin and origin in _ALLOWED_ORIGINS:
+        return True
+    if origin.endswith('.vercel.app'):
+        return True
+    if referer:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(referer)
+            host_root = f"{p.scheme}://{p.netloc}".rstrip('/')
+            if host_root in _ALLOWED_ORIGINS or host_root.endswith('.vercel.app'):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def require_app_origin(fn):
+    """Decorator for mutating CRM endpoints. Requires browser Origin from the
+    Anu CRM frontend OR a valid X-Admin-Token. Frontend fetch() attaches
+    Origin automatically — zero UX cost. Blocks random internet curl.
+    """
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if _request_origin_ok() or _admin_token_ok():
+            return fn(*args, **kwargs)
+        return jsonify({
+            'error': 'forbidden',
+            'detail': 'This endpoint is callable only from the Anu CRM frontend or with a valid X-Admin-Token.',
+        }), 403
+    return wrapped
+
+
 DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
 DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
 
@@ -589,38 +676,20 @@ def init_db():
                 detected_at TIMESTAMP DEFAULT NOW()
             )
         ''')
-        # Idempotency guard: re-running the same day's sync used to duplicate
-        # change events. Connection is autocommit=True (line 386), so each
-        # statement is independent. We:
-        #   1. Dedupe existing rows (only if the unique index doesn't exist)
-        #   2. Create the unique index
-        #   3. The insert path uses ON CONFLICT so future dupes are ignored
-        # Wrapped in try/except so a transient failure can't kill startup.
+        # Idempotency guard for sod_listing_changes — DEFERRED to admin
+        # endpoint /api/admin/dedupe-listing-changes so startup stays fast.
+        # Pre-existing duplicates would block CREATE UNIQUE INDEX; rather than
+        # run a potentially-slow DELETE at boot (gunicorn worker timeout =
+        # 30s on Render), we attempt the index and silently skip if dupes
+        # exist. The insert path has a fallback for both the indexed and
+        # non-indexed case, so functionality is unaffected either way.
         try:
-            cur.execute("""
-                SELECT 1 FROM pg_indexes
-                WHERE indexname = 'uniq_sod_listing_changes'
-            """)
-            already_indexed = cur.fetchone() is not None
-            if not already_indexed:
-                # Dedupe: keep MIN(id) per (sku, COALESCE(store_number,-1), change_date, change_type)
-                cur.execute("""
-                    DELETE FROM sod_listing_changes a USING sod_listing_changes b
-                    WHERE a.id > b.id
-                      AND a.sku = b.sku
-                      AND COALESCE(a.store_number, -1) = COALESCE(b.store_number, -1)
-                      AND a.change_date = b.change_date
-                      AND a.change_type = b.change_type
-                """)
-                deleted = cur.rowcount or 0
-                if deleted:
-                    print(f"[init_db] Deduped {deleted} sod_listing_changes rows before index creation")
             cur.execute('''
                 CREATE UNIQUE INDEX IF NOT EXISTS uniq_sod_listing_changes
                   ON sod_listing_changes (sku, COALESCE(store_number, -1), change_date, change_type)
             ''')
         except Exception as _idx_err:
-            print(f"[init_db] uniq_sod_listing_changes setup skipped: {_idx_err}")
+            print(f"[init_db] uniq_sod_listing_changes index skipped (dedupe needed): {_idx_err}")
         # Per-(store, sku) change tracking for our tracked SKUs:
         # answers "which stores added/dropped Red Admiral last week?"
         cur.execute('''
@@ -3498,8 +3567,15 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                            DO NOTHING""",
                         change_inserts,
                     )
-                except psycopg2.errors.InvalidColumnReference:
-                    print(f"[SOD-{source}] uniq index missing, falling back to plain INSERT")
+                except Exception as _conflict_err:
+                    # If the unique index doesn't exist (e.g. dedupe step on a
+                    # massive history table didn't complete), ON CONFLICT raises.
+                    # Fall back to plain INSERT to keep the daily sync alive.
+                    print(f"[SOD-{source}] ON CONFLICT failed ({_conflict_err}), retrying with plain INSERT")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     psycopg2.extras.execute_values(
                         cur,
                         """INSERT INTO sod_listing_changes
@@ -6392,106 +6468,8 @@ _EXPORT_TABLES = [
 ]
 
 
-def _admin_token_ok() -> bool:
-    """Verify X-Admin-Token header against ADMIN_TOKEN env var.
-
-    If ADMIN_TOKEN is not set, only allow from localhost (dev convenience).
-    Constant-time comparison to defeat timing attacks.
-    """
-    expected = os.environ.get('ADMIN_TOKEN', '').strip()
-    if not expected:
-        # Dev-only: allow if request looks local
-        return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
-    got = request.headers.get('X-Admin-Token', '').strip()
-    if not got:
-        # Fall back to query param ?admin_token= for browser UX (still validated)
-        got = (request.args.get('admin_token') or '').strip()
-    if not got or len(got) != len(expected):
-        return False
-    # Constant-time compare
-    import hmac
-    return hmac.compare_digest(got, expected)
-
-
-def require_admin_token(fn):
-    """Decorator for endpoints that mutate data or expose secrets. Returns 403
-    if the X-Admin-Token header (or ?admin_token= query param) doesn't match
-    ADMIN_TOKEN. All ADMIN_TOKEN usage here is constant-time compared.
-    """
-    from functools import wraps
-
-    @wraps(fn)
-    def wrapped(*args, **kwargs):
-        if not _admin_token_ok():
-            return jsonify({
-                'error': 'forbidden',
-                'detail': 'Provide a valid X-Admin-Token header (or ?admin_token= query param). '
-                          'Set ADMIN_TOKEN env var on the host to enable.',
-            }), 403
-        return fn(*args, **kwargs)
-
-    return wrapped
-
-
-# ── Mutation gate (Origin/Referer-based — frontend pays no UX cost) ─────────
-# Stops random internet curl from POST/PUT/DELETE-ing CRM data without
-# requiring tokens in every fetch. Verified domains pass; everything else 403s.
-# Admin token (when present) is the escape hatch for cron/scripts.
-_ALLOWED_ORIGINS = {
-    'https://lcbo-tracker-web.vercel.app',
-    'https://lcbo.anu-spirits.com',
-    # Local-dev convenience
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://127.0.0.1:3000',
-}
-
-
-def _request_origin_ok() -> bool:
-    """Return True if the request's Origin or Referer is on the allowlist."""
-    origin = (request.headers.get('Origin') or '').strip().rstrip('/')
-    referer = (request.headers.get('Referer') or '').strip()
-    if origin and origin in _ALLOWED_ORIGINS:
-        return True
-    # Vercel preview deploys get a generated subdomain — accept any *.vercel.app
-    if origin.endswith('.vercel.app'):
-        return True
-    if referer:
-        # Pull scheme://host from referer (drop path)
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(referer)
-            host_root = f"{p.scheme}://{p.netloc}".rstrip('/')
-            if host_root in _ALLOWED_ORIGINS or host_root.endswith('.vercel.app'):
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def require_app_origin(fn):
-    """Decorator for mutating CRM endpoints. Requires the request to come from
-    an allow-listed origin (Vercel + production custom domain) OR carry a valid
-    X-Admin-Token header. Blocks random internet curl from wiping CRM data.
-
-    Frontend pays zero cost — browsers automatically attach Origin to fetch().
-    Cron/scripts pass via X-Admin-Token.
-    """
-    from functools import wraps
-
-    @wraps(fn)
-    def wrapped(*args, **kwargs):
-        if _request_origin_ok():
-            return fn(*args, **kwargs)
-        if _admin_token_ok():
-            return fn(*args, **kwargs)
-        return jsonify({
-            'error': 'forbidden',
-            'detail': 'This endpoint is callable only from the Anu CRM frontend or '
-                      'with a valid X-Admin-Token. Origin not on allowlist.',
-        }), 403
-
-    return wrapped
+# NB: _admin_token_ok / require_admin_token / require_app_origin are defined
+# at the top of the file so decorators can reference them at import time.
 
 
 @app.route('/api/admin/export', methods=['GET'])
