@@ -11129,11 +11129,12 @@ def api_crm_priority_targets():
         'Namit': {'prefixes': ['M'],
                   'cities': ['Woodbridge','Vaughan','Maple','Markham','Stouffville',
                              'Newmarket','Aurora','Richmond Hill','Thornhill','Concord','Kleinburg']},
-        'Ikshit': {'prefixes': ['L5','L6','L7'],
-                   'cities': ['Burlington','Oakville','Milton','Georgetown','Mississauga','Brampton']},
-        'Virat': {'prefixes': ['L1'],
-                  'cities': ['Pickering','Ajax','Whitby','Oshawa','Bowmanville','Courtice',
-                             'Clarington','Port Perry','Uxbridge']},
+        'Ikshit': {  # Burlington + Oakville (Halton south)
+            'prefixes': ['L7L','L7M','L7N','L7P','L7R','L7S','L7T'],
+            'cities': ['Burlington','Oakville','Bronte']},
+        'Virat': {   # Mississauga + Milton + Caledon
+            'prefixes': ['L4Z','L5','L6P','L6R','L6S','L6T','L6V','L6W','L6X','L6Y','L7A','L7C','L7E','L7G','L7K'],
+            'cities': ['Mississauga','Milton','Caledon','Bolton','Georgetown','Brampton']},
         'Surya': {
             # IN + AROUND OTTAWA ONLY (no Kingston/Brockville/Belleville/Petawawa)
             'prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
@@ -11141,10 +11142,11 @@ def api_crm_priority_targets():
                        'Manotick','Rockland','Embrun','Carleton Place',
                        'Almonte','Smiths Falls','Gloucester','Vanier',
                        'Russell','Kemptville','Cumberland','Greely']},
-        'Neeraj': {'prefixes': ['N'],
-                   'cities': ['Hamilton','Burlington','Niagara Falls','St. Catharines','Welland',
-                              'Kitchener','Waterloo','Cambridge','Guelph','London','Brantford',
-                              'Woodstock','Stratford','Sarnia','Windsor','Chatham']},
+        'Neeraj': {  # Guelph + Cambridge + KW + Hamilton (broader west of GTA)
+            'prefixes': ['N1','N2','N3','L8','L9G','L9H','L9J','L9K'],
+            'cities': ['Guelph','Cambridge','Kitchener','Waterloo','Hamilton',
+                       'Stoney Creek','Ancaster','Dundas','Acton','Rockwood',
+                       'Fergus','Elora','Erin']},
     }
     if rep not in TERR:
         return jsonify({'error': f'Unknown rep {rep!r}. Valid: {list(TERR.keys())}'}), 400
@@ -11361,20 +11363,19 @@ def api_crm_territory_plan():
             'target_min': 120, 'target_max': 160,
         },
         'Ikshit': {
-            'name': 'GTA West (Mississauga/Brampton/Halton)',
-            'postal_prefixes': ['L5', 'L6', 'L7'],
-            'fallback_cities': ['Burlington', 'Oakville', 'Milton', 'Georgetown',
-                                'Mississauga', 'Brampton'],
-            'target_min': 50, 'target_max': 80,
+            # Burlington + Oakville (Halton south)
+            'name': 'Burlington + Oakville',
+            'postal_prefixes': ['L7L', 'L7M', 'L7N', 'L7P', 'L7R', 'L7S', 'L7T'],
+            'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
+            'target_min': 25, 'target_max': 45,
         },
         'Virat': {
-            # GTA East + Durham (excluding Markham which is Namit's now)
-            'name': 'GTA East + Durham (Pickering/Ajax/Whitby/Oshawa)',
-            'postal_prefixes': ['L1'],
-            'fallback_cities': ['Pickering', 'Ajax', 'Whitby', 'Oshawa',
-                                'Bowmanville', 'Courtice', 'Clarington',
-                                'Port Perry', 'Uxbridge'],
-            'target_min': 30, 'target_max': 50,
+            # Mississauga + Milton + Caledon + Brampton
+            'name': 'Mississauga + Milton + Caledon + Brampton',
+            'postal_prefixes': ['L4Z','L5','L6P','L6R','L6S','L6T','L6V','L6W','L6X','L6Y','L7A','L7C','L7E','L7G','L7K'],
+            'fallback_cities': ['Mississauga', 'Milton', 'Caledon', 'Bolton',
+                                'Georgetown', 'Brampton'],
+            'target_min': 40, 'target_max': 70,
         },
         'Surya': {
             # IN + AROUND OTTAWA ONLY — Ottawa core (K1*, K2*) + immediate
@@ -11390,14 +11391,14 @@ def api_crm_territory_plan():
             'target_min': 40, 'target_max': 70,
         },
         'Neeraj': {
-            'name': 'South-Western Ontario (Hamilton/Niagara/Kitchener/London)',
-            'postal_prefixes': ['N'],  # 148 stores in N* postal
+            # Guelph + Cambridge + KW + Hamilton (west of GTA)
+            'name': 'Guelph + Cambridge + KW + Hamilton',
+            'postal_prefixes': ['N1', 'N2', 'N3', 'L8', 'L9G', 'L9H', 'L9J', 'L9K'],
             'fallback_cities': ['Hamilton', 'Burlington', 'Niagara Falls',
-                                'St. Catharines', 'Welland', 'Kitchener',
-                                'Waterloo', 'Cambridge', 'Guelph', 'London',
-                                'Brantford', 'Woodstock', 'Stratford', 'Sarnia',
-                                'Windsor', 'Chatham'],
-            'target_min': 100, 'target_max': 150,
+                                'Guelph', 'Cambridge', 'Kitchener', 'Waterloo',
+                                'Hamilton', 'Stoney Creek', 'Ancaster', 'Dundas',
+                                'Acton', 'Rockwood', 'Fergus', 'Elora', 'Erin'],
+            'target_min': 50, 'target_max': 100,
         },
     }
     if rep not in TERRITORY:
