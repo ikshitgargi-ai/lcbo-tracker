@@ -10888,6 +10888,182 @@ def api_crm_activities_create():
 
 # =========================== Rep quotas ===========================
 
+@app.route('/api/crm/priority-targets', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=('rep', 'max_skus', 'days'))
+def api_crm_priority_targets():
+    """Priority targets for a rep — stores in their territory with ≤max_skus
+    of our tracked SKUs currently listed. Server-side SQL filtering is fast.
+
+    ?rep=Namit|Surya|Ikshit|Virat|Neeraj  &max_skus=1  &days=14  &max_per_day=10
+    """
+    rep = (request.args.get('rep') or '').strip()
+    max_skus = int(request.args.get('max_skus', 1))
+    days = max(1, min(int(request.args.get('days', 14)), 21))
+    max_per_day = max(5, min(int(request.args.get('max_per_day', 10)), 14))
+
+    # Same territory map as territory-plan — keep in sync.
+    TERR = {
+        'Namit': {'prefixes': ['M'],
+                  'cities': ['Woodbridge','Vaughan','Maple','Markham','Stouffville',
+                             'Newmarket','Aurora','Richmond Hill','Thornhill','Concord','Kleinburg']},
+        'Ikshit': {'prefixes': ['L5','L6','L7'],
+                   'cities': ['Burlington','Oakville','Milton','Georgetown','Mississauga','Brampton']},
+        'Virat': {'prefixes': ['L1'],
+                  'cities': ['Pickering','Ajax','Whitby','Oshawa','Bowmanville','Courtice',
+                             'Clarington','Port Perry','Uxbridge']},
+        'Surya': {'prefixes': ['K'],
+                  'cities': ['Kingston','Brockville','Cornwall','Belleville','Trenton','Picton','Napanee']},
+        'Neeraj': {'prefixes': ['N'],
+                   'cities': ['Hamilton','Burlington','Niagara Falls','St. Catharines','Welland',
+                              'Kitchener','Waterloo','Cambridge','Guelph','London','Brantford',
+                              'Woodstock','Stratford','Sarnia','Windsor','Chatham']},
+    }
+    if rep not in TERR:
+        return jsonify({'error': f'Unknown rep {rep!r}. Valid: {list(TERR.keys())}'}), 400
+    cfg = TERR[rep]
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    scoped_skus = list(SOD_TRACKED_SKUS.keys())
+    sku_phs = ','.join([ph] * len(scoped_skus))
+
+    # Build territory WHERE clause
+    where_parts = []
+    params = []
+    for pfx in cfg['prefixes']:
+        where_parts.append(f"REPLACE(UPPER(s.postal),' ','') LIKE {ph}")
+        params.append(f"{pfx}%")
+    for city in cfg['cities']:
+        where_parts.append(f"LOWER(TRIM(s.city)) = LOWER({ph})")
+        params.append(city)
+    territory_sql = "(" + " OR ".join(where_parts) + ")"
+
+    # SQL: for each store in territory, count how many of our SKUs are listed
+    # at status='L' at the latest snapshot. Filter to ≤max_skus.
+    q = f"""
+        WITH latest_per_sku AS (
+            SELECT sku, MAX(snapshot_date) AS d FROM sod_inventory
+            WHERE sku IN ({sku_phs}) GROUP BY sku
+        ),
+        store_listed AS (
+            SELECT i.store_number, COUNT(DISTINCT i.sku) AS listed_count
+            FROM sod_inventory i
+            JOIN latest_per_sku l ON l.sku = i.sku AND l.d = i.snapshot_date
+            WHERE i.sku IN ({sku_phs}) AND i.status = 'L'
+            GROUP BY i.store_number
+        )
+        SELECT s.id, s.store_number, COALESCE(s.account,''),
+               COALESCE(s.address,''), COALESCE(s.city,''), COALESCE(s.postal,''),
+               COALESCE(s.priority,''), COALESCE(s.rep,''),
+               COALESCE(s.lat,0), COALESCE(s.lng,0),
+               COALESCE(s.manager_name,''), COALESCE(s.manager_phone, s.phone, ''),
+               COALESCE(t.name,''), COALESCE(t.color,'#888'),
+               COALESCE(sl.listed_count, 0) AS listed_count
+        FROM stores s
+        LEFT JOIN territories t ON t.id = s.territory_id
+        LEFT JOIN store_listed sl ON sl.store_number = s.store_number
+        WHERE {territory_sql}
+          AND s.lat <> 0 AND s.lng <> 0
+          AND COALESCE(sl.listed_count, 0) <= {ph}
+        ORDER BY COALESCE(sl.listed_count, 0), s.city, s.postal
+    """
+    final_params = scoped_skus + scoped_skus + params + [max_skus]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(q, final_params)
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = db.execute(q, final_params).fetchall()
+
+    stores = []
+    for r in rows:
+        stores.append({
+            'id': r[0], 'store_number': r[1], 'account': r[2], 'address': r[3],
+            'city': r[4], 'postal': (r[5] or '').strip().upper().replace(' ',''),
+            'priority': r[6], 'rep_assigned': r[7],
+            'lat': float(r[8]) if r[8] else 0,
+            'lng': float(r[9]) if r[9] else 0,
+            'manager_name': r[10], 'phone': r[11],
+            'territory_name': r[12], 'territory_color': r[13],
+            'skus_listed_count': int(r[14]),
+        })
+
+    # Cluster into days using FSA buckets + nearest-neighbor TSP
+    from collections import defaultdict
+    from math import radians, sin, cos, asin, sqrt
+    by_fsa = defaultdict(list)
+    for s in stores:
+        fsa = s['postal'][:3] if s['postal'] else 'UNK'
+        by_fsa[fsa].append(s)
+    sorted_fsas = sorted(by_fsa.keys(), key=lambda k: (-len(by_fsa[k]), k))
+    day_buckets = []
+    cur_day = []
+    for fsa in sorted_fsas:
+        for s in by_fsa[fsa]:
+            cur_day.append(s)
+            if len(cur_day) >= max_per_day:
+                day_buckets.append(cur_day)
+                cur_day = []
+    if cur_day:
+        day_buckets.append(cur_day)
+
+    def hv(a, b):
+        if not (a.get('lat') and a.get('lng') and b.get('lat') and b.get('lng')):
+            return 999
+        lat1, lng1, lat2, lng2 = map(radians, (a['lat'], a['lng'], b['lat'], b['lng']))
+        dlat = lat2 - lat1; dlng = lng2 - lng1
+        h = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
+        return 2 * 6371 * asin(sqrt(h))
+
+    today = _toronto_today()
+    plan = []
+    for d_idx, bucket in enumerate(day_buckets[:days]):
+        if not bucket: continue
+        with_gps = [s for s in bucket if s['lat'] and s['lng']]
+        if with_gps:
+            cx = sum(s['lat'] for s in with_gps) / len(with_gps)
+            cy = sum(s['lng'] for s in with_gps) / len(with_gps)
+            start = {'lat': cx, 'lng': cy}
+        else:
+            start = {'lat': 0, 'lng': 0}
+        remaining = list(bucket)
+        ordered = []
+        cur_pt = start
+        total_km = 0.0
+        while remaining:
+            nxt = min(remaining, key=lambda s: hv(cur_pt, s))
+            d = hv(cur_pt, nxt)
+            if ordered and d < 999:
+                nxt['leg_km'] = round(d, 1)
+                total_km += d
+            else:
+                nxt['leg_km'] = 0
+            ordered.append(nxt)
+            remaining.remove(nxt)
+            cur_pt = nxt
+        plan.append({
+            'day': d_idx + 1,
+            'date': (today + timedelta(days=d_idx)).isoformat(),
+            'stops': len(ordered),
+            'total_km_est': round(total_km, 1),
+            'cluster_label': bucket[0].get('city',''),
+            'stores': ordered,
+        })
+
+    return jsonify({
+        'rep': rep,
+        'territory': cfg,
+        'max_skus_filter': max_skus,
+        'total_priority_stores': len(stores),
+        'zero_skus_listed': sum(1 for s in stores if s['skus_listed_count'] == 0),
+        'one_sku_listed': sum(1 for s in stores if s['skus_listed_count'] == 1),
+        'days_in_plan': len(plan),
+        'stores_in_plan': sum(d['stops'] for d in plan),
+        'plan': plan,
+    })
+
+
 @app.route('/api/crm/territory-plan', methods=['GET'])
 @cached_response(ttl_seconds=300, key_args=('rep', 'days'))
 def api_crm_territory_plan():
