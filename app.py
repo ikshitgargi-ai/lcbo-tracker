@@ -7049,7 +7049,13 @@ def api_admin_commission_audit():
 
     db = get_db()
     rows_out = []
-    summary = {'lcbo_only': 0, 'sod_only': 0, 'agree': 0, 'units_undercounted': 0}
+    summary = {
+        'lcbo_only': 0,         # ← potential commission claims (SOD missed)
+        'sod_only_empty': 0,    # ← SOD listed, on_hand=0 (real, just no stock right now)
+        'sod_only_stale': 0,    # ← SOD listed, on_hand>0, but no recent lcbo.com confirm
+        'agree': 0,
+        'units_undercounted': 0,
+    }
 
     for sku in skus_to_audit:
         brand, name = SOD_TRACKED_SKUS[sku]
@@ -7171,8 +7177,13 @@ def api_admin_commission_audit():
                 claim_units = lcbo['qty'] if lcbo else 0
                 summary['units_undercounted'] += claim_units
             elif sod_says_listed and not (lcbo_has or rep_saw):
-                verdict = 'sod_only'  # → SOD claims a listing we may have lost
-                summary['sod_only'] += 1
+                # Distinguish "real listing, empty shelf" from "possibly stale SOD"
+                if sod and (sod.get('on_hand') or 0) == 0:
+                    verdict = 'sod_only_empty'  # listed, just out-of-stock
+                    summary['sod_only_empty'] += 1
+                else:
+                    verdict = 'sod_only_stale'  # listed w/ stock but lcbo.com hasn't confirmed
+                    summary['sod_only_stale'] += 1
             else:
                 summary['agree'] += 1
                 if not include_matches:
