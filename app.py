@@ -7774,10 +7774,15 @@ def api_admin_new_listings_by_range():
 
         # Find the actual snapshot dates we'll use for the comparison.
         # Pick the SOD snapshot at-or-before the requested start, and the
-        # SOD snapshot at-or-before the requested end. This handles weekends
-        # / missed days where SOD didn't ingest.
+        # SOD snapshot at-or-before the requested end. Handles weekends /
+        # missed days where SOD didn't ingest.
+        # If no snapshot exists at-or-before start_d (= our SOD history
+        # starts AFTER the requested start), fall back to the earliest
+        # snapshot we have and flag it so the operator knows the count
+        # is approximate.
         start_snapshot = None
         end_snapshot = None
+        start_was_clipped = False
         try:
             cur = db.cursor() if USE_POSTGRES else db
             if USE_POSTGRES:
@@ -7786,6 +7791,11 @@ def api_admin_new_listings_by_range():
                     "WHERE sku=%s AND snapshot_date <= %s",
                     (sku, start_d.isoformat()))
                 start_snapshot = cur.fetchone()[0]
+                if start_snapshot is None:
+                    cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                    start_snapshot = cur.fetchone()[0]
+                    start_was_clipped = True
                 cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=%s AND snapshot_date <= %s",
@@ -7797,6 +7807,10 @@ def api_admin_new_listings_by_range():
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (sku, start_d.isoformat())).fetchone()[0]
+                if start_snapshot is None:
+                    start_snapshot = cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)).fetchone()[0]
+                    start_was_clipped = True
                 end_snapshot = cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
@@ -7961,6 +7975,7 @@ def api_admin_new_listings_by_range():
             'brand': brand,
             'start_snapshot_date': str(start_snapshot) if start_snapshot else None,
             'end_snapshot_date': str(end_snapshot) if end_snapshot else None,
+            'start_was_clipped': start_was_clipped,
             'sod_new_count': len(new_set),
             'lcbo_only_new_count': len(lcbo_only_new),
             'rep_only_new_count': len(rep_only_new),
@@ -11868,6 +11883,10 @@ def _new_listings_per_sku_in_range(days, sku=None):
         sku_clean = s.lstrip('0')
 
         # Snapshot dates
+        # If no snapshot exists at-or-before start_d, fall back to the
+        # earliest snapshot we have. Without this fallback, the diff is
+        # 'everything listed at end vs nothing' which produces inflated
+        # 'new' counts that don't reflect real new wins.
         try:
             cur = db.cursor() if USE_POSTGRES else db
             if USE_POSTGRES:
@@ -11876,6 +11895,12 @@ def _new_listings_per_sku_in_range(days, sku=None):
                     "WHERE sku=%s AND snapshot_date <= %s",
                     (s, start_d.isoformat()))
                 start_snap = cur.fetchone()[0]
+                if start_snap is None:
+                    cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory "
+                        "WHERE sku=%s",
+                        (s,))
+                    start_snap = cur.fetchone()[0]
                 cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=%s AND snapshot_date <= %s",
@@ -11887,6 +11912,10 @@ def _new_listings_per_sku_in_range(days, sku=None):
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (s, start_d.isoformat())).fetchone()[0]
+                if start_snap is None:
+                    start_snap = cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory "
+                        "WHERE sku=?", (s,)).fetchone()[0]
                 end_snap = cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
@@ -12081,7 +12110,10 @@ def _free_answer(question):
         'portfolio', 'all skus', 'all products', 'everything', 'all brands',
         'whole', 'entire', 'tracked skus', 'tracked products',
     ])
-    is_new = ('new' in ql or 'added' in ql or 'recent' in ql or 'fresh' in ql)
+    is_new = (
+        'new' in ql or 'added' in ql or 'recent' in ql or 'fresh' in ql
+        or 'gained' in ql or 'won' in ql or 'picked up' in ql
+    )
     is_about_stores_total = (
         'lcbo store' in ql or 'how many stores' in ql or 'total stores' in ql
         or 'store count' in ql or 'lcbo locations' in ql
