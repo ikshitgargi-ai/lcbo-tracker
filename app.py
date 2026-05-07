@@ -11037,16 +11037,17 @@ def _detect_window_days(q):
     ql = q.lower()
     m = re.search(r'(?:last|past)\s+(\d+)\s*(?:day|days|d)\b', ql)
     if m:
-        return max(1, min(int(m.group(1)), 90))
+        return max(1, min(int(m.group(1)), 365))
     if 'today' in ql or 'yesterday' in ql:
         return 1
-    if 'this week' in ql or 'last 7' in ql or 'past week' in ql:
+    if 'this week' in ql or 'last 7' in ql or 'past week' in ql or 'last week' in ql:
         return 7
-    if 'this month' in ql or 'last 30' in ql or 'past month' in ql:
+    if ('this month' in ql or 'last 30' in ql or 'past month' in ql
+            or 'last month' in ql or 'monthly' in ql):
         return 30
-    if 'this quarter' in ql or 'last 90' in ql or 'past 90' in ql:
+    if 'this quarter' in ql or 'last 90' in ql or 'past 90' in ql or 'last quarter' in ql:
         return 90
-    if 'this year' in ql or 'last 365' in ql or 'ytd' in ql:
+    if 'this year' in ql or 'last 365' in ql or 'ytd' in ql or 'last year' in ql:
         return 365
     return 7
 
@@ -11196,17 +11197,21 @@ def _free_answer(question):
         or ('how many' in ql and 'store' in ql and not sku)
     )
 
-    # Priority 0: total store count question — "how many stores does LCBO have"
-    if is_about_stores_total and not (is_listing and sku):
-        return _count_total_stores()
-
-    # Priority 0b: new listings question — "how many new listings last week"
+    # Priority 0a: new listings question — "how many new listings last week"
+    # Must come before total-stores so "new listings" doesn't hit the
+    # generic "how many stores" matcher.
     if is_new and is_listing:
         return _count_new_listings(days, sku)
 
-    # Priority 0c: new stores question — "any new stores added this week"
+    # Priority 0b: new stores question — "any new stores added this week"
+    # Must also come before total-stores (because "how many new stores" still
+    # contains "how many stores").
     if is_new and 'store' in ql and not sku and not rep and not is_listing:
         return _count_new_stores(days)
+
+    # Priority 0c: total store count question — "how many stores does LCBO have"
+    if is_about_stores_total and not (is_listing and sku):
+        return _count_total_stores()
 
     # Priority 1: store-specific summary
     if store_num is not None:
