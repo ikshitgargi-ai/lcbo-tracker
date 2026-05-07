@@ -1963,7 +1963,13 @@ def live_inventory_for_sku(sku):
 
 
 def _persist_live_inventory(product_id, sku, stores, meta):
-    """Write scraped inventory to inventory_cache + inventory_history, update product listing status."""
+    """Write scraped inventory to inventory_cache + inventory_history, update product listing status.
+
+    CRITICAL: writes per-store rows so the cross-validation engine can detect
+    SOD vs lcbo.com drift accurately (was: only writing one SUMMARY row, which
+    caused the data-integrity report to think we have inventory in '1 store'
+    and report 98% drift on every SKU — completely useless).
+    """
     # Replace inventory cache for this product
     db_execute("DELETE FROM inventory_cache WHERE product_id=?", [product_id])
     for s in stores:
@@ -1971,14 +1977,22 @@ def _persist_live_inventory(product_id, sku, stores, meta):
             "INSERT INTO inventory_cache (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
             [product_id, s['store_number'], s['store_name'], s['city'], s['quantity']]
         )
-    # Append aggregate snapshot row to inventory_history for trend reporting
+    # Append PER-STORE rows to inventory_history (this is the source of truth
+    # for the cross-validation engine; SUMMARY rows below are kept for legacy
+    # 14-day trend graphs but excluded from drift queries).
     try:
+        for s in stores:
+            db_execute(
+                "INSERT INTO inventory_history (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
+                [product_id, str(s['store_number']), s['store_name'], s['city'], s['quantity']]
+            )
+        # Aggregate row for legacy trend display
         db_execute(
             "INSERT INTO inventory_history (product_id, store_number, store_name, store_city, quantity) VALUES (?,?,?,?,?)",
             [product_id, 'SUMMARY', f'{len(stores)} stores', 'TOTAL', sum(s['quantity'] for s in stores)]
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[persist] inventory_history write failed for product {product_id}: {e}")
     # Update price and listing status
     if meta.get('price_cents'):
         db_execute("UPDATE products SET price=? WHERE id=?", [f"${meta['price_cents']/100:.2f}", product_id])
@@ -6816,11 +6830,15 @@ def api_admin_data_integrity():
             pid = None
         if pid:
             try:
+                # EXCLUDE 'SUMMARY' pseudo-store — that's a legacy aggregate row
+                # used for 14-day trend graphs; counting it as a store inflates
+                # drift detection and breaks the cross-validation report.
                 if USE_POSTGRES:
                     cur = db.cursor()
                     cur.execute(
                         "SELECT COUNT(DISTINCT store_number), COALESCE(SUM(quantity),0) "
                         "FROM inventory_history WHERE product_id=%s AND quantity > 0 "
+                        "AND store_number <> 'SUMMARY' "
                         "AND recorded_at >= NOW() - INTERVAL '24 hours'",
                         (pid,),
                     )
@@ -6830,6 +6848,7 @@ def api_admin_data_integrity():
                     row = db.execute(
                         "SELECT COUNT(DISTINCT store_number), COALESCE(SUM(quantity),0) "
                         "FROM inventory_history WHERE product_id=? AND quantity > 0 "
+                        "AND store_number <> 'SUMMARY' "
                         "AND recorded_at >= datetime('now','-24 hours')",
                         (pid,),
                     ).fetchone()
@@ -6996,6 +7015,307 @@ def api_admin_data_integrity():
         report['global']['aggregate_drift_pct'] = None
 
     return jsonify(report)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Commission audit — produces a per-store-SKU disagreement report so we
+# can claim listings we're not being paid for. The CEO-level use case:
+# every store where lcbo.com shows our bottle on shelf but SOD says
+# Not-Listed/Delisted is potentially a missing commission line.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/commission-audit', methods=['GET'])
+def api_admin_commission_audit():
+    """Per-store-SKU reconciliation report — every disagreement between
+    SOD's listing status and what lcbo.com / rep observations actually
+    show. This is the artifact you take to NB Distillers / brand owners
+    when contesting commission shortfalls.
+
+    Query params:
+      sku=<7-digit padded SKU>   filter to one product
+      days=<int>                 lookback window for lcbo.com data (default 7)
+      include_matches=1          include rows where SOD and lcbo.com agree
+                                 (default: only return disagreements)
+      format=json|csv            (default json)
+    """
+    sku_filter = (request.args.get('sku') or '').strip()
+    try:
+        days = max(1, min(int(request.args.get('days', 7)), 30))
+    except ValueError:
+        days = 7
+    include_matches = request.args.get('include_matches') in ('1', 'true', 'yes')
+    fmt = (request.args.get('format') or 'json').lower()
+
+    skus_to_audit = [sku_filter] if sku_filter and sku_filter in SOD_TRACKED_SKUS else list(SOD_TRACKED_SKUS.keys())
+
+    db = get_db()
+    rows_out = []
+    summary = {'lcbo_only': 0, 'sod_only': 0, 'agree': 0, 'units_undercounted': 0}
+
+    for sku in skus_to_audit:
+        brand, name = SOD_TRACKED_SKUS[sku]
+        sku_clean = sku.lstrip('0')
+
+        # Map: store_number -> SOD status / on_hand at latest snapshot
+        sod_per_store = {}
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                latest = cur.fetchone()[0]
+                if latest:
+                    cur.execute(
+                        "SELECT store_number, status, on_hand FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s", (sku, latest))
+                    for r in cur.fetchall():
+                        sod_per_store[int(r[0])] = {'status': r[1], 'on_hand': int(r[2] or 0), 'snapshot_date': str(latest)}
+                cur.close()
+            else:
+                latest_row = db.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)).fetchone()
+                latest = latest_row[0] if latest_row else None
+                if latest:
+                    cur = db.execute(
+                        "SELECT store_number, status, on_hand FROM sod_inventory "
+                        "WHERE sku=? AND snapshot_date=?", (sku, latest))
+                    for r in cur.fetchall():
+                        sod_per_store[int(r[0])] = {'status': r[1], 'on_hand': int(r[2] or 0), 'snapshot_date': str(latest)}
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[commission-audit] SOD lookup failed for {sku}: {e}")
+
+        # Map: store_number -> latest lcbo.com qty (last N days, excluding SUMMARY)
+        lcbo_per_store = {}
+        try:
+            if USE_POSTGRES:
+                cur = db.cursor()
+                cur.execute("SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1", (sku_clean,))
+                prow = cur.fetchone()
+                pid = prow[0] if prow else None
+                if pid:
+                    cur.execute(
+                        "SELECT store_number, MAX(quantity), MAX(recorded_at)::text "
+                        "FROM inventory_history WHERE product_id=%s "
+                        "AND quantity > 0 AND store_number <> 'SUMMARY' "
+                        "AND recorded_at >= NOW() - (INTERVAL '1 day' * %s) "
+                        "GROUP BY store_number",
+                        (pid, days))
+                    for r in cur.fetchall():
+                        try:
+                            lcbo_per_store[int(r[0])] = {'qty': int(r[1] or 0), 'as_of': r[2]}
+                        except (ValueError, TypeError):
+                            continue
+                cur.close()
+            else:
+                prow = db.execute("SELECT id FROM products WHERE lcbo_sku=? LIMIT 1", (sku_clean,)).fetchone()
+                pid = prow[0] if prow else None
+                if pid:
+                    cur = db.execute(
+                        "SELECT store_number, MAX(quantity), MAX(recorded_at) "
+                        "FROM inventory_history WHERE product_id=? "
+                        "AND quantity > 0 AND store_number <> 'SUMMARY' "
+                        "AND recorded_at >= datetime('now', ? || ' days') "
+                        "GROUP BY store_number",
+                        (pid, f'-{days}'))
+                    for r in cur.fetchall():
+                        try:
+                            lcbo_per_store[int(r[0])] = {'qty': int(r[1] or 0), 'as_of': r[2]}
+                        except (ValueError, TypeError):
+                            continue
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[commission-audit] lcbo.com lookup failed for {sku}: {e}")
+
+        # Map: rep-observed listings (manual override flow)
+        rep_observed = {}
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            sql = ("SELECT store_number, MAX(observed_at)::text, MAX(rep) "
+                   "FROM rep_listing_observations "
+                   "WHERE sku=%s AND observed_at >= NOW() - (INTERVAL '1 day' * %s) "
+                   "GROUP BY store_number") if USE_POSTGRES else (
+                   "SELECT store_number, MAX(observed_at), MAX(rep) "
+                   "FROM rep_listing_observations "
+                   "WHERE sku=? AND observed_at >= datetime('now', ? || ' days') "
+                   "GROUP BY store_number")
+            params = (sku, days) if USE_POSTGRES else (sku, f'-{days}')
+            if USE_POSTGRES:
+                cur.execute(sql, params)
+                for r in cur.fetchall():
+                    rep_observed[int(r[0])] = {'observed_at': r[1], 'rep': r[2]}
+                cur.close()
+            else:
+                for r in cur.execute(sql, params).fetchall():
+                    rep_observed[int(r[0])] = {'observed_at': r[1], 'rep': r[2]}
+        except Exception:
+            # Table may not exist yet — silently skip
+            try: db.rollback()
+            except Exception: pass
+
+        # Walk the universe of stores that appeared in either source
+        all_stores = set(sod_per_store.keys()) | set(lcbo_per_store.keys()) | set(rep_observed.keys())
+        for store_num in sorted(all_stores):
+            sod = sod_per_store.get(store_num)
+            lcbo = lcbo_per_store.get(store_num)
+            obs = rep_observed.get(store_num)
+            sod_says_listed = bool(sod and sod['status'] == 'L')
+            sod_says_delist = bool(sod and sod['status'] in ('D', 'F'))
+            lcbo_has = bool(lcbo and lcbo['qty'] > 0)
+            rep_saw = obs is not None
+
+            verdict = 'agree'
+            claim_units = 0
+            if (lcbo_has or rep_saw) and not sod_says_listed:
+                verdict = 'lcbo_only'  # → potential commission claim
+                summary['lcbo_only'] += 1
+                claim_units = lcbo['qty'] if lcbo else 0
+                summary['units_undercounted'] += claim_units
+            elif sod_says_listed and not (lcbo_has or rep_saw):
+                verdict = 'sod_only'  # → SOD claims a listing we may have lost
+                summary['sod_only'] += 1
+            else:
+                summary['agree'] += 1
+                if not include_matches:
+                    continue
+
+            rows_out.append({
+                'sku': sku,
+                'product_name': name,
+                'brand': brand,
+                'store_number': store_num,
+                'verdict': verdict,
+                'claim_units': claim_units,
+                'sod_status': sod['status'] if sod else None,
+                'sod_on_hand': sod['on_hand'] if sod else 0,
+                'sod_snapshot_date': sod['snapshot_date'] if sod else None,
+                'lcbo_units': lcbo['qty'] if lcbo else 0,
+                'lcbo_seen_at': lcbo['as_of'] if lcbo else None,
+                'rep_observed': rep_saw,
+                'rep_observation_at': obs['observed_at'] if obs else None,
+                'rep_observation_by': obs['rep'] if obs else None,
+            })
+
+    if fmt == 'csv':
+        import csv as _csv, io as _io
+        buf = _io.StringIO()
+        if rows_out:
+            w = _csv.DictWriter(buf, fieldnames=list(rows_out[0].keys()))
+            w.writeheader()
+            for r in rows_out:
+                w.writerow(r)
+        return Response(
+            buf.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename=anu-commission-audit-{_toronto_today().isoformat()}.csv'},
+        )
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'window_days': days,
+        'sku_filter': sku_filter or None,
+        'summary': summary,
+        'rows': rows_out,
+        'how_to_use': (
+            "lcbo_only rows are stores where lcbo.com or our reps saw stock but SOD did "
+            "not flag the SKU as Listed at that store. Each row is a potential commission "
+            "claim. Filter to verdict='lcbo_only', export to CSV, and submit to brand owner."
+        ),
+    })
+
+
+# Manual rep override — "I physically saw Red Admiral on shelf at this store"
+# This is the field-data flow that catches SOD undercounts the moment a rep
+# notices them, instead of waiting for the next lcbo.com scrape.
+@app.route('/api/crm/observe-listing', methods=['POST'])
+@require_app_origin
+def api_crm_observe_listing():
+    """A rep visited a store, saw our bottle on shelf, but SOD/lcbo.com
+    don't show it. They tap "Saw on shelf" → row lands here → feeds the
+    commission-audit reconciliation.
+
+    Body: { sku, store_number, rep, on_shelf: bool, units?: int, notes?: str }
+    """
+    body = request.get_json(silent=True) or {}
+    sku = (body.get('sku') or '').strip()
+    store_number = body.get('store_number')
+    rep = (body.get('rep') or '').strip()
+    on_shelf = bool(body.get('on_shelf', True))
+    units = body.get('units')
+    notes = (body.get('notes') or '').strip()[:500]
+
+    if not sku or sku not in SOD_TRACKED_SKUS:
+        return jsonify({'error': 'sku must be one of the 8 tracked SKUs'}), 400
+    try:
+        store_number = int(store_number)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'store_number must be an integer'}), 400
+    if not rep:
+        return jsonify({'error': 'rep is required'}), 400
+
+    # Lazy-create the table (will exist after first call)
+    db = get_db()
+    try:
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS rep_listing_observations (
+                    id BIGSERIAL PRIMARY KEY,
+                    sku TEXT NOT NULL,
+                    store_number INTEGER NOT NULL,
+                    rep TEXT NOT NULL,
+                    on_shelf BOOLEAN DEFAULT TRUE,
+                    units INTEGER,
+                    notes TEXT,
+                    observed_at TIMESTAMP DEFAULT NOW()
+                )
+            ''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_rep_obs_sku_store ON rep_listing_observations (sku, store_number, observed_at DESC)')
+            cur.execute(
+                "INSERT INTO rep_listing_observations (sku, store_number, rep, on_shelf, units, notes) "
+                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                (sku, store_number, rep, on_shelf,
+                 int(units) if units is not None else None,
+                 notes or None),
+            )
+            new_id = cur.fetchone()[0]
+            cur.close()
+            db.commit()
+        else:
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS rep_listing_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku TEXT NOT NULL,
+                    store_number INTEGER NOT NULL,
+                    rep TEXT NOT NULL,
+                    on_shelf BOOLEAN DEFAULT 1,
+                    units INTEGER,
+                    notes TEXT,
+                    observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_rep_obs_sku_store ON rep_listing_observations (sku, store_number, observed_at DESC)')
+            cur = db.execute(
+                "INSERT INTO rep_listing_observations (sku, store_number, rep, on_shelf, units, notes) "
+                "VALUES (?,?,?,?,?,?)",
+                (sku, store_number, rep, 1 if on_shelf else 0,
+                 int(units) if units is not None else None, notes or None),
+            )
+            new_id = cur.lastrowid
+            db.commit()
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        return jsonify({'error': f'observation save failed: {e}'}), 500
+
+    return jsonify({
+        'id': new_id,
+        'sku': sku,
+        'store_number': store_number,
+        'rep': rep,
+        'on_shelf': on_shelf,
+        'recorded_at': datetime.utcnow().isoformat() + 'Z',
+        'note': 'This observation will appear in the next /api/admin/commission-audit run as a "lcbo_only" row if SOD doesn\'t already show this SKU as Listed at this store.',
+    }), 201
 
 
 @app.route('/api/admin/db-stats', methods=['GET'])
