@@ -3626,6 +3626,53 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 )
 
         print(f"[SOD-{source}] step 7/8 done")
+
+        # 7c) AUTO-ONBOARD: any store_number that appeared in this snapshot
+        # but isn't in our master `stores` directory → INSERT a stub row.
+        # This grows the master directory automatically when LCBO opens new
+        # stores or starts carrying our SKUs at a store we hadn't tracked.
+        # ON CONFLICT DO NOTHING so hand-curated rows are never overwritten.
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT DISTINCT store_number FROM sod_inventory "
+                    "WHERE snapshot_date = %s",
+                    (snapshot_date,))
+                snap_stores = {int(r[0]) for r in cur.fetchall()}
+                cur.execute("SELECT store_number FROM stores")
+                existing_stores = {int(r[0]) for r in cur.fetchall()}
+                missing = snap_stores - existing_stores
+                if missing:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO stores
+                             (store_number, account, address, city, priority)
+                           VALUES %s
+                           ON CONFLICT (store_number) DO NOTHING""",
+                        [(sn, f"LCBO #{sn}", '', '', 'Standard') for sn in missing],
+                    )
+                    print(f"[SOD-{source}] auto-onboarded {len(missing)} stores from SOD into master directory")
+            else:
+                snap_stores = {
+                    int(r[0]) for r in cur.execute(
+                        "SELECT DISTINCT store_number FROM sod_inventory WHERE snapshot_date=?",
+                        (snapshot_date,)).fetchall()
+                }
+                existing_stores = {
+                    int(r[0]) for r in cur.execute("SELECT store_number FROM stores").fetchall()
+                }
+                missing = snap_stores - existing_stores
+                if missing:
+                    cur.executemany(
+                        """INSERT OR IGNORE INTO stores
+                             (store_number, account, address, city, priority)
+                           VALUES (?,?,?,?,?)""",
+                        [(sn, f"LCBO #{sn}", '', '', 'Standard') for sn in missing],
+                    )
+                    print(f"[SOD-{source}] auto-onboarded {len(missing)} stores from SOD")
+        except Exception as _e:
+            print(f"[SOD-{source}] auto-onboard skipped: {_e}")
+
         # 8) Also stamp a summary inventory_history row per tracked SKU (for legacy views)
         print(f"[SOD-{source}] step 8/8: stamping inventory_history summaries…")
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
@@ -7335,6 +7382,323 @@ def api_crm_observe_listing():
 # "how many stores does LCBO have right now?" / "how many new listings
 # did we win last week?" / "did any new stores open this month?"
 # ───────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+# Store universe = UNION of all sources. The truth is no single source
+# (SOD, lcbo.com, our master directory) is complete. SOD might miss
+# stores that lcbo.com shows; lcbo.com might miss stores that SOD has;
+# our master directory might be stale or have stores LCBO has closed.
+# This helper resolves the union so callers see all stores ever seen.
+# ───────────────────────────────────────────────────────────────────────
+def _resolve_store_universe(db, lcbo_window_hours=48):
+    """Return the union of stores across all data sources.
+
+    Returns a tuple (universe_dict, stats_dict):
+      universe_dict: {store_number: {'in_master': bool, 'in_sod_latest': bool,
+                                     'in_lcbo_recent': bool}}
+      stats_dict:    counts of intersections + summary
+    """
+    universe: dict = {}
+
+    def _mark(sn, key):
+        try:
+            n = int(sn)
+        except (ValueError, TypeError):
+            return
+        if n not in universe:
+            universe[n] = {'in_master': False, 'in_sod_latest': False, 'in_lcbo_recent': False}
+        universe[n][key] = True
+
+    # 1. Master `stores` directory
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute("SELECT store_number FROM stores")
+            for r in cur.fetchall():
+                _mark(r[0], 'in_master')
+            cur.close()
+        else:
+            for r in cur.execute("SELECT store_number FROM stores").fetchall():
+                _mark(r[0], 'in_master')
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        print(f"[universe] master read failed: {e}")
+
+    # 2. Latest SOD snapshot
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT DISTINCT store_number FROM sod_inventory "
+                "WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)")
+            for r in cur.fetchall():
+                _mark(r[0], 'in_sod_latest')
+            cur.close()
+        else:
+            for r in cur.execute(
+                "SELECT DISTINCT store_number FROM sod_inventory "
+                "WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)"
+            ).fetchall():
+                _mark(r[0], 'in_sod_latest')
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        print(f"[universe] sod read failed: {e}")
+
+    # 3. lcbo.com inventory_history within window
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT DISTINCT store_number FROM inventory_history "
+                "WHERE store_number <> 'SUMMARY' "
+                "  AND recorded_at >= NOW() - (INTERVAL '1 hour' * %s)",
+                (lcbo_window_hours,))
+            for r in cur.fetchall():
+                _mark(r[0], 'in_lcbo_recent')
+            cur.close()
+        else:
+            for r in cur.execute(
+                "SELECT DISTINCT store_number FROM inventory_history "
+                "WHERE store_number <> 'SUMMARY' "
+                "  AND recorded_at >= datetime('now', ? || ' hours')",
+                (f'-{lcbo_window_hours}',)).fetchall():
+                _mark(r[0], 'in_lcbo_recent')
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        print(f"[universe] lcbo read failed: {e}")
+
+    # Stats
+    total = len(universe)
+    in_all_three = sum(
+        1 for v in universe.values()
+        if v['in_master'] and v['in_sod_latest'] and v['in_lcbo_recent']
+    )
+    in_master_only = sum(
+        1 for v in universe.values()
+        if v['in_master'] and not v['in_sod_latest'] and not v['in_lcbo_recent']
+    )
+    in_sod_only = sum(
+        1 for v in universe.values()
+        if not v['in_master'] and v['in_sod_latest'] and not v['in_lcbo_recent']
+    )
+    in_lcbo_only = sum(
+        1 for v in universe.values()
+        if not v['in_master'] and not v['in_sod_latest'] and v['in_lcbo_recent']
+    )
+    in_master_and_sod = sum(
+        1 for v in universe.values()
+        if v['in_master'] and v['in_sod_latest']
+    )
+    in_master_and_lcbo = sum(
+        1 for v in universe.values()
+        if v['in_master'] and v['in_lcbo_recent']
+    )
+    in_sod_and_lcbo = sum(
+        1 for v in universe.values()
+        if v['in_sod_latest'] and v['in_lcbo_recent']
+    )
+
+    stats = {
+        'total_universe_size': total,
+        'in_all_three': in_all_three,
+        'in_master_only': in_master_only,
+        'in_sod_only': in_sod_only,        # ← new stores LCBO opened we haven't onboarded
+        'in_lcbo_only': in_lcbo_only,      # ← stores lcbo.com sees but SOD missed
+        'in_master_and_sod': in_master_and_sod,
+        'in_master_and_lcbo': in_master_and_lcbo,
+        'in_sod_and_lcbo': in_sod_and_lcbo,
+    }
+    return universe, stats
+
+
+def _resolve_carrying_us_universe(db, lcbo_window_hours=48):
+    """Return the union of stores currently carrying ANY of our SKUs across
+    all data sources. A store counts if ANY of these is true:
+      - SOD latest snapshot has status='L' for any of our SKUs
+      - lcbo.com inventory_history shows qty>0 in window for any of our SKUs
+      - rep_listing_observations on_shelf=true within 30 days for any of our SKUs
+
+    Returns (carrying_dict, stats):
+      carrying_dict: {store_number: {sources: ['sod','lcbo','rep'], skus: [...]}}
+    """
+    carrying: dict = {}
+
+    def _add(sn, source, sku):
+        try:
+            n = int(sn)
+        except (ValueError, TypeError):
+            return
+        if n not in carrying:
+            carrying[n] = {'sources': set(), 'skus': set()}
+        carrying[n]['sources'].add(source)
+        carrying[n]['skus'].add(sku)
+
+    # 1. SOD-listed
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT store_number, sku FROM sod_inventory "
+                "WHERE status='L' "
+                "  AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)")
+            for r in cur.fetchall():
+                _add(r[0], 'sod', r[1])
+            cur.close()
+        else:
+            for r in cur.execute(
+                "SELECT store_number, sku FROM sod_inventory "
+                "WHERE status='L' "
+                "  AND snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)"
+            ).fetchall():
+                _add(r[0], 'sod', r[1])
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+
+    # 2. lcbo.com qty>0 in window — must JOIN products to get the padded SKU
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT ih.store_number, p.lcbo_sku FROM inventory_history ih "
+                "JOIN products p ON p.id = ih.product_id "
+                "WHERE ih.store_number <> 'SUMMARY' "
+                "  AND ih.quantity > 0 "
+                "  AND ih.recorded_at >= NOW() - (INTERVAL '1 hour' * %s)",
+                (lcbo_window_hours,))
+            for r in cur.fetchall():
+                # Pad the SKU back to 7 digits to match SOD_TRACKED_SKUS keys
+                sku = (r[1] or '').zfill(7)
+                _add(r[0], 'lcbo', sku)
+            cur.close()
+        else:
+            for r in cur.execute(
+                "SELECT ih.store_number, p.lcbo_sku FROM inventory_history ih "
+                "JOIN products p ON p.id = ih.product_id "
+                "WHERE ih.store_number <> 'SUMMARY' "
+                "  AND ih.quantity > 0 "
+                "  AND ih.recorded_at >= datetime('now', ? || ' hours')",
+                (f'-{lcbo_window_hours}',)).fetchall():
+                sku = (r[1] or '').zfill(7)
+                _add(r[0], 'lcbo', sku)
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+
+    # 3. Rep observations within 30 days
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT store_number, sku FROM rep_listing_observations "
+                "WHERE on_shelf = TRUE "
+                "  AND observed_at >= NOW() - INTERVAL '30 days'")
+            for r in cur.fetchall():
+                _add(r[0], 'rep', r[1])
+            cur.close()
+        else:
+            for r in cur.execute(
+                "SELECT store_number, sku FROM rep_listing_observations "
+                "WHERE on_shelf = 1 "
+                "  AND observed_at >= datetime('now','-30 days')"
+            ).fetchall():
+                _add(r[0], 'rep', r[1])
+    except Exception:
+        # Table may not exist yet
+        try: db.rollback()
+        except Exception: pass
+
+    # Convert sets to sorted lists for JSON serialization
+    out = {n: {'sources': sorted(v['sources']), 'skus': sorted(v['skus'])}
+           for n, v in carrying.items()}
+
+    stats = {
+        'total_stores_carrying_any_sku': len(out),
+        'sod_only': sum(1 for v in out.values() if set(v['sources']) == {'sod'}),
+        'lcbo_only': sum(1 for v in out.values() if set(v['sources']) == {'lcbo'}),
+        'rep_only': sum(1 for v in out.values() if set(v['sources']) == {'rep'}),
+        'sod_and_lcbo': sum(1 for v in out.values()
+                            if 'sod' in v['sources'] and 'lcbo' in v['sources']),
+        'all_three': sum(1 for v in out.values()
+                         if set(v['sources']) >= {'sod', 'lcbo', 'rep'}),
+    }
+    return out, stats
+
+
+@app.route('/api/admin/store-universe', methods=['GET'])
+def api_admin_store_universe():
+    """Per-store source breakdown — every store seen in any source.
+
+    Query params:
+      lcbo_hours=48  — how far back the lcbo.com window goes (default 48h)
+      verbose=1      — include the full per-store dict (default: just stats + drift list)
+    """
+    try:
+        lcbo_hours = max(1, min(int(request.args.get('lcbo_hours', '48')), 720))
+    except ValueError:
+        lcbo_hours = 48
+    verbose = request.args.get('verbose') in ('1', 'true', 'yes')
+
+    db = get_db()
+    universe, u_stats = _resolve_store_universe(db, lcbo_window_hours=lcbo_hours)
+    carrying, c_stats = _resolve_carrying_us_universe(db, lcbo_window_hours=lcbo_hours)
+
+    # Drift items the operator should investigate
+    drift = {
+        'sod_only_stores': [
+            sn for sn, v in universe.items()
+            if v['in_sod_latest'] and not v['in_master']
+        ][:50],
+        'lcbo_only_stores': [
+            sn for sn, v in universe.items()
+            if v['in_lcbo_recent'] and not v['in_master']
+        ][:50],
+        'master_only_stores': [
+            sn for sn, v in universe.items()
+            if v['in_master'] and not v['in_sod_latest'] and not v['in_lcbo_recent']
+        ][:50],
+        'carrying_us_only_in_sod': [
+            sn for sn, v in carrying.items()
+            if set(v['sources']) == {'sod'}
+        ][:50],
+        'carrying_us_only_in_lcbo': [
+            sn for sn, v in carrying.items()
+            if set(v['sources']) == {'lcbo'}
+        ][:50],
+        'carrying_us_only_via_rep': [
+            sn for sn, v in carrying.items()
+            if set(v['sources']) == {'rep'}
+        ][:50],
+    }
+
+    out = {
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'lcbo_window_hours': lcbo_hours,
+        'universe_stats': u_stats,
+        'carrying_stats': c_stats,
+        'drift': drift,
+        'how_to_read': (
+            "lcbo_only_stores = stores lcbo.com shows but SOD missed. "
+            "carrying_us_only_in_lcbo = stores where lcbo.com confirms us on shelf "
+            "but SOD doesn't list us — potential commission claims. "
+            "master_only_stores = stores in our directory neither source has seen "
+            "recently — likely closed/stale."
+        ),
+    }
+    if verbose:
+        out['per_store'] = {
+            str(sn): {
+                **universe[sn],
+                'carrying_skus': carrying.get(sn, {}).get('skus', []),
+                'carrying_sources': carrying.get(sn, {}).get('sources', []),
+            }
+            for sn in sorted(universe.keys())
+        }
+    return jsonify(out)
+
+
 @app.route('/api/admin/movement', methods=['GET'])
 def api_admin_movement():
     """Authoritative store + listing movement counts in a date range.
@@ -7390,12 +7754,19 @@ def api_admin_movement():
 
     db = get_db()
 
-    # ── 1. Store universe ──────────────────────────────────────────────
-    # IMPORTANT: We ingest sod_inventory only for our TRACKED SKUs to save
-    # memory (1.5M rows raw → ~18K stored). So "distinct stores in
-    # sod_inventory" = "stores carrying at least one of our 8 SKUs", NOT
-    # "total LCBO universe". The full LCBO universe count comes from our
-    # `stores` master list (hand-maintained from the LCBO store directory).
+    # ── 1. Store universe (UNION across all sources) ───────────────────
+    # The truth = master `stores` ∪ latest SOD snapshot ∪ recent lcbo.com.
+    # Each source is incomplete on its own:
+    #   - master directory: hand-maintained, can be stale
+    #   - SOD: filtered to our 8 tracked SKUs at ingest
+    #   - lcbo.com: 30-min scrape, sometimes misses stores/products
+    # Plus: which stores actually CARRY any of our SKUs is also a union.
+    try:
+        _u, _u_stats = _resolve_store_universe(db, lcbo_window_hours=48)
+        _c, _c_stats = _resolve_carrying_us_universe(db, lcbo_window_hours=48)
+    except Exception as _e:
+        _u, _u_stats, _c, _c_stats = {}, {}, {}, {}
+
     universe = {}
     try:
         cur = db.cursor() if USE_POSTGRES else db
@@ -7489,6 +7860,19 @@ def api_admin_movement():
         try: db.rollback()
         except Exception: pass
         universe['error'] = str(e)
+
+    # Union-based authoritative counts (the truth across all sources)
+    universe['union_total_stores'] = _u_stats.get('total_universe_size', 0)
+    universe['carrying_us_anywhere'] = _c_stats.get('total_stores_carrying_any_sku', 0)
+    universe['carrying_only_sod'] = _c_stats.get('sod_only', 0)
+    universe['carrying_only_lcbo'] = _c_stats.get('lcbo_only', 0)
+    universe['carrying_only_rep_observed'] = _c_stats.get('rep_only', 0)
+    universe['carrying_in_sod_and_lcbo'] = _c_stats.get('sod_and_lcbo', 0)
+    universe['source_drift'] = {
+        'in_sod_not_master': _u_stats.get('in_sod_only', 0),
+        'in_lcbo_not_master': _u_stats.get('in_lcbo_only', 0),
+        'in_master_not_either': _u_stats.get('in_master_only', 0),
+    }
 
     # ── 2. New stores added in [start, end] ────────────────────────────
     new_stores_section = {'added_in_range': 0, 'store_list': []}
@@ -11055,35 +11439,46 @@ def _detect_window_days(q):
 def _count_total_stores():
     """How many stores does LCBO have? How many carry our SKUs?
 
-    Note: sod_inventory only stores rows for our 8 tracked SKUs (memory
-    optimisation), so "stores in sod_inventory" = "stores carrying at
-    least one of our SKUs". The full LCBO universe count comes from our
-    `stores` master list.
+    Uses the UNION of all sources (master directory + latest SOD + recent
+    lcbo.com) so the count reflects reality, not a single source's gaps.
     """
-    sql = """
+    db = get_db()
+    try:
+        _, u_stats = _resolve_store_universe(db, lcbo_window_hours=48)
+        _, c_stats = _resolve_carrying_us_universe(db, lcbo_window_hours=48)
+    except Exception:
+        u_stats, c_stats = {}, {}
+
+    # Also pull the master count + snapshot date for reference
+    sql_meta = """
         SELECT
-            (SELECT COUNT(*)::int FROM stores) AS lcbo_universe,
-            (SELECT COUNT(DISTINCT store_number)::int FROM sod_inventory
-             WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)) AS stores_with_our_skus,
+            (SELECT COUNT(*)::int FROM stores) AS master_count,
             (SELECT MAX(snapshot_date)::text FROM sod_inventory) AS as_of
     """
-    rows, _ = _run_select(sql)
-    if not rows:
-        return "Couldn't read store counts.", sql.strip(), [], []
-    r = rows[0]
-    lcbo = r.get('lcbo_universe') or 0
-    with_us = r.get('stores_with_our_skus') or 0
-    as_of = r.get('as_of') or 'unknown'
-    pct = round(with_us / lcbo * 100, 1) if lcbo else 0
+    meta_rows, _ = _run_select(sql_meta)
+    master_count = (meta_rows[0].get('master_count') or 0) if meta_rows else 0
+    as_of = (meta_rows[0].get('as_of') or 'unknown') if meta_rows else 'unknown'
 
+    universe_total = u_stats.get('total_universe_size', master_count)
+    carrying_total = c_stats.get('total_stores_carrying_any_sku', 0)
+    carrying_sod_and_lcbo = c_stats.get('sod_and_lcbo', 0)
+    carrying_only_sod = c_stats.get('sod_only', 0)
+    carrying_only_lcbo = c_stats.get('lcbo_only', 0)
+    in_sod_only = u_stats.get('in_sod_only', 0)
+    in_lcbo_only = u_stats.get('in_lcbo_only', 0)
+
+    pct = round(carrying_total / universe_total * 100, 1) if universe_total else 0
     parts = [
-        f"LCBO has {lcbo} stores in our master directory.",
-        f"{with_us} of them carry at least one of our 8 tracked SKUs ({pct}% coverage) as of {as_of}.",
+        f"LCBO universe (union of master directory, SOD, and lcbo.com): {universe_total} stores.",
+        f"{carrying_total} carry at least one of our 8 SKUs ({pct}% coverage) as of {as_of}.",
     ]
-    if lcbo - with_us > 0:
-        parts.append(f"That leaves {lcbo - with_us} stores not yet carrying any of our products — those are listing-opportunity targets.")
-    answer = ' '.join(parts)
-    return answer, sql.strip(), rows, ['lcbo_universe', 'stores_with_our_skus', 'as_of']
+    if carrying_only_lcbo:
+        parts.append(f"{carrying_only_lcbo} stores show our products only on lcbo.com (SOD missed) — potential commission claims.")
+    if carrying_only_sod:
+        parts.append(f"{carrying_only_sod} stores show our products only in SOD (lcbo.com hasn't confirmed yet).")
+    if in_sod_only or in_lcbo_only:
+        parts.append(f"Source drift: {in_sod_only} stores in SOD not in master, {in_lcbo_only} stores on lcbo.com not in master (auto-onboarded on next scrape).")
+    return ' '.join(parts), sql_meta.strip(), meta_rows, ['master_count', 'as_of']
 
 
 def _count_new_listings(days, sku=None):
@@ -11144,6 +11539,37 @@ def _count_new_listings(days, sku=None):
     return ' '.join(parts), sql.strip(), rows, ['sku', 'product_name', 'brand', 'new_listings']
 
 
+def _summarize_source_drift():
+    """Plain-English breakdown of where SOD and lcbo.com disagree."""
+    db = get_db()
+    try:
+        _, u_stats = _resolve_store_universe(db, lcbo_window_hours=48)
+        _, c_stats = _resolve_carrying_us_universe(db, lcbo_window_hours=48)
+    except Exception:
+        u_stats, c_stats = {}, {}
+
+    parts = ["Source drift across SOD, lcbo.com, and our master directory:"]
+    in_sod_only = u_stats.get('in_sod_only', 0)
+    in_lcbo_only = u_stats.get('in_lcbo_only', 0)
+    in_master_only = u_stats.get('in_master_only', 0)
+    only_sod = c_stats.get('sod_only', 0)
+    only_lcbo = c_stats.get('lcbo_only', 0)
+
+    if in_sod_only:
+        parts.append(f"{in_sod_only} stores show in SOD's latest snapshot but aren't in our master directory (auto-onboarded next scrape).")
+    if in_lcbo_only:
+        parts.append(f"{in_lcbo_only} stores show on lcbo.com but aren't in our master directory (auto-onboarded next scrape).")
+    if in_master_only:
+        parts.append(f"{in_master_only} stores in our directory haven't appeared in SOD or lcbo.com recently — likely closed or stale.")
+    if only_lcbo:
+        parts.append(f"{only_lcbo} stores carry our SKUs ONLY according to lcbo.com — SOD missed them. These are potential commission claims.")
+    if only_sod:
+        parts.append(f"{only_sod} stores carry our SKUs ONLY according to SOD — lcbo.com hasn't confirmed yet (out-of-stock or hidden).")
+    if len(parts) == 1:
+        parts.append("All sources agree.")
+    return ' '.join(parts), 'source-drift', [], []
+
+
 def _count_new_stores(days):
     """Stores first appearing in SOD inventory within the last N days."""
     sql = """
@@ -11197,19 +11623,25 @@ def _free_answer(question):
         or ('how many' in ql and 'store' in ql and not sku)
     )
 
-    # Priority 0a: new listings question — "how many new listings last week"
-    # Must come before total-stores so "new listings" doesn't hit the
-    # generic "how many stores" matcher.
+    # Priority 0a: source-drift / data-quality question — "where does SOD disagree"
+    is_drift = (
+        'drift' in ql or 'disagree' in ql or 'mismatch' in ql
+        or 'source' in ql and ('compare' in ql or 'difference' in ql)
+        or 'sod vs' in ql or 'lcbo vs' in ql
+        or 'where' in ql and ('hidden' in ql or 'missing' in ql or 'differ' in ql)
+    )
+    if is_drift:
+        return _summarize_source_drift()
+
+    # Priority 0b: new listings question — "how many new listings last week"
     if is_new and is_listing:
         return _count_new_listings(days, sku)
 
-    # Priority 0b: new stores question — "any new stores added this week"
-    # Must also come before total-stores (because "how many new stores" still
-    # contains "how many stores").
+    # Priority 0c: new stores question — "any new stores added this week"
     if is_new and 'store' in ql and not sku and not rep and not is_listing:
         return _count_new_stores(days)
 
-    # Priority 0c: total store count question — "how many stores does LCBO have"
+    # Priority 0d: total store count question — "how many stores does LCBO have"
     if is_about_stores_total and not (is_listing and sku):
         return _count_total_stores()
 
@@ -11252,7 +11684,8 @@ _FREE_ANSWER_HELP = (
     "'Summarize store 217', 'How many stores list Chak De in Toronto?', "
     "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary', "
     "'How many LCBO stores are there?', 'New listings last 7 days', "
-    "'Any new stores added this month?'."
+    "'Any new stores added this month?', 'Where does SOD disagree with lcbo.com?', "
+    "'Source drift report'."
 )
 
 
@@ -14211,17 +14644,22 @@ _lcbo_scheduler = None
 
 
 def _lcbo_daily_scrape_worker():
-    """Scrape live LCBO.com inventory + RECONCILE with SOD.
+    """Scrape live LCBO.com inventory + RECONCILE with SOD + AUTO-ONBOARD stores.
 
-    Two outputs:
-      1. inventory_history: append-only trend log (existing behavior).
+    Three outputs:
+      1. inventory_history: append-only trend log.
       2. sod_store_sku_changes with change_type='LCBO_LIVE_ONLY' for stores where
          lcbo.com shows on_hand > 0 BUT SOD has no row OR status='F' (delisted).
          This is the killer signal: 'lcbo.com shows live inventory at this store
          but SOD says it's delisted/missing — investigate.'
+      3. AUTO-ONBOARD: any store_number that lcbo.com shows but our master
+         `stores` directory is missing → INSERT with city/address/phone from
+         the scrape. ON CONFLICT DO NOTHING so we never overwrite hand-curated
+         CRM rows. This grows the master directory automatically as LCBO opens
+         new stores or as we widen coverage.
 
-    Idempotent on the reconciliation side via UNIQUE(sku, store_number, change_date,
-    change_type). Runs every 2 hours via the scheduler.
+    Idempotent on the reconciliation side via UNIQUE(sku, store_number,
+    change_date, change_type). Runs every 30 min via the scheduler.
     """
     try:
         scrape = globals().get('scrape_lcbo_inventory')
@@ -14231,8 +14669,12 @@ def _lcbo_daily_scrape_worker():
         conn = _sod_get_conn()
         cur = conn.cursor()
         total_rows = 0
-        discoveries = 0  # NEW: stores found via lcbo.com but missing from SOD
+        discoveries = 0  # stores found via lcbo.com but missing from SOD
+        new_stores_added = 0  # stores newly auto-onboarded into `stores`
         today_str = _toronto_today().isoformat()
+        # Collect per-store metadata across all SKUs to do one bulk auto-onboard
+        # at the end — saves N×SKU upserts.
+        store_meta_seen: dict = {}  # store_num -> {city, intersection, address, phone}
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
             sku_clean = sku.lstrip('0')
             sku_padded = sku  # already 7-char zero-padded in SOD_TRACKED_SKUS
@@ -14283,6 +14725,22 @@ def _lcbo_daily_scrape_worker():
             for r in rows:
                 store_num_raw = r.get('store_number', '')
                 qty = int(r.get('quantity', 0) or 0)
+
+                # Track per-store metadata for auto-onboarding (the lcbo.com
+                # storeList rows include city, intersection, address, phone)
+                try:
+                    sn_int = int(store_num_raw)
+                    if sn_int not in store_meta_seen:
+                        store_meta_seen[sn_int] = {
+                            'city': (r.get('city') or r.get('store_city') or '').strip(),
+                            'intersection': (r.get('intersection') or '').strip(),
+                            'address': (r.get('address') or '').strip(),
+                            'phone': (r.get('phone') or '').strip(),
+                            'store_name': (r.get('store_name') or '').strip(),
+                        }
+                except (ValueError, TypeError):
+                    pass
+
                 # Append to inventory_history
                 if pid is not None:
                     if USE_POSTGRES:
@@ -14336,11 +14794,70 @@ def _lcbo_daily_scrape_worker():
                         sku_discoveries,
                     )
                 discoveries += len(sku_discoveries)
+
+        # ── AUTO-ONBOARD: bulk-insert any store_numbers we saw on lcbo.com
+        # that aren't yet in our master `stores` directory. ON CONFLICT
+        # DO NOTHING so hand-curated CRM rows are never overwritten.
+        if store_meta_seen:
+            try:
+                # Find which store_numbers are missing
+                seen_nums = list(store_meta_seen.keys())
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number FROM stores WHERE store_number = ANY(%s)",
+                        (seen_nums,))
+                    existing = {int(r[0]) for r in cur.fetchall()}
+                else:
+                    placeholders = ','.join('?' * len(seen_nums))
+                    cur.execute(
+                        f"SELECT store_number FROM stores WHERE store_number IN ({placeholders})",
+                        seen_nums)
+                    existing = {int(r[0]) for r in cur.fetchall()}
+                missing = [n for n in seen_nums if n not in existing]
+                if missing:
+                    rows_to_insert = []
+                    for sn in missing:
+                        meta = store_meta_seen[sn]
+                        # Build a sensible account label from city + intersection
+                        account = (
+                            f"LCBO #{sn}"
+                            + (f" — {meta['city']}" if meta['city'] else '')
+                            + (f" ({meta['intersection']})" if meta['intersection'] else '')
+                        )[:200]
+                        rows_to_insert.append((
+                            sn,
+                            account,
+                            meta['address'] or '',
+                            meta['city'] or '',
+                            meta['phone'] or '',
+                            'Standard',
+                        ))
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_values(
+                            cur,
+                            """INSERT INTO stores
+                                 (store_number, account, address, city, phone, priority)
+                               VALUES %s
+                               ON CONFLICT (store_number) DO NOTHING""",
+                            rows_to_insert,
+                        )
+                    else:
+                        cur.executemany(
+                            """INSERT OR IGNORE INTO stores
+                                 (store_number, account, address, city, phone, priority)
+                               VALUES (?,?,?,?,?,?)""",
+                            rows_to_insert,
+                        )
+                    new_stores_added = len(missing)
+            except Exception as e:
+                print(f'[LCBO-live] auto-onboard skipped: {e}')
+
         conn.commit()
         cur.close()
         conn.close()
         print(f'[LCBO-live] scraped {total_rows} store-rows; '
-              f'found {discoveries} discoveries (lcbo.com live but SOD blank/F)')
+              f'found {discoveries} discoveries (lcbo.com live but SOD blank/F); '
+              f'auto-onboarded {new_stores_added} new stores into master directory')
     except Exception as e:
         print(f'[LCBO-live] scrape failed: {e}')
 
