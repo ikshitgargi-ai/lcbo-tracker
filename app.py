@@ -7329,6 +7329,344 @@ def api_crm_observe_listing():
     }), 201
 
 
+# ───────────────────────────────────────────────────────────────────────
+# MOVEMENT REPORT — accurate counts of stores, new listings, and new
+# stores in any date range. Single source of truth for the questions
+# "how many stores does LCBO have right now?" / "how many new listings
+# did we win last week?" / "did any new stores open this month?"
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/movement', methods=['GET'])
+def api_admin_movement():
+    """Authoritative store + listing movement counts in a date range.
+
+    Query params:
+      start=YYYY-MM-DD     window start (default: 7 days ago)
+      end=YYYY-MM-DD       window end (default: today)
+      sku=<7-digit>        filter listing counts to one SKU (optional)
+      tracked_only=1       only count tracked SKUs (default: 1)
+
+    Returns:
+      store_universe:
+        current_lcbo_stores       — distinct store_numbers in the latest
+                                    SOD snapshot (the "real" LCBO count)
+        crm_stores                — rows in our stores table
+        snapshot_date             — date of the count
+        crm_minus_lcbo            — stores in our CRM not in latest SOD
+                                    (closed/stale)
+        lcbo_minus_crm            — stores LCBO has that we haven't onboarded
+      new_stores:
+        added_in_range            — store_numbers first appearing in SOD
+                                    within [start, end]
+        store_list                — array of {store_number, first_seen_date}
+      listings:
+        new_in_range              — count of NEW_LISTING events in [start, end]
+        delisted_in_range         — count of DELISTED events
+        relisted_in_range         — count of RELISTED events
+        per_sku                   — breakdown per tracked SKU
+        per_day                   — daily counts for charting
+        sample_new_listings       — up to 100 most recent NEW_LISTING events
+                                    (sku, store_number, date) for verification
+    """
+    from datetime import date as _date
+    today = _toronto_today()
+    try:
+        start = (request.args.get('start') or '').strip()
+        end = (request.args.get('end') or '').strip()
+        if start:
+            start_d = _date.fromisoformat(start)
+        else:
+            start_d = today - timedelta(days=7)
+        if end:
+            end_d = _date.fromisoformat(end)
+        else:
+            end_d = today
+        if start_d > end_d:
+            return jsonify({'error': 'start must be <= end'}), 400
+    except ValueError:
+        return jsonify({'error': 'dates must be YYYY-MM-DD'}), 400
+
+    sku_filter = (request.args.get('sku') or '').strip()
+    tracked_only = (request.args.get('tracked_only', '1') in ('1', 'true', 'yes'))
+
+    db = get_db()
+
+    # ── 1. Store universe ──────────────────────────────────────────────
+    universe = {}
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        # Latest snapshot date in SOD
+        if USE_POSTGRES:
+            cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+            latest = cur.fetchone()[0]
+        else:
+            latest = cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
+        universe['snapshot_date'] = str(latest) if latest else None
+
+        # Distinct stores in latest snapshot (the authoritative LCBO count)
+        if latest:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT store_number) FROM sod_inventory WHERE snapshot_date=%s",
+                    (latest,))
+                lcbo_count = cur.fetchone()[0] or 0
+            else:
+                lcbo_count = cur.execute(
+                    "SELECT COUNT(DISTINCT store_number) FROM sod_inventory WHERE snapshot_date=?",
+                    (latest,)).fetchone()[0] or 0
+        else:
+            lcbo_count = 0
+        universe['current_lcbo_stores'] = int(lcbo_count)
+
+        # Our CRM stores table
+        if USE_POSTGRES:
+            cur.execute("SELECT COUNT(*) FROM stores")
+            crm_count = cur.fetchone()[0] or 0
+        else:
+            crm_count = cur.execute("SELECT COUNT(*) FROM stores").fetchone()[0] or 0
+        universe['crm_stores'] = int(crm_count)
+
+        # Drift: stores in CRM not in latest SOD
+        if latest:
+            if USE_POSTGRES:
+                cur.execute("""
+                    SELECT COUNT(*) FROM stores s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM sod_inventory i
+                        WHERE i.store_number = s.store_number AND i.snapshot_date = %s
+                    )
+                """, (latest,))
+                crm_minus = cur.fetchone()[0] or 0
+                # Stores in latest SOD not in CRM
+                cur.execute("""
+                    SELECT COUNT(DISTINCT i.store_number) FROM sod_inventory i
+                    WHERE i.snapshot_date = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM stores s WHERE s.store_number = i.store_number
+                      )
+                """, (latest,))
+                lcbo_minus = cur.fetchone()[0] or 0
+            else:
+                crm_minus = cur.execute("""
+                    SELECT COUNT(*) FROM stores s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM sod_inventory i
+                        WHERE i.store_number = s.store_number AND i.snapshot_date = ?
+                    )
+                """, (latest,)).fetchone()[0] or 0
+                lcbo_minus = cur.execute("""
+                    SELECT COUNT(DISTINCT i.store_number) FROM sod_inventory i
+                    WHERE i.snapshot_date = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM stores s WHERE s.store_number = i.store_number
+                      )
+                """, (latest,)).fetchone()[0] or 0
+        else:
+            crm_minus = lcbo_minus = 0
+        universe['crm_minus_lcbo'] = int(crm_minus)
+        universe['lcbo_minus_crm'] = int(lcbo_minus)
+        if USE_POSTGRES: cur.close()
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        universe['error'] = str(e)
+
+    # ── 2. New stores added in [start, end] ────────────────────────────
+    new_stores_section = {'added_in_range': 0, 'store_list': []}
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        # First appearance per store_number in sod_inventory
+        if USE_POSTGRES:
+            cur.execute("""
+                SELECT store_number, MIN(snapshot_date) AS first_seen
+                FROM sod_inventory
+                GROUP BY store_number
+                HAVING MIN(snapshot_date) >= %s AND MIN(snapshot_date) <= %s
+                ORDER BY first_seen DESC
+                LIMIT 100
+            """, (start_d.isoformat(), end_d.isoformat()))
+        else:
+            cur.execute("""
+                SELECT store_number, MIN(snapshot_date) AS first_seen
+                FROM sod_inventory
+                GROUP BY store_number
+                HAVING MIN(snapshot_date) >= ? AND MIN(snapshot_date) <= ?
+                ORDER BY first_seen DESC
+                LIMIT 100
+            """, (start_d.isoformat(), end_d.isoformat()))
+        new_store_rows = cur.fetchall()
+        new_stores_section['added_in_range'] = len(new_store_rows)
+        new_stores_section['store_list'] = [
+            {'store_number': int(r[0]), 'first_seen_date': str(r[1])}
+            for r in new_store_rows
+        ]
+        if USE_POSTGRES: cur.close()
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        new_stores_section['error'] = str(e)
+
+    # ── 3. Listing events in [start, end] ──────────────────────────────
+    listings_section = {
+        'new_in_range': 0,
+        'delisted_in_range': 0,
+        'relisted_in_range': 0,
+        'per_sku': [],
+        'per_day': [],
+        'sample_new_listings': [],
+    }
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+
+        base_where = " WHERE c.change_date BETWEEN %s AND %s" if USE_POSTGRES else " WHERE c.change_date BETWEEN ? AND ?"
+        ph = "%s" if USE_POSTGRES else "?"
+        params: list = [start_d.isoformat(), end_d.isoformat()]
+        if sku_filter:
+            base_where += f" AND c.sku = {ph}"
+            params.append(sku_filter)
+        join = (" LEFT JOIN sod_products p ON p.sku = c.sku"
+                + (f" WHERE p.is_tracked = {'TRUE' if USE_POSTGRES else '1'}" if False else ""))
+        # We embed tracked_only as a HAVING-after-WHERE filter
+        tracked_clause = (
+            f" AND p.is_tracked = {'TRUE' if USE_POSTGRES else '1'}"
+        ) if tracked_only else ""
+
+        # Totals by change_type
+        sql_totals = (
+            "SELECT c.change_type, COUNT(*)::int AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + tracked_clause
+            + " GROUP BY c.change_type"
+        ) if USE_POSTGRES else (
+            "SELECT c.change_type, COUNT(*) AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + tracked_clause
+            + " GROUP BY c.change_type"
+        )
+        cur.execute(sql_totals, params)
+        for r in cur.fetchall():
+            ct = r[0] or '?'
+            n = int(r[1] or 0)
+            if ct == 'NEW_LISTING':
+                listings_section['new_in_range'] = n
+            elif ct == 'DELISTED':
+                listings_section['delisted_in_range'] = n
+            elif ct == 'RELISTED':
+                listings_section['relisted_in_range'] = n
+
+        # Per-SKU breakdown of NEW_LISTING (the most-asked metric)
+        sql_per_sku = (
+            "SELECT c.sku, p.product_name, p.brand, COUNT(*)::int AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + " AND c.change_type = 'NEW_LISTING'"
+            + tracked_clause
+            + " GROUP BY c.sku, p.product_name, p.brand "
+            + " ORDER BY n DESC"
+        ) if USE_POSTGRES else (
+            "SELECT c.sku, p.product_name, p.brand, COUNT(*) AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + " AND c.change_type = 'NEW_LISTING'"
+            + tracked_clause
+            + " GROUP BY c.sku, p.product_name, p.brand "
+            + " ORDER BY n DESC"
+        )
+        cur.execute(sql_per_sku, params)
+        for r in cur.fetchall():
+            listings_section['per_sku'].append({
+                'sku': r[0],
+                'product_name': r[1] or '',
+                'brand': r[2] or '',
+                'new_listings': int(r[3] or 0),
+            })
+
+        # Per-day breakdown for chart
+        sql_per_day = (
+            "SELECT c.change_date::text, c.change_type, COUNT(*)::int AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + tracked_clause
+            + " GROUP BY c.change_date, c.change_type "
+            + " ORDER BY c.change_date"
+        ) if USE_POSTGRES else (
+            "SELECT c.change_date, c.change_type, COUNT(*) AS n "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + tracked_clause
+            + " GROUP BY c.change_date, c.change_type "
+            + " ORDER BY c.change_date"
+        )
+        cur.execute(sql_per_day, params)
+        per_day_map: dict = {}
+        for r in cur.fetchall():
+            day = str(r[0])
+            ct = r[1] or '?'
+            n = int(r[2] or 0)
+            if day not in per_day_map:
+                per_day_map[day] = {'date': day, 'NEW_LISTING': 0, 'DELISTED': 0, 'RELISTED': 0}
+            if ct in per_day_map[day]:
+                per_day_map[day][ct] = n
+        listings_section['per_day'] = list(per_day_map.values())
+
+        # Sample of NEW_LISTING events (for trust + verification)
+        sql_sample = (
+            "SELECT c.change_date::text, c.sku, p.product_name, p.brand, c.store_number "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + " AND c.change_type = 'NEW_LISTING' AND c.store_number IS NOT NULL"
+            + tracked_clause
+            + " ORDER BY c.change_date DESC, c.id DESC "
+            + " LIMIT 100"
+        ) if USE_POSTGRES else (
+            "SELECT c.change_date, c.sku, p.product_name, p.brand, c.store_number "
+            "FROM sod_listing_changes c "
+            "LEFT JOIN sod_products p ON p.sku = c.sku"
+            + base_where
+            + " AND c.change_type = 'NEW_LISTING' AND c.store_number IS NOT NULL"
+            + tracked_clause
+            + " ORDER BY c.change_date DESC, c.id DESC "
+            + " LIMIT 100"
+        )
+        cur.execute(sql_sample, params)
+        for r in cur.fetchall():
+            listings_section['sample_new_listings'].append({
+                'date': str(r[0]),
+                'sku': r[1],
+                'product_name': r[2] or '',
+                'brand': r[3] or '',
+                'store_number': int(r[4]) if r[4] is not None else None,
+            })
+
+        if USE_POSTGRES: cur.close()
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        listings_section['error'] = str(e)
+
+    return jsonify({
+        'window': {
+            'start': start_d.isoformat(),
+            'end': end_d.isoformat(),
+            'days': (end_d - start_d).days + 1,
+        },
+        'sku_filter': sku_filter or None,
+        'tracked_only': tracked_only,
+        'store_universe': universe,
+        'new_stores': new_stores_section,
+        'listings': listings_section,
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+    })
+
+
 @app.route('/api/admin/db-stats', methods=['GET'])
 def api_admin_db_stats():
     """Quick DB sanity stats — row counts per table + size hints. Public (read-only)."""
@@ -10674,6 +11012,155 @@ def _list_delisting(sku=None):
     ), sql.strip(), rows, ['sku', 'product_name', 'delisting_stores']
 
 
+def _detect_window_days(q):
+    """Extract a date window from natural language. Returns int days (default 7)."""
+    ql = q.lower()
+    m = re.search(r'(?:last|past)\s+(\d+)\s*(?:day|days|d)\b', ql)
+    if m:
+        return max(1, min(int(m.group(1)), 90))
+    if 'today' in ql or 'yesterday' in ql:
+        return 1
+    if 'this week' in ql or 'last 7' in ql or 'past week' in ql:
+        return 7
+    if 'this month' in ql or 'last 30' in ql or 'past month' in ql:
+        return 30
+    if 'this quarter' in ql or 'last 90' in ql or 'past 90' in ql:
+        return 90
+    if 'this year' in ql or 'last 365' in ql or 'ytd' in ql:
+        return 365
+    return 7
+
+
+def _count_total_stores():
+    """How many stores does LCBO actually have right now? + how many in our CRM?"""
+    sql = """
+        SELECT
+            (SELECT COUNT(DISTINCT store_number)::int FROM sod_inventory
+             WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)) AS lcbo_universe,
+            (SELECT MAX(snapshot_date)::text FROM sod_inventory) AS as_of,
+            (SELECT COUNT(*)::int FROM stores) AS crm_stores
+    """
+    rows, _ = _run_select(sql)
+    if not rows:
+        return "Couldn't read store counts.", sql.strip(), [], []
+    r = rows[0]
+    lcbo = r.get('lcbo_universe') or 0
+    crm = r.get('crm_stores') or 0
+    as_of = r.get('as_of') or 'unknown'
+
+    # Geocode + drift detail
+    drift_sql = """
+        SELECT
+            (SELECT COUNT(*)::int FROM stores
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM sod_inventory i
+                 WHERE i.store_number = stores.store_number
+                   AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
+             )) AS crm_minus_lcbo,
+            (SELECT COUNT(DISTINCT i.store_number)::int FROM sod_inventory i
+             WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
+               AND NOT EXISTS (
+                   SELECT 1 FROM stores s WHERE s.store_number = i.store_number
+               )) AS lcbo_minus_crm
+    """
+    drift_rows, _ = _run_select(drift_sql)
+    crm_minus = (drift_rows[0].get('crm_minus_lcbo') or 0) if drift_rows else 0
+    lcbo_minus = (drift_rows[0].get('lcbo_minus_crm') or 0) if drift_rows else 0
+
+    parts = [
+        f"LCBO has {lcbo} stores in the latest snapshot ({as_of}).",
+        f"Our CRM has {crm} stores.",
+    ]
+    if crm_minus:
+        parts.append(f"{crm_minus} CRM stores are NOT in the latest LCBO data (likely closed/stale).")
+    if lcbo_minus:
+        parts.append(f"{lcbo_minus} LCBO stores are NOT in our CRM yet (need to onboard).")
+    if crm_minus == 0 and lcbo_minus == 0 and lcbo > 0:
+        parts.append("CRM and LCBO are fully aligned.")
+    answer = ' '.join(parts)
+    return answer, sql.strip(), rows, ['lcbo_universe', 'as_of', 'crm_stores']
+
+
+def _count_new_listings(days, sku=None):
+    """How many new listings in the last N days?"""
+    if sku:
+        brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+        sql = """
+            SELECT COUNT(*)::int AS new_listings
+            FROM sod_listing_changes
+            WHERE change_type = 'NEW_LISTING'
+              AND change_date >= CURRENT_DATE - (INTERVAL '1 day' * %s)
+              AND sku = %s
+        """
+        rows, _ = _run_select(sql, (days, sku))
+        n = (rows[0].get('new_listings') or 0) if rows else 0
+        # Also pull a breakdown of stores
+        stores_sql = """
+            SELECT change_date::text AS date, store_number
+            FROM sod_listing_changes
+            WHERE change_type = 'NEW_LISTING'
+              AND change_date >= CURRENT_DATE - (INTERVAL '1 day' * %s)
+              AND sku = %s
+              AND store_number IS NOT NULL
+            ORDER BY change_date DESC
+            LIMIT 20
+        """
+        store_rows, _ = _run_select(stores_sql, (days, sku))
+        return (
+            f"Last {days} days: {n} new {name} listings detected. "
+            f"({len(store_rows)} most recent shown below.)"
+        ), stores_sql.strip(), store_rows, ['date', 'store_number']
+
+    # Across portfolio
+    sql = """
+        SELECT c.sku, p.product_name, p.brand, COUNT(*)::int AS new_listings
+        FROM sod_listing_changes c
+        LEFT JOIN sod_products p ON p.sku = c.sku
+        WHERE c.change_type = 'NEW_LISTING'
+          AND c.change_date >= CURRENT_DATE - (INTERVAL '1 day' * %s)
+          AND p.is_tracked = TRUE
+        GROUP BY c.sku, p.product_name, p.brand
+        ORDER BY new_listings DESC
+    """
+    rows, _ = _run_select(sql, (days,))
+    total = sum(r.get('new_listings') or 0 for r in rows)
+    if not rows or total == 0:
+        return (
+            f"No new listings detected in the last {days} days across the tracked portfolio. "
+            f"(SOD's NEW_LISTING events fire when a SKU first appears at a store.)"
+        ), sql.strip(), rows, ['sku', 'product_name', 'brand', 'new_listings']
+
+    leader = rows[0]
+    leader_name = leader.get('product_name') or leader.get('sku')
+    parts = [
+        f"Last {days} days: {total} new listings across {len(rows)} tracked SKUs.",
+        f"Leader: {leader_name} with {leader.get('new_listings')} new stores.",
+    ]
+    return ' '.join(parts), sql.strip(), rows, ['sku', 'product_name', 'brand', 'new_listings']
+
+
+def _count_new_stores(days):
+    """Stores first appearing in SOD inventory within the last N days."""
+    sql = """
+        SELECT store_number, MIN(snapshot_date)::text AS first_seen
+        FROM sod_inventory
+        GROUP BY store_number
+        HAVING MIN(snapshot_date) >= CURRENT_DATE - (INTERVAL '1 day' * %s)
+        ORDER BY first_seen DESC
+        LIMIT 50
+    """
+    rows, _ = _run_select(sql, (days,))
+    if not rows:
+        return (
+            f"No new LCBO stores appeared in the last {days} days. "
+            f"(Detected by first-appearance in the daily SOD feed.)"
+        ), sql.strip(), [], ['store_number', 'first_seen']
+    return (
+        f"Last {days} days: {len(rows)} new LCBO stores detected. "
+        f"Most recent: store #{rows[0].get('store_number')} on {rows[0].get('first_seen')}."
+    ), sql.strip(), rows, ['store_number', 'first_seen']
+
+
 def _free_answer(question):
     """Try to answer the question deterministically.
     Returns (answer, sql, rows, columns) on success, None on no match."""
@@ -10684,6 +11171,7 @@ def _free_answer(question):
     rep = _detect_rep(q)
     city = _detect_city(q)
     store_num = _detect_store_number(q)
+    days = _detect_window_days(q)
 
     is_summary = any(w in ql for w in [
         'summarize', 'summary', 'overview', 'how is', "how's", 'report on',
@@ -10697,6 +11185,24 @@ def _free_answer(question):
         'portfolio', 'all skus', 'all products', 'everything', 'all brands',
         'whole', 'entire', 'tracked skus', 'tracked products',
     ])
+    is_new = ('new' in ql or 'added' in ql or 'recent' in ql or 'fresh' in ql)
+    is_about_stores_total = (
+        'lcbo store' in ql or 'how many stores' in ql or 'total stores' in ql
+        or 'store count' in ql or 'lcbo locations' in ql
+        or ('how many' in ql and 'store' in ql and not sku)
+    )
+
+    # Priority 0: total store count question — "how many stores does LCBO have"
+    if is_about_stores_total and not (is_listing and sku):
+        return _count_total_stores()
+
+    # Priority 0b: new listings question — "how many new listings last week"
+    if is_new and is_listing:
+        return _count_new_listings(days, sku)
+
+    # Priority 0c: new stores question — "any new stores added this week"
+    if is_new and 'store' in ql and not sku and not rep and not is_listing:
+        return _count_new_stores(days)
 
     # Priority 1: store-specific summary
     if store_num is not None:
@@ -10735,7 +11241,9 @@ def _free_answer(question):
 _FREE_ANSWER_HELP = (
     "I can answer questions like: 'Summarize Red Admiral', 'How is Namit doing?', "
     "'Summarize store 217', 'How many stores list Chak De in Toronto?', "
-    "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary'."
+    "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary', "
+    "'How many LCBO stores are there?', 'New listings last 7 days', "
+    "'Any new stores added this month?'."
 )
 
 
