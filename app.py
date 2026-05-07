@@ -7699,6 +7699,310 @@ def api_admin_store_universe():
     return jsonify(out)
 
 
+# ───────────────────────────────────────────────────────────────────────
+# New-listings-by-range — the "how many stores were added per SKU between
+# date X and date Y" report. Methodology:
+#
+#   1. Find the SOD snapshot closest to (and on/after) start_date for each SKU
+#   2. Find the SOD snapshot closest to (and on/before) end_date for each SKU
+#   3. New listing = (sku, store) listed at end-snapshot but NOT listed at
+#      start-snapshot (status='L' at end, status≠'L' or absent at start)
+#   4. Cross-check each new listing against lcbo.com inventory_history (was
+#      qty>0 around the end-snapshot date?) — triple verification
+#   5. Also include rep observations within the window as additional
+#      confirmation
+#
+# This catches everything: SOD-detected listings, lcbo.com-detected listings
+# (where SOD might hide them), and rep-observed listings.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/new-listings-by-range', methods=['GET'])
+def api_admin_new_listings_by_range():
+    """New-listings-by-range — per-SKU comparison of two SOD snapshots.
+
+    Query params:
+      start=YYYY-MM-DD     compare-from date (default: 30 days ago)
+      end=YYYY-MM-DD       compare-to date (default: today)
+      sku=<7-digit>        filter to one SKU (optional)
+      include_lcbo=1       cross-check each new listing against lcbo.com (default 1)
+
+    Returns per SKU:
+      - start_snapshot_date (closest SOD snapshot at/before start)
+      - end_snapshot_date   (closest SOD snapshot at/before end)
+      - new_listings_count  (stores Listed at end but not at start)
+      - new_listings: [{store_number, lcbo_confirmed, rep_confirmed, first_seen_in_window}]
+      - lost_listings_count (stores Listed at start but not at end)
+      - net_change          (new - lost)
+    """
+    from datetime import date as _date
+    today = _toronto_today()
+    try:
+        start = (request.args.get('start') or '').strip()
+        end = (request.args.get('end') or '').strip()
+        if start:
+            start_d = _date.fromisoformat(start)
+        else:
+            start_d = today - timedelta(days=30)
+        if end:
+            end_d = _date.fromisoformat(end)
+        else:
+            end_d = today
+        if start_d > end_d:
+            return jsonify({'error': 'start must be <= end'}), 400
+    except ValueError:
+        return jsonify({'error': 'dates must be YYYY-MM-DD'}), 400
+
+    sku_filter = (request.args.get('sku') or '').strip()
+    include_lcbo = (request.args.get('include_lcbo', '1') in ('1', 'true', 'yes'))
+    skus_to_audit = (
+        [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
+        else list(SOD_TRACKED_SKUS.keys())
+    )
+
+    db = get_db()
+    out_rows = []
+    summary = {
+        'total_new_listings': 0,
+        'total_lost_listings': 0,
+        'net_change': 0,
+        'lcbo_confirmed_new': 0,
+        'rep_confirmed_new': 0,
+    }
+
+    for sku in skus_to_audit:
+        brand, name = SOD_TRACKED_SKUS[sku]
+        sku_clean = sku.lstrip('0')
+
+        # Find the actual snapshot dates we'll use for the comparison.
+        # Pick the SOD snapshot at-or-before the requested start, and the
+        # SOD snapshot at-or-before the requested end. This handles weekends
+        # / missed days where SOD didn't ingest.
+        start_snapshot = None
+        end_snapshot = None
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date <= %s",
+                    (sku, start_d.isoformat()))
+                start_snapshot = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date <= %s",
+                    (sku, end_d.isoformat()))
+                end_snapshot = cur.fetchone()[0]
+                cur.close()
+            else:
+                start_snapshot = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=? AND snapshot_date <= ?",
+                    (sku, start_d.isoformat())).fetchone()[0]
+                end_snapshot = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=? AND snapshot_date <= ?",
+                    (sku, end_d.isoformat())).fetchone()[0]
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            out_rows.append({
+                'sku': sku, 'product_name': name, 'brand': brand,
+                'error': f'snapshot lookup failed: {e}',
+            })
+            continue
+
+        # Pull the two snapshots' Listed-store sets
+        def listed_stores_at(snap_date):
+            if not snap_date:
+                return set()
+            try:
+                cur = db.cursor() if USE_POSTGRES else db
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s AND status='L'",
+                        (sku, snap_date))
+                    out = {int(r[0]) for r in cur.fetchall()}
+                    cur.close()
+                else:
+                    out = {
+                        int(r[0]) for r in cur.execute(
+                            "SELECT store_number FROM sod_inventory "
+                            "WHERE sku=? AND snapshot_date=? AND status='L'",
+                            (sku, snap_date)).fetchall()
+                    }
+                return out
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+                return set()
+
+        start_listed = listed_stores_at(start_snapshot)
+        end_listed = listed_stores_at(end_snapshot)
+
+        new_set = end_listed - start_listed     # listings won
+        lost_set = start_listed - end_listed     # listings lost
+
+        # Cross-check new listings against lcbo.com (qty>0 within window)
+        lcbo_confirmed = set()
+        if include_lcbo and new_set:
+            try:
+                cur = db.cursor() if USE_POSTGRES else db
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1",
+                        (sku_clean,))
+                    prow = cur.fetchone()
+                    pid = prow[0] if prow else None
+                    if pid:
+                        cur.execute(
+                            "SELECT DISTINCT store_number FROM inventory_history "
+                            "WHERE product_id=%s AND quantity>0 "
+                            "  AND store_number <> 'SUMMARY' "
+                            "  AND recorded_at >= %s "
+                            "  AND recorded_at <= %s",
+                            (pid, start_d.isoformat(),
+                             (end_d + timedelta(days=1)).isoformat()))
+                        for r in cur.fetchall():
+                            try:
+                                lcbo_confirmed.add(int(r[0]))
+                            except (ValueError, TypeError):
+                                continue
+                    cur.close()
+                else:
+                    prow = cur.execute(
+                        "SELECT id FROM products WHERE lcbo_sku=? LIMIT 1",
+                        (sku_clean,)).fetchone()
+                    pid = prow[0] if prow else None
+                    if pid:
+                        for r in cur.execute(
+                            "SELECT DISTINCT store_number FROM inventory_history "
+                            "WHERE product_id=? AND quantity>0 "
+                            "  AND store_number <> 'SUMMARY' "
+                            "  AND recorded_at >= ? "
+                            "  AND recorded_at <= ?",
+                            (pid, start_d.isoformat(),
+                             (end_d + timedelta(days=1)).isoformat())).fetchall():
+                            try:
+                                lcbo_confirmed.add(int(r[0]))
+                            except (ValueError, TypeError):
+                                continue
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+
+        # Also pull rep observations for this SKU within window
+        rep_confirmed = set()
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT DISTINCT store_number FROM rep_listing_observations "
+                    "WHERE sku=%s AND on_shelf=TRUE "
+                    "  AND observed_at >= %s AND observed_at <= %s",
+                    (sku, start_d.isoformat(),
+                     (end_d + timedelta(days=1)).isoformat()))
+                for r in cur.fetchall():
+                    try:
+                        rep_confirmed.add(int(r[0]))
+                    except (ValueError, TypeError):
+                        continue
+                cur.close()
+            else:
+                for r in cur.execute(
+                    "SELECT DISTINCT store_number FROM rep_listing_observations "
+                    "WHERE sku=? AND on_shelf=1 "
+                    "  AND observed_at >= ? AND observed_at <= ?",
+                    (sku, start_d.isoformat(),
+                     (end_d + timedelta(days=1)).isoformat())).fetchall():
+                    try:
+                        rep_confirmed.add(int(r[0]))
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+        # ALSO catch lcbo.com-only new listings: stores where lcbo.com saw
+        # qty>0 in-window AND that store wasn't Listed at start_snapshot.
+        # These are "hidden in SOD but visible on lcbo.com" wins.
+        lcbo_only_new = (lcbo_confirmed - start_listed) - new_set
+        rep_only_new = (rep_confirmed - start_listed) - new_set - lcbo_only_new
+
+        # Build per-store rows
+        store_rows = []
+        for sn in sorted(new_set):
+            store_rows.append({
+                'store_number': sn,
+                'discovered_via': 'sod',
+                'lcbo_confirmed': sn in lcbo_confirmed,
+                'rep_confirmed': sn in rep_confirmed,
+            })
+        for sn in sorted(lcbo_only_new):
+            store_rows.append({
+                'store_number': sn,
+                'discovered_via': 'lcbo_only',
+                'lcbo_confirmed': True,
+                'rep_confirmed': sn in rep_confirmed,
+            })
+        for sn in sorted(rep_only_new):
+            store_rows.append({
+                'store_number': sn,
+                'discovered_via': 'rep_only',
+                'lcbo_confirmed': sn in lcbo_confirmed,
+                'rep_confirmed': True,
+            })
+
+        # Combined "all sources" new-listing count (the union)
+        union_new = new_set | lcbo_only_new | rep_only_new
+
+        out_rows.append({
+            'sku': sku,
+            'product_name': name,
+            'brand': brand,
+            'start_snapshot_date': str(start_snapshot) if start_snapshot else None,
+            'end_snapshot_date': str(end_snapshot) if end_snapshot else None,
+            'sod_new_count': len(new_set),
+            'lcbo_only_new_count': len(lcbo_only_new),
+            'rep_only_new_count': len(rep_only_new),
+            'union_new_count': len(union_new),
+            'sod_lost_count': len(lost_set),
+            'net_change': len(new_set) - len(lost_set),
+            'start_listed_count': len(start_listed),
+            'end_listed_count': len(end_listed),
+            'lcbo_confirmed_count': len(lcbo_confirmed & union_new),
+            'rep_confirmed_count': len(rep_confirmed & union_new),
+            'new_stores': store_rows,
+            'lost_stores': sorted(lost_set),
+        })
+
+        summary['total_new_listings'] += len(union_new)
+        summary['total_lost_listings'] += len(lost_set)
+        summary['net_change'] += len(new_set) - len(lost_set)
+        summary['lcbo_confirmed_new'] += len(lcbo_confirmed & union_new)
+        summary['rep_confirmed_new'] += len(rep_confirmed & union_new)
+
+    return jsonify({
+        'window': {
+            'start': start_d.isoformat(),
+            'end': end_d.isoformat(),
+            'days': (end_d - start_d).days + 1,
+        },
+        'sku_filter': sku_filter or None,
+        'include_lcbo_cross_check': include_lcbo,
+        'summary': summary,
+        'per_sku': out_rows,
+        'how_to_read': (
+            "Each per-SKU row compares two SOD snapshots: 'start' (closest at/before "
+            "the requested start date) and 'end' (closest at/before the requested end). "
+            "union_new_count = stores that became Listed in the window AS DETECTED BY "
+            "ANY SOURCE (SOD diff + lcbo.com confirmation + rep observations). "
+            "discovered_via='lcbo_only' means SOD didn't show this listing — those "
+            "are the listings hidden from SOD that you can claim commission on."
+        ),
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+    })
+
+
 @app.route('/api/admin/movement', methods=['GET'])
 def api_admin_movement():
     """Authoritative store + listing movement counts in a date range.
@@ -11539,6 +11843,167 @@ def _count_new_listings(days, sku=None):
     return ' '.join(parts), sql.strip(), rows, ['sku', 'product_name', 'brand', 'new_listings']
 
 
+def _new_listings_per_sku_in_range(days, sku=None):
+    """Per-SKU new listings via 2-snapshot diff + lcbo.com triple-check.
+
+    This is the 'how many stores were added between date X and today' answer
+    — uses snapshot diff, not just NEW_LISTING events (which can miss listings
+    SOD hides). Cross-checks each one against lcbo.com inventory_history.
+    """
+    db = get_db()
+    end_d = _toronto_today()
+    start_d = end_d - timedelta(days=days)
+
+    skus_to_audit = (
+        [sku] if (sku and sku in SOD_TRACKED_SKUS)
+        else list(SOD_TRACKED_SKUS.keys())
+    )
+
+    rows_out = []
+    total_new = 0
+    total_lcbo_only = 0
+
+    for s in skus_to_audit:
+        brand, name = SOD_TRACKED_SKUS[s]
+        sku_clean = s.lstrip('0')
+
+        # Snapshot dates
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date <= %s",
+                    (s, start_d.isoformat()))
+                start_snap = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date <= %s",
+                    (s, end_d.isoformat()))
+                end_snap = cur.fetchone()[0]
+                cur.close()
+            else:
+                start_snap = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=? AND snapshot_date <= ?",
+                    (s, start_d.isoformat())).fetchone()[0]
+                end_snap = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory "
+                    "WHERE sku=? AND snapshot_date <= ?",
+                    (s, end_d.isoformat())).fetchone()[0]
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+            continue
+
+        def listed_at(snap):
+            if not snap:
+                return set()
+            try:
+                cur = db.cursor() if USE_POSTGRES else db
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s AND status='L'",
+                        (s, snap))
+                    out = {int(r[0]) for r in cur.fetchall()}
+                    cur.close()
+                else:
+                    out = {
+                        int(r[0]) for r in cur.execute(
+                            "SELECT store_number FROM sod_inventory "
+                            "WHERE sku=? AND snapshot_date=? AND status='L'",
+                            (s, snap)).fetchall()
+                    }
+                return out
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+                return set()
+
+        start_set = listed_at(start_snap)
+        end_set = listed_at(end_snap)
+        new_sod = end_set - start_set
+
+        # lcbo.com triple-check: stores where lcbo.com saw qty>0 in window
+        # but weren't Listed at start_snap = lcbo-only new listings
+        lcbo_seen = set()
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1",
+                    (sku_clean,))
+                prow = cur.fetchone()
+                pid = prow[0] if prow else None
+                if pid:
+                    cur.execute(
+                        "SELECT DISTINCT store_number FROM inventory_history "
+                        "WHERE product_id=%s AND quantity>0 "
+                        "  AND store_number <> 'SUMMARY' "
+                        "  AND recorded_at >= %s",
+                        (pid, start_d.isoformat()))
+                    for r in cur.fetchall():
+                        try:
+                            lcbo_seen.add(int(r[0]))
+                        except (ValueError, TypeError):
+                            continue
+                cur.close()
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+        lcbo_only_new = (lcbo_seen - start_set) - new_sod
+        union_new = new_sod | lcbo_only_new
+
+        rows_out.append({
+            'sku': s,
+            'product_name': name,
+            'brand': brand,
+            'sod_new': len(new_sod),
+            'lcbo_only_new': len(lcbo_only_new),
+            'total_new': len(union_new),
+            'start_snap': str(start_snap) if start_snap else None,
+            'end_snap': str(end_snap) if end_snap else None,
+        })
+        total_new += len(union_new)
+        total_lcbo_only += len(lcbo_only_new)
+
+    rows_out.sort(key=lambda r: -r['total_new'])
+
+    if sku:
+        # Single-SKU answer
+        if not rows_out:
+            return f"No data for {sku}.", 'snapshot-diff', [], []
+        r = rows_out[0]
+        if r['total_new'] == 0:
+            return (
+                f"Last {days} days for {r['product_name']}: 0 new stores added "
+                f"(comparing snapshots {r['start_snap']} → {r['end_snap']})."
+            ), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
+        parts = [
+            f"Last {days} days for {r['product_name']}: {r['total_new']} new store-listings "
+            f"({r['sod_new']} confirmed by SOD, {r['lcbo_only_new']} caught only on lcbo.com)."
+        ]
+        if r['lcbo_only_new']:
+            parts.append(f"The {r['lcbo_only_new']} lcbo.com-only finds are potential commission claims SOD missed.")
+        parts.append(f"Snapshot comparison: {r['start_snap']} → {r['end_snap']}.")
+        return ' '.join(parts), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
+
+    # Portfolio-wide
+    parts = [
+        f"Last {days} days: {total_new} new store-listings won across the portfolio."
+    ]
+    if total_lcbo_only:
+        parts.append(f"{total_lcbo_only} of those were caught only on lcbo.com (SOD missed) — potential commission claims.")
+    if rows_out:
+        leader = rows_out[0]
+        if leader['total_new'] > 0:
+            parts.append(f"Top performer: {leader['product_name']} with {leader['total_new']} new stores.")
+    parts.append(f"Run /new-listings page for the per-store breakdown.")
+    return ' '.join(parts), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
+
+
 def _summarize_source_drift():
     """Plain-English breakdown of where SOD and lcbo.com disagree."""
     db = get_db()
@@ -11633,7 +12098,19 @@ def _free_answer(question):
     if is_drift:
         return _summarize_source_drift()
 
-    # Priority 0b: new listings question — "how many new listings last week"
+    # Priority 0b: new-listings-by-snapshot-diff — "how many new stores were
+    # ADDED for Red Admiral last 60 days" or "how many stores added this month".
+    # Distinct from _count_new_listings (which counts NEW_LISTING events) —
+    # this does a 2-snapshot diff that catches listings even if the diff
+    # engine missed the event, plus cross-checks against lcbo.com.
+    is_added_phrase = (
+        'added' in ql or 'gained' in ql or 'won' in ql or 'picked up' in ql
+        or ('stores' in ql and ('for' in ql or sku) and is_new)
+    )
+    if is_added_phrase and ('store' in ql or 'listing' in ql) and (sku or is_listing):
+        return _new_listings_per_sku_in_range(days, sku)
+
+    # Priority 0c: simpler new listings question — "how many new listings last week"
     if is_new and is_listing:
         return _count_new_listings(days, sku)
 
