@@ -7391,6 +7391,11 @@ def api_admin_movement():
     db = get_db()
 
     # ── 1. Store universe ──────────────────────────────────────────────
+    # IMPORTANT: We ingest sod_inventory only for our TRACKED SKUs to save
+    # memory (1.5M rows raw → ~18K stored). So "distinct stores in
+    # sod_inventory" = "stores carrying at least one of our 8 SKUs", NOT
+    # "total LCBO universe". The full LCBO universe count comes from our
+    # `stores` master list (hand-maintained from the LCBO store directory).
     universe = {}
     try:
         cur = db.cursor() if USE_POSTGRES else db
@@ -7402,30 +7407,42 @@ def api_admin_movement():
             latest = cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
         universe['snapshot_date'] = str(latest) if latest else None
 
-        # Distinct stores in latest snapshot (the authoritative LCBO count)
+        # Stores carrying at least one of our tracked SKUs (the SOD-side count)
         if latest:
             if USE_POSTGRES:
                 cur.execute(
                     "SELECT COUNT(DISTINCT store_number) FROM sod_inventory WHERE snapshot_date=%s",
                     (latest,))
-                lcbo_count = cur.fetchone()[0] or 0
+                stores_with_us = cur.fetchone()[0] or 0
             else:
-                lcbo_count = cur.execute(
+                stores_with_us = cur.execute(
                     "SELECT COUNT(DISTINCT store_number) FROM sod_inventory WHERE snapshot_date=?",
                     (latest,)).fetchone()[0] or 0
         else:
-            lcbo_count = 0
-        universe['current_lcbo_stores'] = int(lcbo_count)
+            stores_with_us = 0
+        universe['stores_carrying_our_skus'] = int(stores_with_us)
 
-        # Our CRM stores table
+        # Total LCBO universe — from our master `stores` list (the only
+        # source we have for the full ~766 store directory)
         if USE_POSTGRES:
             cur.execute("SELECT COUNT(*) FROM stores")
             crm_count = cur.fetchone()[0] or 0
         else:
             crm_count = cur.execute("SELECT COUNT(*) FROM stores").fetchone()[0] or 0
+        universe['lcbo_universe_total'] = int(crm_count)
+        # Legacy alias (kept for backward compat with anything that read `crm_stores`)
         universe['crm_stores'] = int(crm_count)
+        # Legacy alias for current_lcbo_stores — DO NOT USE; will be removed
+        universe['current_lcbo_stores'] = int(stores_with_us)
 
-        # Drift: stores in CRM not in latest SOD
+        # Coverage %: how much of our universe carries at least one of our SKUs
+        if crm_count > 0:
+            universe['carrying_pct'] = round(stores_with_us / crm_count * 100, 1)
+        else:
+            universe['carrying_pct'] = 0
+
+        # Drift: stores in CRM master that did NOT show up in the latest
+        # SOD snapshot (= stores not carrying any of our SKUs right now)
         if latest:
             if USE_POSTGRES:
                 cur.execute("""
@@ -7435,8 +7452,8 @@ def api_admin_movement():
                         WHERE i.store_number = s.store_number AND i.snapshot_date = %s
                     )
                 """, (latest,))
-                crm_minus = cur.fetchone()[0] or 0
-                # Stores in latest SOD not in CRM
+                no_listing = cur.fetchone()[0] or 0
+                # Stores that appeared in SOD but aren't in our CRM master
                 cur.execute("""
                     SELECT COUNT(DISTINCT i.store_number) FROM sod_inventory i
                     WHERE i.snapshot_date = %s
@@ -7446,7 +7463,7 @@ def api_admin_movement():
                 """, (latest,))
                 lcbo_minus = cur.fetchone()[0] or 0
             else:
-                crm_minus = cur.execute("""
+                no_listing = cur.execute("""
                     SELECT COUNT(*) FROM stores s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM sod_inventory i
@@ -7461,8 +7478,11 @@ def api_admin_movement():
                       )
                 """, (latest,)).fetchone()[0] or 0
         else:
-            crm_minus = lcbo_minus = 0
-        universe['crm_minus_lcbo'] = int(crm_minus)
+            no_listing = lcbo_minus = 0
+        universe['stores_without_our_skus'] = int(no_listing)
+        universe['stores_in_sod_not_in_crm'] = int(lcbo_minus)
+        # Legacy aliases
+        universe['crm_minus_lcbo'] = int(no_listing)
         universe['lcbo_minus_crm'] = int(lcbo_minus)
         if USE_POSTGRES: cur.close()
     except Exception as e:
@@ -11032,53 +11052,37 @@ def _detect_window_days(q):
 
 
 def _count_total_stores():
-    """How many stores does LCBO actually have right now? + how many in our CRM?"""
+    """How many stores does LCBO have? How many carry our SKUs?
+
+    Note: sod_inventory only stores rows for our 8 tracked SKUs (memory
+    optimisation), so "stores in sod_inventory" = "stores carrying at
+    least one of our SKUs". The full LCBO universe count comes from our
+    `stores` master list.
+    """
     sql = """
         SELECT
+            (SELECT COUNT(*)::int FROM stores) AS lcbo_universe,
             (SELECT COUNT(DISTINCT store_number)::int FROM sod_inventory
-             WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)) AS lcbo_universe,
-            (SELECT MAX(snapshot_date)::text FROM sod_inventory) AS as_of,
-            (SELECT COUNT(*)::int FROM stores) AS crm_stores
+             WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)) AS stores_with_our_skus,
+            (SELECT MAX(snapshot_date)::text FROM sod_inventory) AS as_of
     """
     rows, _ = _run_select(sql)
     if not rows:
         return "Couldn't read store counts.", sql.strip(), [], []
     r = rows[0]
     lcbo = r.get('lcbo_universe') or 0
-    crm = r.get('crm_stores') or 0
+    with_us = r.get('stores_with_our_skus') or 0
     as_of = r.get('as_of') or 'unknown'
-
-    # Geocode + drift detail
-    drift_sql = """
-        SELECT
-            (SELECT COUNT(*)::int FROM stores
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM sod_inventory i
-                 WHERE i.store_number = stores.store_number
-                   AND i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
-             )) AS crm_minus_lcbo,
-            (SELECT COUNT(DISTINCT i.store_number)::int FROM sod_inventory i
-             WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory)
-               AND NOT EXISTS (
-                   SELECT 1 FROM stores s WHERE s.store_number = i.store_number
-               )) AS lcbo_minus_crm
-    """
-    drift_rows, _ = _run_select(drift_sql)
-    crm_minus = (drift_rows[0].get('crm_minus_lcbo') or 0) if drift_rows else 0
-    lcbo_minus = (drift_rows[0].get('lcbo_minus_crm') or 0) if drift_rows else 0
+    pct = round(with_us / lcbo * 100, 1) if lcbo else 0
 
     parts = [
-        f"LCBO has {lcbo} stores in the latest snapshot ({as_of}).",
-        f"Our CRM has {crm} stores.",
+        f"LCBO has {lcbo} stores in our master directory.",
+        f"{with_us} of them carry at least one of our 8 tracked SKUs ({pct}% coverage) as of {as_of}.",
     ]
-    if crm_minus:
-        parts.append(f"{crm_minus} CRM stores are NOT in the latest LCBO data (likely closed/stale).")
-    if lcbo_minus:
-        parts.append(f"{lcbo_minus} LCBO stores are NOT in our CRM yet (need to onboard).")
-    if crm_minus == 0 and lcbo_minus == 0 and lcbo > 0:
-        parts.append("CRM and LCBO are fully aligned.")
+    if lcbo - with_us > 0:
+        parts.append(f"That leaves {lcbo - with_us} stores not yet carrying any of our products — those are listing-opportunity targets.")
     answer = ' '.join(parts)
-    return answer, sql.strip(), rows, ['lcbo_universe', 'as_of', 'crm_stores']
+    return answer, sql.strip(), rows, ['lcbo_universe', 'stores_with_our_skus', 'as_of']
 
 
 def _count_new_listings(days, sku=None):
