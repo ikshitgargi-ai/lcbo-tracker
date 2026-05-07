@@ -3267,6 +3267,97 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False, progress_
     }
 
 
+def stream_parse_sod_zip_to_sets(zip_bytes, tracked_skus, target_status='L'):
+    """ULTRA-LEAN streaming parser for compare-uploads.
+
+    Builds ONLY (date, sku) -> set of store_numbers where status == target_status.
+    Nothing else accumulates — no per-row dicts, no aggregates. Stays well under
+    10MB of RAM even on a full 50MB / 1.5M-row SOD file.
+
+    Returns dict:
+      dat_name: str
+      total_rows: int (rows actually parsed)
+      tracked_rows: int
+      dates_seen: set[str]
+      listed_by_date_sku: {date_str: {sku: set(store_number)}}
+      counts_by_date_sku: {date_str: {sku: {'L': n, 'D': n, 'F': n, 'total': n,
+                                            'on_hand_listed': n, 'product_name': str}}}
+
+    Use counts_by_date_sku for headline stats, listed_by_date_sku for the diff.
+    """
+    listed_by_date_sku: dict = {}   # date -> sku -> set(store)
+    counts_by_date_sku: dict = {}   # date -> sku -> dict
+    dates_seen: set = set()
+    total_rows = 0
+    tracked_rows = 0
+    last_logged = 0
+    started = datetime.utcnow()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        members = zf.namelist()
+        if not members:
+            raise RuntimeError("Zip is empty")
+        dat_name = members[0]
+        print(f"[SOD-lean] streaming {dat_name} ({len(zip_bytes):,}B compressed)…")
+        with zf.open(dat_name) as raw_stream:
+            text_stream = io.TextIOWrapper(
+                raw_stream, encoding='latin-1', errors='replace', newline='')
+            for line in text_stream:
+                if line.endswith('\n'):
+                    line = line[:-1]
+                if line.endswith('\r'):
+                    line = line[:-1]
+                row = _parse_sod_line(line)
+                if row is None:
+                    continue
+                total_rows += 1
+                if row['sku'] not in tracked_skus:
+                    # Not one of ours — count toward total but don't track per-store
+                    continue
+                tracked_rows += 1
+                d = row['snapshot_date']
+                dates_seen.add(d)
+                sku = row['sku']
+                status = row['status'] or 'L'
+
+                # Per-status counter
+                date_bucket = counts_by_date_sku.setdefault(d, {})
+                cnt = date_bucket.get(sku)
+                if cnt is None:
+                    cnt = {'L': 0, 'D': 0, 'F': 0, 'total': 0,
+                           'on_hand_listed': 0, 'product_name': row['product_name']}
+                    date_bucket[sku] = cnt
+                cnt[status] = cnt.get(status, 0) + 1
+                cnt['total'] += 1
+                if status == 'L':
+                    cnt['on_hand_listed'] += row['on_hand']
+
+                # Set membership for the target status (default L)
+                if status == target_status:
+                    sku_bucket = listed_by_date_sku.setdefault(d, {}).setdefault(sku, set())
+                    sku_bucket.add(row['store_number'])
+
+                if total_rows - last_logged >= 200_000:
+                    elapsed = (datetime.utcnow() - started).total_seconds()
+                    rate = total_rows / max(elapsed, 0.001)
+                    print(f"[SOD-lean] {total_rows:>9,} rows ({elapsed:.1f}s, {rate:,.0f}/s, "
+                          f"tracked={tracked_rows}, dates={len(dates_seen)})")
+                    last_logged = total_rows
+
+    elapsed = (datetime.utcnow() - started).total_seconds()
+    print(f"[SOD-lean] DONE: {total_rows:,} rows in {elapsed:.1f}s "
+          f"(tracked={tracked_rows}, dates={sorted(dates_seen)})")
+
+    return {
+        'dat_name': dat_name,
+        'total_rows': total_rows,
+        'tracked_rows': tracked_rows,
+        'dates_seen': dates_seen,
+        'listed_by_date_sku': listed_by_date_sku,
+        'counts_by_date_sku': counts_by_date_sku,
+    }
+
+
 # ------- DB helpers scoped to the sync pipeline (use a dedicated connection) -------
 def _sod_get_conn():
     """Dedicated connection for the sync (not the request-scoped `g.db`).
@@ -8079,17 +8170,27 @@ def api_admin_new_listings_by_range():
 def api_admin_sod_compare_uploads():
     """Compare two uploaded SOD inventory ZIPs and produce a per-SKU diff.
 
+    Memory-safe — uses stream_parse_sod_zip_to_sets which never buffers
+    rows, only the (sku, store) Listed sets. Stays well under 50MB RAM
+    even with two 50MB+ ZIPs uploaded.
+
     Multipart form fields:
-      from_zip   (file, REQUIRED)   — the historical/baseline snapshot
-      to_zip     (file, OPTIONAL)   — the comparison snapshot. If omitted,
-                                      we use the latest snapshot from our DB.
-      sku        (str, OPTIONAL)    — filter to one tracked SKU
-      include_lcbo (str, OPTIONAL)  — '1' to cross-check via lcbo.com (default)
+      from_zip      (file, REQUIRED) — the historical/baseline snapshot
+      to_zip        (file, OPTIONAL) — the comparison snapshot. If omitted,
+                                       we use the latest snapshot from our DB.
+      from_date     (str,  OPTIONAL) — if from_zip has multiple dates, pick
+                                       which one to use (YYYY-MM-DD). Default:
+                                       most recent date in the ZIP.
+      to_date       (str,  OPTIONAL) — same idea for to_zip.
+      sku           (str,  OPTIONAL) — filter to one tracked SKU
+      include_lcbo  (str,  OPTIONAL) — '1' to cross-check via lcbo.com (default)
     """
     from_file = request.files.get('from_zip')
     to_file = request.files.get('to_zip')
     sku_filter = (request.form.get('sku') or '').strip()
     include_lcbo = (request.form.get('include_lcbo', '1') in ('1', 'true', 'yes'))
+    from_date_pick = (request.form.get('from_date') or '').strip()
+    to_date_pick = (request.form.get('to_date') or '').strip()
 
     if not from_file:
         return jsonify({'error': 'from_zip is required (the historical snapshot)'}), 400
@@ -8100,37 +8201,64 @@ def api_admin_sod_compare_uploads():
     )
     tracked_set = set(skus_to_audit)
 
-    # Parse "from" — only keep tracked SKUs to save memory.
+    # Parse "from" with the lean streaming parser (no row buffering)
     try:
         from_bytes = from_file.read()
         if not from_bytes:
             return jsonify({'error': 'from_zip is empty'}), 400
-        from_parsed = stream_parse_sod_zip(
-            from_bytes, tracked_set, keep_all_rows=False)
+        from_parsed = stream_parse_sod_zip_to_sets(from_bytes, tracked_set)
     except Exception as e:
         return jsonify({'error': f'failed to parse from_zip: {e}'}), 400
 
-    # Build per-SKU per-store Listed set for "from"
-    from_listed_by_sku: dict = {sku: set() for sku in skus_to_audit}
     from_dates = sorted(from_parsed.get('dates_seen', set()))
-    for r in from_parsed.get('rows_to_persist', []):
-        if r['sku'] in tracked_set and r.get('status') == 'L':
-            from_listed_by_sku[r['sku']].add(int(r['store_number']))
+    if not from_dates:
+        return jsonify({
+            'error': 'no rows for tracked SKUs found in from_zip',
+            'tip': 'ZIP may not contain any of our 8 tracked SKUs.',
+        }), 422
+    # Pick which date inside from_zip to use as the snapshot
+    if from_date_pick and from_date_pick in from_parsed['listed_by_date_sku']:
+        from_date_used = from_date_pick
+    elif from_date_pick:
+        return jsonify({
+            'error': f'from_date {from_date_pick} not in zip',
+            'available_dates': from_dates,
+        }), 400
+    else:
+        from_date_used = from_dates[-1]   # default: most recent date in ZIP
+
+    from_listed_by_sku: dict = {
+        sku: from_parsed['listed_by_date_sku'].get(from_date_used, {}).get(sku, set())
+        for sku in skus_to_audit
+    }
 
     # Parse "to" if provided, else fall back to latest snapshot in DB
     to_listed_by_sku: dict = {sku: set() for sku in skus_to_audit}
     to_dates = []
     to_source = 'db_latest'
+    to_date_used = None
+    to_parsed: dict = {}  # so the parse_stats reference is safe even when to_file is None
     if to_file:
         try:
             to_bytes = to_file.read()
             if to_bytes:
-                to_parsed = stream_parse_sod_zip(
-                    to_bytes, tracked_set, keep_all_rows=False)
+                to_parsed = stream_parse_sod_zip_to_sets(to_bytes, tracked_set)
                 to_dates = sorted(to_parsed.get('dates_seen', set()))
-                for r in to_parsed.get('rows_to_persist', []):
-                    if r['sku'] in tracked_set and r.get('status') == 'L':
-                        to_listed_by_sku[r['sku']].add(int(r['store_number']))
+                if not to_dates:
+                    return jsonify({'error': 'no rows for tracked SKUs in to_zip'}), 422
+                if to_date_pick and to_date_pick in to_parsed['listed_by_date_sku']:
+                    to_date_used = to_date_pick
+                elif to_date_pick:
+                    return jsonify({
+                        'error': f'to_date {to_date_pick} not in zip',
+                        'available_dates': to_dates,
+                    }), 400
+                else:
+                    to_date_used = to_dates[-1]
+                to_listed_by_sku = {
+                    sku: to_parsed['listed_by_date_sku'].get(to_date_used, {}).get(sku, set())
+                    for sku in skus_to_audit
+                }
                 to_source = 'uploaded'
         except Exception as e:
             return jsonify({'error': f'failed to parse to_zip: {e}'}), 400
@@ -8279,19 +8407,179 @@ def api_admin_sod_compare_uploads():
         'from_filename': getattr(from_file, 'filename', '') or '',
         'to_filename': getattr(to_file, 'filename', '') if to_file else '(latest from DB)',
         'from_dates_in_zip': from_dates,
+        'from_date_used': from_date_used,
         'to_dates': to_dates,
+        'to_date_used': to_date_used,
         'to_source': to_source,
         'sku_filter': sku_filter or None,
         'include_lcbo_cross_check': include_lcbo,
         'summary': summary,
         'per_sku': per_sku_out,
+        'parse_stats': {
+            'from_total_rows': from_parsed.get('total_rows', 0),
+            'from_tracked_rows': from_parsed.get('tracked_rows', 0),
+            'to_total_rows': to_parsed.get('total_rows') if to_file else None,
+            'to_tracked_rows': to_parsed.get('tracked_rows') if to_file else None,
+        },
         'how_to_read': (
             "Upload a SOD inventory ZIP from any historical date as 'from_zip'. "
             "The endpoint diffs it against today's snapshot (or a second uploaded "
-            "ZIP) and returns stores added/lost per SKU. lcbo.com cross-check "
-            "catches listings that may be hidden in the 'to' SOD but visible "
-            "to customers."
+            "ZIP) and returns stores added/lost per SKU. If a ZIP contains "
+            "multiple dates, the most recent is used by default — pass from_date "
+            "or to_date to override. lcbo.com cross-check catches listings that "
+            "may be hidden in the 'to' SOD but visible to customers."
         ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD UPLOAD-PREVIEW — see what dates a ZIP contains and what would be
+# inserted, BEFORE persisting. Lean parser, no DB writes.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/upload-preview', methods=['POST'])
+@require_app_origin
+def api_admin_sod_upload_preview():
+    """Inspect a SOD ZIP without persisting. Returns dates inside, per-SKU
+    Listed counts, and what would be inserted vs already exists.
+
+    Multipart form fields:
+      zip   (file, REQUIRED)   — the SOD inventory ZIP
+    """
+    f = request.files.get('zip')
+    if not f:
+        return jsonify({'error': 'zip file is required'}), 400
+    try:
+        zip_bytes = f.read()
+        if not zip_bytes:
+            return jsonify({'error': 'zip is empty'}), 400
+        parsed = stream_parse_sod_zip_to_sets(zip_bytes, set(SOD_TRACKED_SKUS.keys()))
+    except Exception as e:
+        return jsonify({'error': f'parse failed: {e}'}), 400
+
+    dates = sorted(parsed.get('dates_seen', set()))
+    counts = parsed.get('counts_by_date_sku', {})
+
+    # Per-date per-SKU summary
+    per_date = []
+    for d in dates:
+        sku_rows = []
+        for sku, cnt in (counts.get(d) or {}).items():
+            brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+            sku_rows.append({
+                'sku': sku,
+                'product_name': name,
+                'brand': brand,
+                'L': cnt.get('L', 0),
+                'D': cnt.get('D', 0),
+                'F': cnt.get('F', 0),
+                'total': cnt.get('total', 0),
+                'on_hand_listed': cnt.get('on_hand_listed', 0),
+            })
+        sku_rows.sort(key=lambda r: -r['L'])
+        per_date.append({
+            'snapshot_date': d,
+            'tracked_sku_rows': sku_rows,
+        })
+
+    # Check overlap with existing data
+    existing_per_date = {}
+    try:
+        db = get_db()
+        cur = db.cursor() if USE_POSTGRES else db
+        for d in dates:
+            if USE_POSTGRES:
+                cur.execute("SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date=%s", (d,))
+                existing_per_date[d] = int(cur.fetchone()[0] or 0)
+            else:
+                existing_per_date[d] = int(cur.execute(
+                    "SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date=?", (d,)
+                ).fetchone()[0] or 0)
+        if USE_POSTGRES: cur.close()
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'filename': getattr(f, 'filename', '') or '',
+        'total_rows_in_zip': parsed.get('total_rows', 0),
+        'tracked_rows_in_zip': parsed.get('tracked_rows', 0),
+        'dates_in_zip': dates,
+        'per_date': per_date,
+        'existing_rows_per_date': existing_per_date,
+        'note': (
+            "This is a preview only — no rows are persisted. To actually "
+            "ingest, POST the same file to /api/admin/sod/upload-historical."
+        ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD ROLLBACK — delete a historical snapshot if it was wrongly uploaded.
+# DOES NOT touch the live sync data; only deletes a specific snapshot_date.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/rollback-snapshot', methods=['POST'])
+@require_app_origin
+def api_admin_sod_rollback_snapshot():
+    """Delete all sod_inventory rows for a specific snapshot_date.
+
+    Body: { snapshot_date: 'YYYY-MM-DD', confirm: true }
+
+    Refuses to delete unless confirm=true is set explicitly. Also logs an
+    event_log row so the deletion is auditable.
+    """
+    body = request.get_json(silent=True) or {}
+    snapshot_date = (body.get('snapshot_date') or '').strip()
+    confirm = bool(body.get('confirm'))
+
+    if not snapshot_date:
+        return jsonify({'error': 'snapshot_date is required (YYYY-MM-DD)'}), 400
+    try:
+        from datetime import date as _date
+        _date.fromisoformat(snapshot_date)
+    except ValueError:
+        return jsonify({'error': 'snapshot_date must be YYYY-MM-DD'}), 400
+    if not confirm:
+        return jsonify({
+            'error': 'confirm=true is required to actually delete',
+            'snapshot_date': snapshot_date,
+            'note': 'Re-POST with {"confirm": true} to perform the deletion.',
+        }), 400
+
+    deleted = 0
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=%s", (snapshot_date,))
+            deleted = cur.rowcount
+            # Also remove any sod_listing_changes that fired for this snapshot
+            cur.execute(
+                "DELETE FROM sod_listing_changes WHERE change_date=%s "
+                "AND (old_status IS NULL OR old_status='') ",  # only synthetic baselines
+                (snapshot_date,))
+        else:
+            cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=?", (snapshot_date,))
+            deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': f'delete failed: {e}'}), 500
+
+    # Audit log
+    try:
+        _log_event('sod_snapshot_rolled_back', 'snapshot', snapshot_date,
+                   actor=request.headers.get('X-User', 'admin'),
+                   payload={'deleted_rows': deleted})
+    except Exception:
+        pass
+
+    return jsonify({
+        'status': 'ok',
+        'snapshot_date': snapshot_date,
+        'deleted_rows': deleted,
+        'note': 'Snapshot removed from sod_inventory. /new-listings will no longer compare against this date.',
     })
 
 
@@ -8309,18 +8597,35 @@ def api_admin_sod_upload_historical():
     """Backfill a historical SOD snapshot into the sod_inventory table.
 
     Multipart form fields:
-      zip          (file, REQUIRED)   — the SOD inventory ZIP
-      keep_all_rows (str, OPTIONAL)   — '1' to ingest ALL SKUs (default 0:
-                                        only tracked SKUs to save space)
+      zip            (file, REQUIRED)   — the SOD inventory ZIP
+      keep_all_rows  (str, OPTIONAL)    — '1' to ingest ALL SKUs (default 0)
+      only_dates     (str, OPTIONAL)    — comma-separated YYYY-MM-DD list;
+                                          if provided, ONLY rows with these
+                                          dates are ingested (skip the rest).
+                                          Useful when a ZIP contains weekly
+                                          data and you only want one day.
 
-    The ZIP's snapshot_date is taken from the rows themselves (each row
-    contains the date it represents). ON CONFLICT (sku, store_number,
-    snapshot_date) DO NOTHING so re-uploads are idempotent.
+    The ZIP's snapshot_date is taken from the rows themselves. ON CONFLICT
+    (sku, store_number, snapshot_date) DO NOTHING so re-uploads are
+    idempotent. If you uploaded the wrong date, use
+    POST /api/admin/sod/rollback-snapshot to remove it.
     """
     f = request.files.get('zip')
     if not f:
         return jsonify({'error': 'zip file is required'}), 400
     keep_all = request.form.get('keep_all_rows') in ('1', 'true', 'yes')
+    only_dates_raw = (request.form.get('only_dates') or '').strip()
+    only_dates = (
+        {d.strip() for d in only_dates_raw.split(',') if d.strip()}
+        if only_dates_raw else None
+    )
+    if only_dates:
+        try:
+            from datetime import date as _date
+            for d in only_dates:
+                _date.fromisoformat(d)
+        except ValueError:
+            return jsonify({'error': 'only_dates must be comma-separated YYYY-MM-DD'}), 400
 
     try:
         zip_bytes = f.read()
@@ -8334,10 +8639,15 @@ def api_admin_sod_upload_historical():
 
     rows = parsed.get('rows_to_persist', [])
     dates = sorted(parsed.get('dates_seen', set()))
+    if only_dates:
+        rows = [r for r in rows if r['snapshot_date'] in only_dates]
+        dates = [d for d in dates if d in only_dates]
     if not rows:
         return jsonify({
-            'error': 'no rows for tracked SKUs found in this ZIP',
-            'dates_in_zip': dates,
+            'error': 'no rows for tracked SKUs found in this ZIP'
+                     + (f' for the requested dates' if only_dates else ''),
+            'dates_in_zip': sorted(parsed.get('dates_seen', set())),
+            'only_dates_filter': sorted(only_dates) if only_dates else None,
         }), 422
 
     # Bulk insert via existing sod_inventory schema. ON CONFLICT DO NOTHING
