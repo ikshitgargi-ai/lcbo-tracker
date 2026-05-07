@@ -7774,15 +7774,22 @@ def api_admin_new_listings_by_range():
 
         # Find the actual snapshot dates we'll use for the comparison.
         # Pick the SOD snapshot at-or-before the requested start, and the
-        # SOD snapshot at-or-before the requested end. Handles weekends /
-        # missed days where SOD didn't ingest.
-        # If no snapshot exists at-or-before start_d (= our SOD history
-        # starts AFTER the requested start), fall back to the earliest
-        # snapshot we have and flag it so the operator knows the count
-        # is approximate.
+        # SOD snapshot at-or-before the requested end.
+        #
+        # POLICY: if no snapshot exists at-or-before start_d (= our SOD
+        # history is younger than the requested start), DO NOT fall back
+        # silently. The diff would be 'everything Listed at end vs nothing'
+        # which inflates 'new' to whatever the current Listed count is —
+        # that's how the user got '9 and 7 for both NB products' for any
+        # date range that predated our ingest. Instead, return a row with
+        # start_was_clipped=true and zeroed counts so the UI can prompt
+        # the operator to upload a historical SOD ZIP via the new
+        # /api/admin/sod/compare-uploads or /api/admin/sod/upload-historical
+        # endpoint to produce a truthful diff.
         start_snapshot = None
         end_snapshot = None
         start_was_clipped = False
+        earliest_available = None
         try:
             cur = db.cursor() if USE_POSTGRES else db
             if USE_POSTGRES:
@@ -7791,36 +7798,70 @@ def api_admin_new_listings_by_range():
                     "WHERE sku=%s AND snapshot_date <= %s",
                     (sku, start_d.isoformat()))
                 start_snapshot = cur.fetchone()[0]
-                if start_snapshot is None:
-                    cur.execute(
-                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
-                    start_snapshot = cur.fetchone()[0]
-                    start_was_clipped = True
                 cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=%s AND snapshot_date <= %s",
                     (sku, end_d.isoformat()))
                 end_snapshot = cur.fetchone()[0]
+                if start_snapshot is None:
+                    start_was_clipped = True
+                    cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                    earliest_available = cur.fetchone()[0]
                 cur.close()
             else:
                 start_snapshot = cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (sku, start_d.isoformat())).fetchone()[0]
-                if start_snapshot is None:
-                    start_snapshot = cur.execute(
-                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)).fetchone()[0]
-                    start_was_clipped = True
                 end_snapshot = cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (sku, end_d.isoformat())).fetchone()[0]
+                if start_snapshot is None:
+                    start_was_clipped = True
+                    earliest_available = cur.execute(
+                        "SELECT MIN(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)
+                    ).fetchone()[0]
         except Exception as e:
             try: db.rollback()
             except Exception: pass
             out_rows.append({
                 'sku': sku, 'product_name': name, 'brand': brand,
                 'error': f'snapshot lookup failed: {e}',
+            })
+            continue
+
+        # If start was clipped, return the row with a clear flag and zeros.
+        # This is honest: we don't know what was Listed at start_d because
+        # we didn't have data then. Operator can upload a historical ZIP.
+        if start_was_clipped:
+            out_rows.append({
+                'sku': sku,
+                'product_name': name,
+                'brand': brand,
+                'start_snapshot_date': None,
+                'end_snapshot_date': str(end_snapshot) if end_snapshot else None,
+                'start_was_clipped': True,
+                'earliest_available_snapshot': str(earliest_available) if earliest_available else None,
+                'sod_new_count': 0,
+                'lcbo_only_new_count': 0,
+                'rep_only_new_count': 0,
+                'union_new_count': 0,
+                'sod_lost_count': 0,
+                'net_change': 0,
+                'start_listed_count': 0,
+                'end_listed_count': 0,
+                'lcbo_confirmed_count': 0,
+                'rep_confirmed_count': 0,
+                'new_stores': [],
+                'lost_stores': [],
+                'message': (
+                    f"Our SOD ingest only goes back to {earliest_available}; the "
+                    f"requested start date ({start_d.isoformat()}) is before that. "
+                    f"To get a real diff, upload a historical SOD inventory ZIP via "
+                    f"/api/admin/sod/compare-uploads."
+                ),
             })
             continue
 
@@ -8015,6 +8056,363 @@ def api_admin_new_listings_by_range():
             "are the listings hidden from SOD that you can claim commission on."
         ),
         'as_of': datetime.utcnow().isoformat() + 'Z',
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD COMPARE UPLOADS — the "right way" to do new-listings-by-range:
+#
+#   1. Operator downloads the SOD inventory ZIP for a historical date
+#      (e.g. March 1) directly from sod.lcbo.com.
+#   2. Optionally downloads today's ZIP (or we use the latest from the DB).
+#   3. Uploads the two ZIPs (or one ZIP) to this endpoint.
+#   4. We stream-parse both, build per-SKU per-store Listed sets, diff them.
+#   5. Return per-SKU "stores added" + "stores lost" with full store_number
+#      lists. Nothing gets persisted; pure compute.
+#
+# This bypasses the "no historical SOD data in our DB" problem — operator
+# brings the historical data with them. Works for any date range as long
+# as SOD's portal still has the file.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/compare-uploads', methods=['POST'])
+@require_app_origin
+def api_admin_sod_compare_uploads():
+    """Compare two uploaded SOD inventory ZIPs and produce a per-SKU diff.
+
+    Multipart form fields:
+      from_zip   (file, REQUIRED)   — the historical/baseline snapshot
+      to_zip     (file, OPTIONAL)   — the comparison snapshot. If omitted,
+                                      we use the latest snapshot from our DB.
+      sku        (str, OPTIONAL)    — filter to one tracked SKU
+      include_lcbo (str, OPTIONAL)  — '1' to cross-check via lcbo.com (default)
+    """
+    from_file = request.files.get('from_zip')
+    to_file = request.files.get('to_zip')
+    sku_filter = (request.form.get('sku') or '').strip()
+    include_lcbo = (request.form.get('include_lcbo', '1') in ('1', 'true', 'yes'))
+
+    if not from_file:
+        return jsonify({'error': 'from_zip is required (the historical snapshot)'}), 400
+
+    skus_to_audit = (
+        [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
+        else list(SOD_TRACKED_SKUS.keys())
+    )
+    tracked_set = set(skus_to_audit)
+
+    # Parse "from" — only keep tracked SKUs to save memory.
+    try:
+        from_bytes = from_file.read()
+        if not from_bytes:
+            return jsonify({'error': 'from_zip is empty'}), 400
+        from_parsed = stream_parse_sod_zip(
+            from_bytes, tracked_set, keep_all_rows=False)
+    except Exception as e:
+        return jsonify({'error': f'failed to parse from_zip: {e}'}), 400
+
+    # Build per-SKU per-store Listed set for "from"
+    from_listed_by_sku: dict = {sku: set() for sku in skus_to_audit}
+    from_dates = sorted(from_parsed.get('dates_seen', set()))
+    for r in from_parsed.get('rows_to_persist', []):
+        if r['sku'] in tracked_set and r.get('status') == 'L':
+            from_listed_by_sku[r['sku']].add(int(r['store_number']))
+
+    # Parse "to" if provided, else fall back to latest snapshot in DB
+    to_listed_by_sku: dict = {sku: set() for sku in skus_to_audit}
+    to_dates = []
+    to_source = 'db_latest'
+    if to_file:
+        try:
+            to_bytes = to_file.read()
+            if to_bytes:
+                to_parsed = stream_parse_sod_zip(
+                    to_bytes, tracked_set, keep_all_rows=False)
+                to_dates = sorted(to_parsed.get('dates_seen', set()))
+                for r in to_parsed.get('rows_to_persist', []):
+                    if r['sku'] in tracked_set and r.get('status') == 'L':
+                        to_listed_by_sku[r['sku']].add(int(r['store_number']))
+                to_source = 'uploaded'
+        except Exception as e:
+            return jsonify({'error': f'failed to parse to_zip: {e}'}), 400
+
+    if to_source == 'db_latest':
+        # Pull latest snapshot per SKU from DB
+        try:
+            db = get_db()
+            cur = db.cursor() if USE_POSTGRES else db
+            for sku in skus_to_audit:
+                if USE_POSTGRES:
+                    cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                    latest = cur.fetchone()[0]
+                else:
+                    latest = cur.execute(
+                        "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?",
+                        (sku,)).fetchone()[0]
+                if not latest:
+                    continue
+                to_dates.append(str(latest))
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number FROM sod_inventory "
+                        "WHERE sku=%s AND snapshot_date=%s AND status='L'",
+                        (sku, latest))
+                    to_listed_by_sku[sku] = {int(r[0]) for r in cur.fetchall()}
+                else:
+                    to_listed_by_sku[sku] = {
+                        int(r[0]) for r in cur.execute(
+                            "SELECT store_number FROM sod_inventory "
+                            "WHERE sku=? AND snapshot_date=? AND status='L'",
+                            (sku, latest)).fetchall()
+                    }
+            if USE_POSTGRES: cur.close()
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            return jsonify({'error': f'DB lookup failed: {e}'}), 500
+        to_dates = sorted(set(to_dates))
+
+    # Optional lcbo.com cross-check for each "added" store-SKU
+    lcbo_per_sku = {}
+    if include_lcbo:
+        try:
+            db = get_db()
+            cur = db.cursor() if USE_POSTGRES else db
+            for sku in skus_to_audit:
+                sku_clean = sku.lstrip('0')
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1",
+                        (sku_clean,))
+                    prow = cur.fetchone()
+                    pid = prow[0] if prow else None
+                    if pid:
+                        cur.execute(
+                            "SELECT DISTINCT store_number FROM inventory_history "
+                            "WHERE product_id=%s AND quantity>0 "
+                            "  AND store_number <> 'SUMMARY' "
+                            "  AND recorded_at >= NOW() - INTERVAL '7 days'",
+                            (pid,))
+                        seen = set()
+                        for r in cur.fetchall():
+                            try:
+                                seen.add(int(r[0]))
+                            except (ValueError, TypeError):
+                                continue
+                        lcbo_per_sku[sku] = seen
+                else:
+                    prow = cur.execute(
+                        "SELECT id FROM products WHERE lcbo_sku=? LIMIT 1",
+                        (sku_clean,)).fetchone()
+                    pid = prow[0] if prow else None
+                    if pid:
+                        seen = set()
+                        for r in cur.execute(
+                            "SELECT DISTINCT store_number FROM inventory_history "
+                            "WHERE product_id=? AND quantity>0 "
+                            "  AND store_number <> 'SUMMARY' "
+                            "  AND recorded_at >= datetime('now','-7 days')",
+                            (pid,)).fetchall():
+                            try:
+                                seen.add(int(r[0]))
+                            except (ValueError, TypeError):
+                                continue
+                        lcbo_per_sku[sku] = seen
+            if USE_POSTGRES: cur.close()
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+    # Compute per-SKU diff
+    per_sku_out = []
+    summary = {
+        'total_added': 0,
+        'total_lost': 0,
+        'total_lcbo_only': 0,
+    }
+    for sku in skus_to_audit:
+        brand, name = SOD_TRACKED_SKUS[sku]
+        from_set = from_listed_by_sku.get(sku, set())
+        to_set = to_listed_by_sku.get(sku, set())
+        added = to_set - from_set
+        lost = from_set - to_set
+        # Also include lcbo-only-new: stores lcbo.com saw within 7 days that
+        # weren't in 'from' set (potentially being hidden in 'to' SOD as well)
+        lcbo_seen = lcbo_per_sku.get(sku, set())
+        lcbo_only_new = (lcbo_seen - from_set) - to_set
+        union_added = added | lcbo_only_new
+
+        added_rows = []
+        for sn in sorted(added):
+            added_rows.append({
+                'store_number': sn,
+                'discovered_via': 'sod',
+                'lcbo_confirmed': sn in lcbo_seen,
+            })
+        for sn in sorted(lcbo_only_new):
+            added_rows.append({
+                'store_number': sn,
+                'discovered_via': 'lcbo_only',
+                'lcbo_confirmed': True,
+            })
+
+        per_sku_out.append({
+            'sku': sku,
+            'product_name': name,
+            'brand': brand,
+            'from_listed_count': len(from_set),
+            'to_listed_count': len(to_set),
+            'sod_added_count': len(added),
+            'sod_lost_count': len(lost),
+            'lcbo_only_added_count': len(lcbo_only_new),
+            'lcbo_confirmed_added': len(added & lcbo_seen),
+            'union_added_count': len(union_added),
+            'net_change': len(added) - len(lost),
+            'added_stores': added_rows,
+            'lost_stores': sorted(lost),
+        })
+        summary['total_added'] += len(union_added)
+        summary['total_lost'] += len(lost)
+        summary['total_lcbo_only'] += len(lcbo_only_new)
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'from_filename': getattr(from_file, 'filename', '') or '',
+        'to_filename': getattr(to_file, 'filename', '') if to_file else '(latest from DB)',
+        'from_dates_in_zip': from_dates,
+        'to_dates': to_dates,
+        'to_source': to_source,
+        'sku_filter': sku_filter or None,
+        'include_lcbo_cross_check': include_lcbo,
+        'summary': summary,
+        'per_sku': per_sku_out,
+        'how_to_read': (
+            "Upload a SOD inventory ZIP from any historical date as 'from_zip'. "
+            "The endpoint diffs it against today's snapshot (or a second uploaded "
+            "ZIP) and returns stores added/lost per SKU. lcbo.com cross-check "
+            "catches listings that may be hidden in the 'to' SOD but visible "
+            "to customers."
+        ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD HISTORICAL UPLOAD — backfill a past snapshot into sod_inventory.
+#
+# After upload, the existing /new-listings page will work for any date
+# range that includes the uploaded snapshot (no longer clipped to our
+# ingest start). One-time per past date; ON CONFLICT DO NOTHING so re-
+# uploading the same file is safe.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/upload-historical', methods=['POST'])
+@require_app_origin
+def api_admin_sod_upload_historical():
+    """Backfill a historical SOD snapshot into the sod_inventory table.
+
+    Multipart form fields:
+      zip          (file, REQUIRED)   — the SOD inventory ZIP
+      keep_all_rows (str, OPTIONAL)   — '1' to ingest ALL SKUs (default 0:
+                                        only tracked SKUs to save space)
+
+    The ZIP's snapshot_date is taken from the rows themselves (each row
+    contains the date it represents). ON CONFLICT (sku, store_number,
+    snapshot_date) DO NOTHING so re-uploads are idempotent.
+    """
+    f = request.files.get('zip')
+    if not f:
+        return jsonify({'error': 'zip file is required'}), 400
+    keep_all = request.form.get('keep_all_rows') in ('1', 'true', 'yes')
+
+    try:
+        zip_bytes = f.read()
+        if not zip_bytes:
+            return jsonify({'error': 'zip is empty'}), 400
+        parsed = stream_parse_sod_zip(
+            zip_bytes, set(SOD_TRACKED_SKUS.keys()),
+            keep_all_rows=keep_all)
+    except Exception as e:
+        return jsonify({'error': f'parse failed: {e}'}), 400
+
+    rows = parsed.get('rows_to_persist', [])
+    dates = sorted(parsed.get('dates_seen', set()))
+    if not rows:
+        return jsonify({
+            'error': 'no rows for tracked SKUs found in this ZIP',
+            'dates_in_zip': dates,
+        }), 422
+
+    # Bulk insert via existing sod_inventory schema. ON CONFLICT DO NOTHING
+    # so this is idempotent — uploading the same file twice is a no-op.
+    inserted = 0
+    skipped = 0
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        # Stream in batches of 5000 to keep memory bounded
+        BATCH = 5000
+        batch = []
+        for r in rows:
+            batch.append((
+                r['sku'], r['store_number'], r['snapshot_date'],
+                r['status'], r['on_hand'], r['product_name'],
+                'historical_upload',
+            ))
+            if len(batch) >= BATCH:
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES %s
+                           ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+                else:
+                    cur.executemany(
+                        """INSERT OR IGNORE INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+                batch = []
+        if batch:
+            if USE_POSTGRES:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO sod_inventory
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                       VALUES %s
+                       ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                    batch,
+                )
+                inserted += cur.rowcount
+            else:
+                cur.executemany(
+                    """INSERT OR IGNORE INTO sod_inventory
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    batch,
+                )
+                inserted += cur.rowcount
+        skipped = len(rows) - inserted
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': f'DB insert failed: {e}'}), 500
+
+    return jsonify({
+        'status': 'ok',
+        'filename': getattr(f, 'filename', '') or '',
+        'dates_in_zip': dates,
+        'tracked_rows_in_zip': len(rows),
+        'inserted': inserted,
+        'skipped_existing': skipped,
+        'note': (
+            "Historical snapshot backfilled into sod_inventory. The /new-listings "
+            "page can now compare any date range that includes these dates."
+        ),
     })
 
 
@@ -12321,11 +12719,10 @@ def _new_listings_per_sku_in_range(days, sku=None):
         brand, name = SOD_TRACKED_SKUS[s]
         sku_clean = s.lstrip('0')
 
-        # Snapshot dates
-        # If no snapshot exists at-or-before start_d, fall back to the
-        # earliest snapshot we have. Without this fallback, the diff is
-        # 'everything listed at end vs nothing' which produces inflated
-        # 'new' counts that don't reflect real new wins.
+        # Snapshot dates. If start_d predates our SOD history we DO NOT
+        # fall back silently — we mark this row as clipped and skip the
+        # diff so we don't return inflated counts.
+        start_clipped = False
         try:
             cur = db.cursor() if USE_POSTGRES else db
             if USE_POSTGRES:
@@ -12334,12 +12731,6 @@ def _new_listings_per_sku_in_range(days, sku=None):
                     "WHERE sku=%s AND snapshot_date <= %s",
                     (s, start_d.isoformat()))
                 start_snap = cur.fetchone()[0]
-                if start_snap is None:
-                    cur.execute(
-                        "SELECT MIN(snapshot_date) FROM sod_inventory "
-                        "WHERE sku=%s",
-                        (s,))
-                    start_snap = cur.fetchone()[0]
                 cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=%s AND snapshot_date <= %s",
@@ -12351,17 +12742,32 @@ def _new_listings_per_sku_in_range(days, sku=None):
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (s, start_d.isoformat())).fetchone()[0]
-                if start_snap is None:
-                    start_snap = cur.execute(
-                        "SELECT MIN(snapshot_date) FROM sod_inventory "
-                        "WHERE sku=?", (s,)).fetchone()[0]
                 end_snap = cur.execute(
                     "SELECT MAX(snapshot_date) FROM sod_inventory "
                     "WHERE sku=? AND snapshot_date <= ?",
                     (s, end_d.isoformat())).fetchone()[0]
+            if start_snap is None:
+                start_clipped = True
         except Exception:
             try: db.rollback()
             except Exception: pass
+            continue
+
+        # If start_snap is missing (our history is younger than start_d),
+        # this comparison would be meaningless ('everything vs nothing').
+        # Return a clipped row with 0s so the AI can be honest.
+        if start_clipped:
+            rows_out.append({
+                'sku': s,
+                'product_name': name,
+                'brand': brand,
+                'sod_new': 0,
+                'lcbo_only_new': 0,
+                'total_new': 0,
+                'start_snap': None,
+                'end_snap': str(end_snap) if end_snap else None,
+                'clipped': True,
+            })
             continue
 
         def listed_at(snap):
@@ -12444,6 +12850,14 @@ def _new_listings_per_sku_in_range(days, sku=None):
         if not rows_out:
             return f"No data for {sku}.", 'snapshot-diff', [], []
         r = rows_out[0]
+        if r.get('clipped'):
+            return (
+                f"Our SOD ingest only covers data starting after the requested "
+                f"window's start date, so a real diff for {r['product_name']} over "
+                f"the last {days} days isn't possible from stored data alone. "
+                f"Upload a historical SOD inventory ZIP via /sod-compare to get "
+                f"a truthful comparison."
+            ), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
         if r['total_new'] == 0:
             return (
                 f"Last {days} days for {r['product_name']}: 0 new stores added "
@@ -12451,22 +12865,30 @@ def _new_listings_per_sku_in_range(days, sku=None):
             ), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
         parts = [
             f"Last {days} days for {r['product_name']}: {r['total_new']} new store-listings "
-            f"({r['sod_new']} confirmed by SOD, {r['lcbo_only_new']} caught only on lcbo.com)."
+            f"({r['sod_new']} confirmed by SOD, {r['lcbo_only_new']} caught only on lcbo.com). "
+            f"Snapshot comparison: {r['start_snap']} → {r['end_snap']}."
         ]
         if r['lcbo_only_new']:
             parts.append(f"The {r['lcbo_only_new']} lcbo.com-only finds are potential commission claims SOD missed.")
-        parts.append(f"Snapshot comparison: {r['start_snap']} → {r['end_snap']}.")
         return ' '.join(parts), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
 
     # Portfolio-wide
+    clipped_skus = sum(1 for r in rows_out if r.get('clipped'))
     parts = [
         f"Last {days} days: {total_new} new store-listings won across the portfolio."
     ]
+    if clipped_skus:
+        parts.append(
+            f"⚠ {clipped_skus} SKU(s) couldn't be compared because the requested window "
+            f"predates our SOD history — upload a historical SOD ZIP via /sod-compare to "
+            f"get a real diff for those."
+        )
     if total_lcbo_only:
         parts.append(f"{total_lcbo_only} of those were caught only on lcbo.com (SOD missed) — potential commission claims.")
     if rows_out:
-        leader = rows_out[0]
-        if leader['total_new'] > 0:
+        non_clipped = [r for r in rows_out if not r.get('clipped')]
+        if non_clipped and non_clipped[0]['total_new'] > 0:
+            leader = non_clipped[0]
             parts.append(f"Top performer: {leader['product_name']} with {leader['total_new']} new stores.")
     parts.append(f"Run /new-listings page for the per-store breakdown.")
     return ' '.join(parts), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
