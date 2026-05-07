@@ -8018,6 +8018,445 @@ def api_admin_new_listings_by_range():
     })
 
 
+# ───────────────────────────────────────────────────────────────────────
+# HIDDEN LISTINGS DETECTOR — finds 4 patterns of sneaky disappearance:
+#
+#   1. GHOST listings:    Listed in a recent past snapshot, NOT in latest
+#                         snapshot, AND no DELISTED event was recorded.
+#                         (= row vanished without leaving a trail)
+#
+#   2. HIDDEN INVENTORY:  SOD says non-L (Delisted/Fully Delisted/absent)
+#                         BUT lcbo.com sees qty>0 in last 48h, OR rep saw
+#                         on shelf in last 7 days.
+#                         (= the bottle is on shelf, SOD won't pay us for it)
+#
+#   3. FLICKER:           Same (sku, store) flipped status 3+ times in last
+#                         30 days. Real listings don't flicker — this is
+#                         either bad data or deliberate obscuring.
+#
+#   4. MASS-DELIST:       A snapshot day where listed-count dropped >10%
+#                         vs prior day for any SKU. Suspicious — real
+#                         delistings happen 1-2 stores at a time.
+#
+# This is the headline anti-fraud audit. Output is "every store-SKU pair
+# that looks like the listing was hidden, with evidence."
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/hidden-listings', methods=['GET'])
+def api_admin_hidden_listings():
+    """Detect listings hidden in SOD via 4 distinct patterns.
+
+    Query params:
+      sku=<7-digit>      filter to one SKU (optional)
+      lookback_days=90   how far back to look for past snapshots (default 90)
+      flicker_min=3      min status changes to count as flicker (default 3)
+      mass_delist_pct=10 day-over-day drop threshold (default 10%)
+      lcbo_window_h=72   lcbo.com inventory window for hidden-inventory check
+    """
+    try:
+        lookback_days = max(7, min(int(request.args.get('lookback_days', '90')), 365))
+        flicker_min = max(2, min(int(request.args.get('flicker_min', '3')), 20))
+        mass_delist_pct = max(1, min(int(request.args.get('mass_delist_pct', '10')), 100))
+        lcbo_window_h = max(1, min(int(request.args.get('lcbo_window_h', '72')), 720))
+    except ValueError:
+        return jsonify({'error': 'numeric params must be integers'}), 400
+
+    sku_filter = (request.args.get('sku') or '').strip()
+    skus_to_audit = (
+        [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
+        else list(SOD_TRACKED_SKUS.keys())
+    )
+
+    db = get_db()
+    output = {
+        'ghost_listings': [],
+        'hidden_inventory': [],
+        'flicker_patterns': [],
+        'mass_delist_days': [],
+    }
+    summary = {
+        'total_ghost': 0,
+        'total_hidden_inventory': 0,
+        'total_flicker': 0,
+        'total_mass_delist_events': 0,
+    }
+
+    for sku in skus_to_audit:
+        brand, name = SOD_TRACKED_SKUS[sku]
+        sku_clean = sku.lstrip('0')
+
+        # ── PATTERN 1: GHOST LISTINGS ──────────────────────────────────
+        # Stores that were Listed at some point in the lookback window
+        # but are NOT in the latest snapshot AND have no DELISTED change
+        # event recorded. The row just vanished.
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (sku,))
+                latest = cur.fetchone()[0]
+            else:
+                latest = cur.execute(
+                    "SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=?", (sku,)
+                ).fetchone()[0]
+            if not latest:
+                continue
+
+            # Stores in latest snapshot
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT store_number FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date=%s",
+                    (sku, latest))
+                latest_stores = {int(r[0]) for r in cur.fetchall()}
+                cur.execute(
+                    "SELECT DISTINCT store_number FROM sod_inventory "
+                    "WHERE sku=%s AND status='L' "
+                    "  AND snapshot_date >= %s::date - (INTERVAL '1 day' * %s)",
+                    (sku, latest, lookback_days))
+                ever_listed = {int(r[0]) for r in cur.fetchall()}
+                cur.execute(
+                    "SELECT DISTINCT store_number FROM sod_listing_changes "
+                    "WHERE sku=%s AND change_type IN ('DELISTED','FULLY_DELISTED') "
+                    "  AND change_date >= %s::date - (INTERVAL '1 day' * %s) "
+                    "  AND store_number IS NOT NULL",
+                    (sku, latest, lookback_days))
+                had_delist_event = {int(r[0]) for r in cur.fetchall()}
+            else:
+                latest_stores = {
+                    int(r[0]) for r in cur.execute(
+                        "SELECT store_number FROM sod_inventory "
+                        "WHERE sku=? AND snapshot_date=?",
+                        (sku, latest)).fetchall()
+                }
+                ever_listed = {
+                    int(r[0]) for r in cur.execute(
+                        "SELECT DISTINCT store_number FROM sod_inventory "
+                        "WHERE sku=? AND status='L' "
+                        "  AND snapshot_date >= date(?, ? || ' days')",
+                        (sku, latest, f'-{lookback_days}')).fetchall()
+                }
+                had_delist_event = {
+                    int(r[0]) for r in cur.execute(
+                        "SELECT DISTINCT store_number FROM sod_listing_changes "
+                        "WHERE sku=? AND change_type IN ('DELISTED','FULLY_DELISTED') "
+                        "  AND change_date >= date(?, ? || ' days') "
+                        "  AND store_number IS NOT NULL",
+                        (sku, latest, f'-{lookback_days}')).fetchall()
+                }
+
+            # GHOST = ever-listed AND not-in-latest-snapshot AND no-delist-event
+            ghosts = (ever_listed - latest_stores) - had_delist_event
+            for sn in sorted(ghosts):
+                # Find when this store was last seen as Listed
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT MAX(snapshot_date)::text FROM sod_inventory "
+                        "WHERE sku=%s AND store_number=%s AND status='L'",
+                        (sku, sn))
+                    last_listed = cur.fetchone()[0]
+                else:
+                    last_listed = cur.execute(
+                        "SELECT MAX(snapshot_date) FROM sod_inventory "
+                        "WHERE sku=? AND store_number=? AND status='L'",
+                        (sku, sn)).fetchone()[0]
+                output['ghost_listings'].append({
+                    'sku': sku,
+                    'product_name': name,
+                    'brand': brand,
+                    'store_number': sn,
+                    'last_listed_date': str(last_listed) if last_listed else None,
+                    'days_since_last_listed': (
+                        (latest - last_listed).days
+                        if last_listed and hasattr(latest, '__sub__') else None
+                    ),
+                    'pattern': 'ghost',
+                    'evidence': 'Listed in past snapshot but absent from latest with no DELISTED event.',
+                })
+            summary['total_ghost'] += len(ghosts)
+            if USE_POSTGRES: cur.close()
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[hidden] ghost-detect failed for {sku}: {e}")
+
+        # ── PATTERN 2: HIDDEN INVENTORY ────────────────────────────────
+        # SOD says non-L (D/F/absent) at latest snapshot, BUT lcbo.com
+        # saw qty>0 in last lcbo_window_h hours, OR rep observed on shelf.
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            # SOD-listed at latest
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT store_number, status FROM sod_inventory "
+                    "WHERE sku=%s AND snapshot_date=%s",
+                    (sku, latest))
+                sod_at_latest = {int(r[0]): r[1] for r in cur.fetchall()}
+            else:
+                sod_at_latest = {
+                    int(r[0]): r[1] for r in cur.execute(
+                        "SELECT store_number, status FROM sod_inventory "
+                        "WHERE sku=? AND snapshot_date=?",
+                        (sku, latest)).fetchall()
+                }
+            # lcbo.com saw qty>0 within window
+            lcbo_inventory = {}  # store_num -> (qty, recorded_at)
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT id FROM products WHERE lcbo_sku=%s LIMIT 1", (sku_clean,))
+                prow = cur.fetchone()
+                pid = prow[0] if prow else None
+                if pid:
+                    cur.execute(
+                        "SELECT store_number, MAX(quantity), MAX(recorded_at)::text "
+                        "FROM inventory_history "
+                        "WHERE product_id=%s AND quantity>0 "
+                        "  AND store_number <> 'SUMMARY' "
+                        "  AND recorded_at >= NOW() - (INTERVAL '1 hour' * %s) "
+                        "GROUP BY store_number",
+                        (pid, lcbo_window_h))
+                    for r in cur.fetchall():
+                        try:
+                            lcbo_inventory[int(r[0])] = (int(r[1] or 0), r[2])
+                        except (ValueError, TypeError):
+                            continue
+            else:
+                prow = cur.execute(
+                    "SELECT id FROM products WHERE lcbo_sku=? LIMIT 1",
+                    (sku_clean,)).fetchone()
+                pid = prow[0] if prow else None
+                if pid:
+                    for r in cur.execute(
+                        "SELECT store_number, MAX(quantity), MAX(recorded_at) "
+                        "FROM inventory_history "
+                        "WHERE product_id=? AND quantity>0 "
+                        "  AND store_number <> 'SUMMARY' "
+                        "  AND recorded_at >= datetime('now', ? || ' hours') "
+                        "GROUP BY store_number",
+                        (pid, f'-{lcbo_window_h}')).fetchall():
+                        try:
+                            lcbo_inventory[int(r[0])] = (int(r[1] or 0), r[2])
+                        except (ValueError, TypeError):
+                            continue
+
+            # Rep observations within last 7 days
+            rep_seen = {}
+            try:
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number, MAX(observed_at)::text, MAX(rep) "
+                        "FROM rep_listing_observations "
+                        "WHERE sku=%s AND on_shelf=TRUE "
+                        "  AND observed_at >= NOW() - INTERVAL '7 days' "
+                        "GROUP BY store_number",
+                        (sku,))
+                    for r in cur.fetchall():
+                        try:
+                            rep_seen[int(r[0])] = (r[1], r[2])
+                        except (ValueError, TypeError):
+                            continue
+                else:
+                    for r in cur.execute(
+                        "SELECT store_number, MAX(observed_at), MAX(rep) "
+                        "FROM rep_listing_observations "
+                        "WHERE sku=? AND on_shelf=1 "
+                        "  AND observed_at >= datetime('now','-7 days') "
+                        "GROUP BY store_number",
+                        (sku,)).fetchall():
+                        try:
+                            rep_seen[int(r[0])] = (r[1], r[2])
+                        except (ValueError, TypeError):
+                            continue
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+
+            # Hidden inventory: any store where (lcbo OR rep) shows on shelf
+            # AND SOD's status is non-L (or absent)
+            for sn in sorted(set(lcbo_inventory.keys()) | set(rep_seen.keys())):
+                sod_status = sod_at_latest.get(sn)
+                if sod_status == 'L':
+                    continue  # not hidden
+                lcbo_data = lcbo_inventory.get(sn)
+                rep_data = rep_seen.get(sn)
+                if not (lcbo_data or rep_data):
+                    continue
+                output['hidden_inventory'].append({
+                    'sku': sku,
+                    'product_name': name,
+                    'brand': brand,
+                    'store_number': sn,
+                    'sod_status': sod_status or 'absent',
+                    'lcbo_units': lcbo_data[0] if lcbo_data else 0,
+                    'lcbo_seen_at': lcbo_data[1] if lcbo_data else None,
+                    'rep_observed_at': rep_data[0] if rep_data else None,
+                    'rep_observed_by': rep_data[1] if rep_data else None,
+                    'pattern': 'hidden_inventory',
+                    'evidence': (
+                        f"lcbo.com {lcbo_data[0]} units "
+                        if lcbo_data else ''
+                    ) + (
+                        f"+ rep saw shelf "
+                        if rep_data else ''
+                    ) + (
+                        f"but SOD shows status={sod_status or 'absent'}."
+                    ),
+                })
+            summary['total_hidden_inventory'] += sum(
+                1 for h in output['hidden_inventory'] if h['sku'] == sku)
+            if USE_POSTGRES: cur.close()
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[hidden] hidden-inventory-detect failed for {sku}: {e}")
+
+        # ── PATTERN 3: FLICKER ─────────────────────────────────────────
+        # Same (sku, store) flipped status flicker_min+ times in last 30 days.
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT store_number, COUNT(*)::int AS flips, "
+                    "       MIN(change_date)::text AS first_flip, "
+                    "       MAX(change_date)::text AS last_flip, "
+                    "       string_agg(change_type, ',' ORDER BY change_date) AS sequence "
+                    "FROM sod_listing_changes "
+                    "WHERE sku=%s AND store_number IS NOT NULL "
+                    "  AND change_date >= CURRENT_DATE - INTERVAL '30 days' "
+                    "  AND change_type IN ('NEW_LISTING','DELISTED','RELISTED','STATUS_FLIP') "
+                    "GROUP BY store_number "
+                    "HAVING COUNT(*) >= %s "
+                    "ORDER BY COUNT(*) DESC LIMIT 50",
+                    (sku, flicker_min))
+                for r in cur.fetchall():
+                    output['flicker_patterns'].append({
+                        'sku': sku,
+                        'product_name': name,
+                        'brand': brand,
+                        'store_number': int(r[0]),
+                        'flip_count': int(r[1]),
+                        'first_flip_date': r[2],
+                        'last_flip_date': r[3],
+                        'sequence': r[4],
+                        'pattern': 'flicker',
+                        'evidence': f"Status flipped {r[1]} times in 30 days: {r[4]}",
+                    })
+                cur.close()
+            else:
+                for r in cur.execute(
+                    "SELECT store_number, COUNT(*) AS flips, "
+                    "       MIN(change_date) AS first_flip, "
+                    "       MAX(change_date) AS last_flip "
+                    "FROM sod_listing_changes "
+                    "WHERE sku=? AND store_number IS NOT NULL "
+                    "  AND change_date >= date('now','-30 days') "
+                    "  AND change_type IN ('NEW_LISTING','DELISTED','RELISTED','STATUS_FLIP') "
+                    "GROUP BY store_number "
+                    "HAVING COUNT(*) >= ? "
+                    "ORDER BY COUNT(*) DESC LIMIT 50",
+                    (sku, flicker_min)).fetchall():
+                    output['flicker_patterns'].append({
+                        'sku': sku, 'product_name': name, 'brand': brand,
+                        'store_number': int(r[0]),
+                        'flip_count': int(r[1]),
+                        'first_flip_date': str(r[2]),
+                        'last_flip_date': str(r[3]),
+                        'sequence': '',
+                        'pattern': 'flicker',
+                        'evidence': f"Status flipped {r[1]} times in 30 days",
+                    })
+            summary['total_flicker'] += sum(
+                1 for f in output['flicker_patterns'] if f['sku'] == sku)
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[hidden] flicker-detect failed for {sku}: {e}")
+
+        # ── PATTERN 4: MASS-DELIST DAYS ────────────────────────────────
+        # Find snapshot days where listed-count dropped >mass_delist_pct%
+        # day-over-day. Real delistings are 1-2 stores at a time.
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "WITH daily AS ( "
+                    "  SELECT snapshot_date, "
+                    "         COUNT(*) FILTER (WHERE status='L')::int AS listed_count "
+                    "  FROM sod_inventory WHERE sku=%s "
+                    "  GROUP BY snapshot_date "
+                    "  ORDER BY snapshot_date "
+                    "), windowed AS ( "
+                    "  SELECT snapshot_date, listed_count, "
+                    "         LAG(listed_count) OVER (ORDER BY snapshot_date) AS prev_count "
+                    "  FROM daily "
+                    ") "
+                    "SELECT snapshot_date::text, listed_count, prev_count, "
+                    "       (prev_count - listed_count) AS drop_count "
+                    "FROM windowed "
+                    "WHERE prev_count IS NOT NULL "
+                    "  AND prev_count > 0 "
+                    "  AND ((prev_count - listed_count)::float / prev_count) * 100 >= %s "
+                    "  AND snapshot_date >= CURRENT_DATE - (INTERVAL '1 day' * %s) "
+                    "ORDER BY snapshot_date DESC LIMIT 20",
+                    (sku, mass_delist_pct, lookback_days))
+                rows = cur.fetchall()
+                for r in rows:
+                    drop = int(r[3] or 0)
+                    pct = round(drop / r[2] * 100, 1) if r[2] else 0
+                    output['mass_delist_days'].append({
+                        'sku': sku,
+                        'product_name': name,
+                        'brand': brand,
+                        'snapshot_date': r[0],
+                        'listed_count': int(r[1] or 0),
+                        'prev_count': int(r[2] or 0),
+                        'drop_count': drop,
+                        'drop_pct': pct,
+                        'pattern': 'mass_delist',
+                        'evidence': (
+                            f"{drop} stores dropped from L between snapshots "
+                            f"({r[2]} → {r[1]}, -{pct}%)."
+                        ),
+                    })
+                summary['total_mass_delist_events'] += len(rows)
+                cur.close()
+            # sqlite path omitted — feature is for prod
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[hidden] mass-delist-detect failed for {sku}: {e}")
+
+    # Sort each section by recency / severity
+    output['ghost_listings'].sort(
+        key=lambda x: x.get('last_listed_date') or '', reverse=True)
+    output['hidden_inventory'].sort(
+        key=lambda x: -(x.get('lcbo_units') or 0))
+    output['flicker_patterns'].sort(
+        key=lambda x: -x.get('flip_count', 0))
+    output['mass_delist_days'].sort(
+        key=lambda x: x.get('snapshot_date') or '', reverse=True)
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'params': {
+            'lookback_days': lookback_days,
+            'flicker_min': flicker_min,
+            'mass_delist_pct': mass_delist_pct,
+            'lcbo_window_h': lcbo_window_h,
+            'sku_filter': sku_filter or None,
+        },
+        'summary': summary,
+        'patterns': output,
+        'how_to_read': (
+            "GHOST = was Listed, vanished from snapshots without a DELISTED event. "
+            "HIDDEN INVENTORY = lcbo.com or a rep saw stock on shelf, but SOD says "
+            "we're not Listed (this is the strongest evidence of intentional hiding). "
+            "FLICKER = same store-SKU flipped status 3+ times in 30 days "
+            "(unusual for real listings). "
+            "MASS-DELIST = a snapshot day where >10% of our listings dropped at once. "
+            "Together these surface every documented disappearance pattern."
+        ),
+    })
+
+
 @app.route('/api/admin/movement', methods=['GET'])
 def api_admin_movement():
     """Authoritative store + listing movement counts in a date range.
@@ -12033,6 +12472,139 @@ def _new_listings_per_sku_in_range(days, sku=None):
     return ' '.join(parts), 'snapshot-diff', rows_out, ['sku', 'product_name', 'sod_new', 'lcbo_only_new', 'total_new']
 
 
+def _summarize_hidden_listings(sku=None):
+    """Plain-English count of suspicious listing patterns.
+
+    Calls the same logic as /api/admin/hidden-listings — just summarizes.
+    """
+    db = get_db()
+    skus = [sku] if (sku and sku in SOD_TRACKED_SKUS) else list(SOD_TRACKED_SKUS.keys())
+
+    ghost_count = 0
+    hidden_count = 0
+    flicker_count = 0
+    mass_delist_count = 0
+    leader_sku = None
+    leader_name = None
+    leader_total = 0
+
+    for s in skus:
+        per_sku_total = 0
+        # Reuse a tiny version of the same logic — 4 cheap counts
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                # Latest snapshot
+                cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku=%s", (s,))
+                latest = cur.fetchone()[0]
+                if not latest:
+                    continue
+                # Ghosts: ever-listed - latest_stores - delist_events
+                cur.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT DISTINCT store_number FROM sod_inventory "
+                    "  WHERE sku=%s AND status='L' "
+                    "    AND snapshot_date >= %s::date - INTERVAL '90 days' "
+                    "  EXCEPT "
+                    "  SELECT store_number FROM sod_inventory "
+                    "  WHERE sku=%s AND snapshot_date=%s "
+                    "  EXCEPT "
+                    "  SELECT DISTINCT store_number FROM sod_listing_changes "
+                    "  WHERE sku=%s AND change_type IN ('DELISTED','FULLY_DELISTED') "
+                    "    AND store_number IS NOT NULL"
+                    ") g",
+                    (s, latest, s, latest, s))
+                g = int(cur.fetchone()[0] or 0)
+                # Hidden inventory: SOD non-L AND lcbo qty>0 within 72h
+                cur.execute(
+                    "SELECT COUNT(DISTINCT ih.store_number) "
+                    "FROM inventory_history ih "
+                    "JOIN products p ON p.id = ih.product_id "
+                    "WHERE p.lcbo_sku = %s "
+                    "  AND ih.quantity > 0 "
+                    "  AND ih.store_number <> 'SUMMARY' "
+                    "  AND ih.recorded_at >= NOW() - INTERVAL '72 hours' "
+                    "  AND NOT EXISTS ( "
+                    "    SELECT 1 FROM sod_inventory si "
+                    "    WHERE si.sku=%s AND si.snapshot_date=%s "
+                    "      AND si.status='L' "
+                    "      AND si.store_number = NULLIF(ih.store_number,'')::int "
+                    "  )",
+                    (s.lstrip('0'), s, latest))
+                h = int(cur.fetchone()[0] or 0)
+                # Flicker: 3+ changes in 30 days per store
+                cur.execute(
+                    "SELECT COUNT(*) FROM ( "
+                    "  SELECT store_number FROM sod_listing_changes "
+                    "  WHERE sku=%s AND store_number IS NOT NULL "
+                    "    AND change_date >= CURRENT_DATE - INTERVAL '30 days' "
+                    "    AND change_type IN ('NEW_LISTING','DELISTED','RELISTED','STATUS_FLIP') "
+                    "  GROUP BY store_number HAVING COUNT(*) >= 3 "
+                    ") f",
+                    (s,))
+                fl = int(cur.fetchone()[0] or 0)
+                # Mass-delist: days where listed count dropped >10%
+                cur.execute(
+                    "WITH daily AS ( "
+                    "  SELECT snapshot_date, COUNT(*) FILTER (WHERE status='L')::int AS lc "
+                    "  FROM sod_inventory WHERE sku=%s GROUP BY snapshot_date "
+                    "), w AS ( SELECT snapshot_date, lc, "
+                    "         LAG(lc) OVER (ORDER BY snapshot_date) AS prev FROM daily) "
+                    "SELECT COUNT(*) FROM w "
+                    "WHERE prev IS NOT NULL AND prev > 0 "
+                    "  AND ((prev - lc)::float / prev) * 100 >= 10 "
+                    "  AND snapshot_date >= CURRENT_DATE - INTERVAL '90 days'",
+                    (s,))
+                md = int(cur.fetchone()[0] or 0)
+                cur.close()
+            else:
+                g = h = fl = md = 0
+            ghost_count += g
+            hidden_count += h
+            flicker_count += fl
+            mass_delist_count += md
+            per_sku_total = g + h + fl + md
+            if per_sku_total > leader_total:
+                leader_total = per_sku_total
+                leader_sku = s
+                _, leader_name = SOD_TRACKED_SKUS.get(s, ('', s))
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+    total = ghost_count + hidden_count + flicker_count + mass_delist_count
+    if sku:
+        _, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+        if total == 0:
+            return (
+                f"No hidden-listing patterns detected for {name}. "
+                f"SOD looks clean across the 4 audit checks (ghost / hidden inventory / flicker / mass-delist)."
+            ), 'hidden-listings', [], []
+        parts = [f"{name} suspicious patterns:"]
+        if ghost_count: parts.append(f"{ghost_count} ghost listings (vanished without DELISTED event).")
+        if hidden_count: parts.append(f"{hidden_count} hidden-inventory (lcbo.com sees stock, SOD says no).")
+        if flicker_count: parts.append(f"{flicker_count} flicker patterns (status flipped 3+ times in 30d).")
+        if mass_delist_count: parts.append(f"{mass_delist_count} mass-delist days (>10% drop in one day).")
+        return ' '.join(parts), 'hidden-listings', [], []
+
+    if total == 0:
+        return (
+            "No hidden-listing patterns detected across the portfolio. "
+            "All 4 audit checks (ghost / hidden inventory / flicker / mass-delist) clean."
+        ), 'hidden-listings', [], []
+    parts = [
+        f"Hidden-listing audit found {total} suspicious patterns across the portfolio:"
+    ]
+    if ghost_count: parts.append(f"{ghost_count} ghosts (Listed then vanished without DELISTED event).")
+    if hidden_count: parts.append(f"{hidden_count} hidden-inventory (lcbo.com confirms stock, SOD says no).")
+    if flicker_count: parts.append(f"{flicker_count} flickers (status whipsawing 3+ times in 30 days).")
+    if mass_delist_count: parts.append(f"{mass_delist_count} mass-delist events (>10% drop in one day).")
+    if leader_sku and leader_total:
+        parts.append(f"Worst offender: {leader_name} with {leader_total} flagged.")
+    parts.append("Open /hidden-listings for the per-store evidence.")
+    return ' '.join(parts), 'hidden-listings', [], []
+
+
 def _summarize_source_drift():
     """Plain-English breakdown of where SOD and lcbo.com disagree."""
     db = get_db()
@@ -12120,12 +12692,23 @@ def _free_answer(question):
         or ('how many' in ql and 'store' in ql and not sku)
     )
 
+    # Priority 0-pre: hidden-listings audit — "any hidden listings", "ghost
+    # listings", "what is being hidden", "suspicious listings", "fraud"
+    is_hidden_audit = (
+        'hidden' in ql or 'ghost' in ql or 'sneaky' in ql or 'fraud' in ql
+        or 'suspicious' in ql or 'flicker' in ql or 'mass delist' in ql
+        or ('disappear' in ql and ('listing' in ql or 'store' in ql))
+        or ('vanish' in ql)
+    )
+    if is_hidden_audit:
+        return _summarize_hidden_listings(sku)
+
     # Priority 0a: source-drift / data-quality question — "where does SOD disagree"
     is_drift = (
         'drift' in ql or 'disagree' in ql or 'mismatch' in ql
         or 'source' in ql and ('compare' in ql or 'difference' in ql)
         or 'sod vs' in ql or 'lcbo vs' in ql
-        or 'where' in ql and ('hidden' in ql or 'missing' in ql or 'differ' in ql)
+        or 'where' in ql and 'differ' in ql
     )
     if is_drift:
         return _summarize_source_drift()
@@ -12193,8 +12776,9 @@ _FREE_ANSWER_HELP = (
     "'Summarize store 217', 'How many stores list Chak De in Toronto?', "
     "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary', "
     "'How many LCBO stores are there?', 'New listings last 7 days', "
+    "'New stores added for Red Admiral last 60 days', "
     "'Any new stores added this month?', 'Where does SOD disagree with lcbo.com?', "
-    "'Source drift report'."
+    "'Source drift report', 'Any hidden listings?', 'Ghost listings for Red Admiral?'."
 )
 
 
