@@ -3300,13 +3300,61 @@ class SODClient:
             'candidates_scanned': len(candidates),
         }
         if debug:
-            # Trim discovery log to keep response small
             out['discovery_log'] = discovery_log[:80]
-            # Sample anchors from /subscribers so the operator can see what's there
-            sample = (page_anchors.get(f'{SOD_BASE}/subscribers') or [])[:40]
+            sample = (page_anchors.get(f'{SOD_BASE}/subscribers') or [])[:60]
             out['sample_subscribers_anchors'] = [
                 {'href': h, 'text': t} for h, t in sample
             ]
+            # Dump structural elements so we can see how categories are rendered
+            try:
+                r = self.session.get(f'{SOD_BASE}/subscribers', timeout=self.timeout)
+                if r.status_code == 200:
+                    html = r.text or ''
+                    out['subscribers_html_len'] = len(html)
+                    # Forms (might be the navigation mechanism)
+                    forms = _re.findall(
+                        r'<form[^>]*action="([^"]+)"[^>]*>',
+                        html, _re.IGNORECASE,
+                    )[:20]
+                    out['forms'] = forms
+                    # Selects + options (might be category dropdown)
+                    selects = []
+                    for sm in _re.finditer(r'<select[^>]*>(.*?)</select>',
+                                           html, _re.DOTALL | _re.IGNORECASE):
+                        opts = _re.findall(
+                            r'<option[^>]*value="([^"]*)"[^>]*>([^<]+)</option>',
+                            sm.group(1), _re.IGNORECASE,
+                        )
+                        if opts:
+                            selects.append(opts[:30])
+                    out['selects'] = selects
+                    # Look for tables — categories may be rendered as table rows
+                    table_rows = _re.findall(
+                        r'<tr[^>]*>(.*?)</tr>',
+                        html, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    # Strip tags, keep text — first 30 rows
+                    out['table_rows_sample'] = []
+                    for row in table_rows[:30]:
+                        txt = _re.sub(r'<[^>]+>', ' | ', row)
+                        txt = ' '.join(txt.split())
+                        if txt and len(txt) > 5:
+                            out['table_rows_sample'].append(txt[:200])
+                    # First 4KB of <body> content (raw, for visual inspection)
+                    body_m = _re.search(
+                        r'<body[^>]*>(.*?)</body>',
+                        html, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    if body_m:
+                        body = body_m.group(1)
+                        # Strip <head>-ish noise
+                        body = _re.sub(r'<script.*?</script>', '', body,
+                                       flags=_re.DOTALL | _re.IGNORECASE)
+                        body = _re.sub(r'<style.*?</style>', '', body,
+                                       flags=_re.DOTALL | _re.IGNORECASE)
+                        out['body_first_4k'] = body[:4000]
+            except Exception as e:
+                out['debug_error'] = str(e)
         return out
 
     def download_url(self, full_url):
