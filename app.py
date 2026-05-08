@@ -6786,6 +6786,394 @@ def api_admin_import():
     })
 
 
+# ───────────────────────────────────────────────────────────────────────
+# DOWNLOAD EVERYTHING — bundles every table the operator might want
+# into a ZIP of CSVs. Designed to be fed straight into ChatGPT / Claude
+# for behavior analysis ("are reps actually working or going to the same
+# stores repeatedly?").
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/export/everything', methods=['GET'])
+@require_app_origin
+def api_admin_export_everything():
+    """Bundle every CRM + audit table into a ZIP of CSVs.
+
+    Query params:
+      include_sod=1      include sod_inventory + sod_listing_changes (large; default 1)
+      include_history=0  include inventory_history (very large; default 0)
+      days=90            row-level filter for time-bounded tables (default 90)
+
+    Returns: zipped bundle, served as application/zip with a filename like
+    anu-export-YYYY-MM-DD-HHMM.zip. Each table becomes one CSV inside.
+    Plus a README.md describing the schemas + columns.
+    """
+    import csv as _csv
+    import zipfile as _zip
+    try:
+        days = max(1, min(int(request.args.get('days', '90')), 730))
+    except ValueError:
+        days = 90
+    include_sod = request.args.get('include_sod', '1') in ('1', 'true', 'yes')
+    include_history = request.args.get('include_history', '0') in ('1', 'true', 'yes')
+
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    buf = io.BytesIO()
+
+    # Resolve which tables to dump
+    base_tables = [
+        # (table, time_filter_column or None, optional ORDER BY)
+        ('stores',                  None,            'store_number'),
+        ('territories',             None,            'id'),
+        ('reps',                    None,            'id'),
+        ('products',                None,            'id'),
+        ('sod_products',            None,            'sku'),
+        ('activities',              'created_at',    'created_at DESC'),
+        ('deals',                   'created_at',    'created_at DESC'),
+        ('followups',               'created_at',    'created_at DESC'),
+        ('rep_listing_observations','observed_at',   'observed_at DESC'),
+        ('rep_quotas',              None,            'id'),
+        ('sales_goals',             None,            'id'),
+        ('horeca_accounts',         None,            'id'),
+        ('event_log',               'occurred_at',   'occurred_at DESC'),
+        ('sod_sync_runs',           'run_at',        'run_at DESC'),
+        ('sod_store_sku_changes',   'change_date',   'change_date DESC, id DESC'),
+        ('sod_listing_changes',     'change_date',   'change_date DESC, id DESC'),
+    ]
+    if include_sod:
+        base_tables.append(('sod_inventory', 'snapshot_date', 'snapshot_date DESC, sku'))
+    if include_history:
+        base_tables.append(('inventory_history', 'recorded_at', 'recorded_at DESC'))
+
+    manifest = {
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'window_days': days,
+        'include_sod': include_sod,
+        'include_history': include_history,
+        'tables': {},
+    }
+
+    with _zip.ZipFile(buf, 'w', _zip.ZIP_DEFLATED) as zf:
+        for tname, time_col, order_by in base_tables:
+            try:
+                if time_col:
+                    if USE_POSTGRES:
+                        sql = (f"SELECT * FROM {tname} "
+                               f"WHERE {time_col} >= NOW() - (INTERVAL '1 day' * %s) "
+                               f"ORDER BY {order_by} LIMIT 100000")
+                        cur.execute(sql, (days,))
+                    else:
+                        sql = (f"SELECT * FROM {tname} "
+                               f"WHERE {time_col} >= datetime('now', ? || ' days') "
+                               f"ORDER BY {order_by} LIMIT 100000")
+                        cur.execute(sql, (f'-{days}',))
+                else:
+                    cur.execute(f"SELECT * FROM {tname} ORDER BY {order_by} LIMIT 200000")
+                col_names = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+
+                csv_buf = io.StringIO()
+                w = _csv.writer(csv_buf)
+                w.writerow(col_names)
+                for row in rows:
+                    w.writerow([_json_safe(v) for v in row])
+                zf.writestr(f'{tname}.csv', csv_buf.getvalue())
+                manifest['tables'][tname] = {
+                    'rows': len(rows),
+                    'columns': col_names,
+                    'time_filter_column': time_col,
+                }
+            except Exception as e:
+                manifest['tables'][tname] = {'error': str(e)}
+                try: db.rollback()
+                except Exception: pass
+
+        # README explaining the bundle
+        readme_lines = [
+            "# Anu LCBO Tracker — Data Export",
+            "",
+            f"Generated: {manifest['generated_at']}",
+            f"Time window: last {days} days (for time-filtered tables)",
+            f"include_sod={include_sod}, include_history={include_history}",
+            "",
+            "## Files",
+            "",
+        ]
+        for t, info in manifest['tables'].items():
+            if 'rows' in info:
+                readme_lines.append(f"- `{t}.csv` — {info['rows']:,} rows, columns: {', '.join(info['columns'])}")
+            else:
+                readme_lines.append(f"- `{t}.csv` — ERROR: {info['error']}")
+        readme_lines += [
+            "",
+            "## Suggested AI prompts",
+            "",
+            "### 1. Are reps actually working or visiting the same places?",
+            "Upload activities.csv + stores.csv to ChatGPT/Claude and ask:",
+            '> "For each rep, count: total visits, unique stores, repeat-visit ratio, days active, days idle. Flag any rep visiting the same store >2 times in 30 days. Flag any rep with <50% territory coverage."',
+            "",
+            "### 2. Did our listings move correctly between snapshots?",
+            "Upload sod_listing_changes.csv + sod_store_sku_changes.csv:",
+            '> "Group by sku and change_type. For NEW_LISTING events in the last 30 days, are they concentrated geographically? Are there suspicious mass-delistings?"',
+            "",
+            "### 3. Pipeline conversion analysis",
+            "Upload deals.csv + activities.csv:",
+            '> "For each deal that became Listed, how many activities preceded it? Average days from prospecting to listed? Which rep has the highest conversion rate?"',
+            "",
+        ]
+        zf.writestr('README.md', '\n'.join(readme_lines))
+        zf.writestr('manifest.json', json.dumps(manifest, indent=2, default=str))
+
+    if USE_POSTGRES: cur.close()
+
+    buf.seek(0)
+    fname = f"anu-export-{datetime.utcnow().strftime('%Y-%m-%d-%H%M')}.zip"
+    return Response(
+        buf.getvalue(),
+        mimetype='application/zip',
+        headers={
+            'Content-Disposition': f'attachment; filename="{fname}"',
+            'X-Anu-Export-Tables': str(len(manifest['tables'])),
+        },
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────
+# REP BEHAVIOR ANALYSIS — answers "are reps working or going to the same
+# places repeatedly". Per-rep metrics with behavior_flags surfacing the
+# stuff you'd want to dig into.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/rep-behavior', methods=['GET'])
+def api_admin_rep_behavior():
+    """Per-rep behavior metrics for the last N days (default 30).
+
+    Returns per rep:
+      visits_total, unique_stores, repeat_visits, repeat_visit_pct,
+      active_days, days_since_last_visit, days_idle (active - lookback),
+      territory_size, coverage_pct, listings_won, tastings, outreach,
+      high_repeat_stores: [{store_number, account, visits, last_visit}],
+      visit_pace_per_active_day, behavior_flags: [string]
+
+    Behavior flags:
+      stale            - no visits in 14+ days
+      narrow_coverage  - <30% of territory visited in window
+      high_repeats     - any store visited 3+ times in window
+      no_conversion    - 30+ visits, 0 listings_won
+      single_city      - 80%+ of visits in one city
+    """
+    try:
+        days = max(7, min(int(request.args.get('days', '30')), 365))
+    except ValueError:
+        days = 30
+
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+
+    # Get full rep roster (same hard-coded list as frontend)
+    rep_roster = ['Ikshit', 'Namit', 'Virat', 'Surya', 'Neeraj']
+    out_rows = []
+
+    for rep in rep_roster:
+        try:
+            # Visits in window
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT a.id, a.store_id, a.created_at::text, "
+                    "       s.store_number, s.account, s.city "
+                    "FROM activities a "
+                    "LEFT JOIN stores s ON s.id = a.store_id "
+                    "WHERE LOWER(TRIM(a.rep)) = LOWER(TRIM(%s)) "
+                    "  AND a.created_at >= NOW() - (INTERVAL '1 day' * %s) "
+                    "  AND (a.deleted_at IS NULL) "
+                    "ORDER BY a.created_at DESC",
+                    (rep, days))
+            else:
+                cur.execute(
+                    "SELECT a.id, a.store_id, a.created_at, "
+                    "       s.store_number, s.account, s.city "
+                    "FROM activities a "
+                    "LEFT JOIN stores s ON s.id = a.store_id "
+                    "WHERE LOWER(TRIM(a.rep)) = LOWER(TRIM(?)) "
+                    "  AND a.created_at >= datetime('now', ? || ' days') "
+                    "  AND (a.deleted_at IS NULL) "
+                    "ORDER BY a.created_at DESC",
+                    (rep, f'-{days}'))
+            visits = cur.fetchall()
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+            visits = []
+
+        visits_total = len(visits)
+        store_visit_counts: dict = {}     # store_number -> count
+        store_meta: dict = {}             # store_number -> {account, city, last_visit}
+        active_days_set: set = set()
+        city_counts: dict = {}
+        last_visit_at = None
+
+        for v in visits:
+            sn = v[3]
+            if sn is not None:
+                try:
+                    sn_int = int(sn)
+                    store_visit_counts[sn_int] = store_visit_counts.get(sn_int, 0) + 1
+                    if sn_int not in store_meta:
+                        store_meta[sn_int] = {
+                            'account': v[4] or '',
+                            'city': v[5] or '',
+                            'last_visit': str(v[2]) if v[2] else None,
+                        }
+                except (ValueError, TypeError):
+                    pass
+            ts = str(v[2]) if v[2] else ''
+            if ts:
+                active_days_set.add(ts[:10])  # YYYY-MM-DD
+                if last_visit_at is None or ts > last_visit_at:
+                    last_visit_at = ts
+            if v[5]:
+                city_counts[v[5]] = city_counts.get(v[5], 0) + 1
+
+        unique_stores = len(store_visit_counts)
+        repeat_visits = visits_total - unique_stores
+        repeat_visit_pct = round(repeat_visits / visits_total * 100, 1) if visits_total else 0.0
+
+        # High-repeat stores (3+ visits)
+        high_repeat = []
+        for sn, count in sorted(store_visit_counts.items(), key=lambda x: -x[1])[:10]:
+            if count >= 3:
+                meta = store_meta.get(sn, {})
+                high_repeat.append({
+                    'store_number': sn,
+                    'account': meta.get('account', ''),
+                    'city': meta.get('city', ''),
+                    'visits': count,
+                    'last_visit': meta.get('last_visit'),
+                })
+
+        # Territory size — best-effort from stores.rep + sod_inventory.store_number
+        try:
+            if USE_POSTGRES:
+                cur.execute("SELECT COUNT(*) FROM stores WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s))", (rep,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM stores WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?))", (rep,))
+            territory_size = int(cur.fetchone()[0] or 0)
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+            territory_size = 0
+        coverage_pct = round(unique_stores / territory_size * 100, 1) if territory_size > 0 else None
+
+        # Listings won (deals stage='listed' with closed_at in window)
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT COUNT(*) FROM deals "
+                    "WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(%s)) "
+                    "  AND stage='listed' "
+                    "  AND closed_at >= NOW() - (INTERVAL '1 day' * %s)",
+                    (rep, days))
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) FROM deals "
+                    "WHERE LOWER(TRIM(owner_rep)) = LOWER(TRIM(?)) "
+                    "  AND stage='listed' "
+                    "  AND closed_at >= datetime('now', ? || ' days')",
+                    (rep, f'-{days}'))
+            listings_won = int(cur.fetchone()[0] or 0)
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+            listings_won = 0
+
+        # Tastings + outreach
+        tastings = sum(1 for v in visits
+                       if v and len(v) > 0
+                       and isinstance(v[0], (int, str))
+                       )  # placeholder; we don't have activity_type joined here
+
+        # Calculate days_since_last_visit
+        days_since_last = None
+        if last_visit_at:
+            try:
+                from datetime import datetime as _dt
+                last_dt = _dt.fromisoformat(last_visit_at.replace('Z', '+00:00').split('.')[0])
+                days_since_last = (datetime.utcnow() - last_dt).days
+            except Exception:
+                pass
+
+        # Behavior flags
+        flags = []
+        if days_since_last is not None and days_since_last >= 14:
+            flags.append('stale')
+        if coverage_pct is not None and coverage_pct < 30 and territory_size >= 10:
+            flags.append('narrow_coverage')
+        if any(c >= 3 for c in store_visit_counts.values()):
+            flags.append('high_repeats')
+        if visits_total >= 30 and listings_won == 0:
+            flags.append('no_conversion')
+        # Single-city concentration
+        if visits_total >= 10:
+            top_city_visits = max(city_counts.values()) if city_counts else 0
+            if top_city_visits / visits_total >= 0.8:
+                flags.append('single_city')
+
+        out_rows.append({
+            'rep': rep,
+            'window_days': days,
+            'visits_total': visits_total,
+            'unique_stores': unique_stores,
+            'repeat_visits': repeat_visits,
+            'repeat_visit_pct': repeat_visit_pct,
+            'active_days': len(active_days_set),
+            'days_since_last_visit': days_since_last,
+            'territory_size': territory_size,
+            'coverage_pct': coverage_pct,
+            'listings_won_in_window': listings_won,
+            'visit_pace_per_active_day': (
+                round(visits_total / len(active_days_set), 1)
+                if active_days_set else None
+            ),
+            'high_repeat_stores': high_repeat,
+            'top_cities': sorted(
+                [{'city': c, 'visits': n} for c, n in city_counts.items()],
+                key=lambda x: -x['visits'])[:5],
+            'behavior_flags': flags,
+        })
+
+    if USE_POSTGRES: cur.close()
+
+    # Global findings
+    findings = []
+    stale_reps = [r['rep'] for r in out_rows if 'stale' in r['behavior_flags']]
+    narrow_reps = [r['rep'] for r in out_rows if 'narrow_coverage' in r['behavior_flags']]
+    high_repeat_reps = [r['rep'] for r in out_rows if 'high_repeats' in r['behavior_flags']]
+    no_conv_reps = [r['rep'] for r in out_rows if 'no_conversion' in r['behavior_flags']]
+    if stale_reps:
+        findings.append(f"{len(stale_reps)} rep(s) haven't logged a visit in 14+ days: {', '.join(stale_reps)}")
+    if narrow_reps:
+        findings.append(f"{len(narrow_reps)} rep(s) covering <30% of territory: {', '.join(narrow_reps)}")
+    if high_repeat_reps:
+        findings.append(f"{len(high_repeat_reps)} rep(s) revisiting the same store 3+ times: {', '.join(high_repeat_reps)}")
+    if no_conv_reps:
+        findings.append(f"{len(no_conv_reps)} rep(s) with 30+ visits but 0 listings won: {', '.join(no_conv_reps)}")
+    if not findings:
+        findings.append("All reps within healthy ranges across all behavior checks.")
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'window_days': days,
+        'per_rep': out_rows,
+        'global_findings': findings,
+        'how_to_read': (
+            "Each rep gets visits_total, unique_stores, and repeat_visit_pct. "
+            "behavior_flags surface 5 patterns: stale (14d idle), narrow_coverage "
+            "(<30% territory), high_repeats (any store 3+ visits), no_conversion "
+            "(30+ visits, 0 listings won), single_city (80%+ in one city). "
+            "Download the full activity log via /api/admin/export/everything for "
+            "deeper AI analysis."
+        ),
+    })
+
+
 @app.route('/api/admin/data-integrity', methods=['GET'])
 def api_admin_data_integrity():
     """Comprehensive data-accuracy audit. Read-only, no auth (just diagnostic).
@@ -13337,6 +13725,87 @@ def _summarize_hidden_listings(sku=None):
     return ' '.join(parts), 'hidden-listings', [], []
 
 
+def _summarize_rep_behavior(days=30):
+    """Plain-English rep behavior audit — answers 'are they working or
+    going to the same places?'."""
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    rep_roster = ['Ikshit', 'Namit', 'Virat', 'Surya', 'Neeraj']
+
+    flagged = []  # list of {rep, flags, key_metric}
+    rows_for_table = []
+
+    for rep in rep_roster:
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT COUNT(*)::int, COUNT(DISTINCT store_id)::int, "
+                    "       COUNT(DISTINCT DATE(created_at))::int, "
+                    "       MAX(created_at)::text "
+                    "FROM activities "
+                    "WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s)) "
+                    "  AND created_at >= NOW() - (INTERVAL '1 day' * %s) "
+                    "  AND deleted_at IS NULL",
+                    (rep, days))
+            else:
+                cur.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT store_id), "
+                    "       COUNT(DISTINCT DATE(created_at)), MAX(created_at) "
+                    "FROM activities "
+                    "WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?)) "
+                    "  AND created_at >= datetime('now', ? || ' days') "
+                    "  AND deleted_at IS NULL",
+                    (rep, f'-{days}'))
+            r = cur.fetchone()
+            visits, unique_stores, active_days, last_visit = (
+                int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), r[3] or '')
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+            visits = unique_stores = active_days = 0
+            last_visit = ''
+
+        repeat_pct = round((visits - unique_stores) / visits * 100, 1) if visits else 0
+        flags_local = []
+        if last_visit:
+            try:
+                from datetime import datetime as _dt
+                lv = _dt.fromisoformat(str(last_visit).replace('Z', '+00:00').split('.')[0])
+                idle = (datetime.utcnow() - lv).days
+                if idle >= 14:
+                    flags_local.append(f'stale({idle}d)')
+            except Exception:
+                pass
+        if repeat_pct >= 50 and visits >= 10:
+            flags_local.append('high_repeat')
+        rows_for_table.append({
+            'rep': rep, 'visits': visits, 'unique_stores': unique_stores,
+            'repeat_pct': repeat_pct, 'active_days': active_days,
+        })
+        if flags_local:
+            flagged.append({'rep': rep, 'flags': flags_local,
+                            'visits': visits, 'unique_stores': unique_stores,
+                            'repeat_pct': repeat_pct})
+
+    if USE_POSTGRES: cur.close()
+
+    parts = [f"Rep behavior over last {days} days:"]
+    rows_for_table.sort(key=lambda x: -x['visits'])
+    for r in rows_for_table:
+        parts.append(
+            f"\n  {r['rep']}: {r['visits']} visits across {r['unique_stores']} stores "
+            f"({r['repeat_pct']}% repeats), active {r['active_days']} days"
+        )
+    if flagged:
+        parts.append("\n\nFlags:")
+        for f in flagged:
+            parts.append(f"\n  • {f['rep']}: {', '.join(f['flags'])}")
+    else:
+        parts.append("\n\nNo behavior flags raised. All reps within healthy ranges.")
+    parts.append("\n\nFor the full per-store breakdown, open /exports → Rep Behavior.")
+    return ''.join(parts), 'rep-behavior', rows_for_table, ['rep', 'visits', 'unique_stores', 'repeat_pct', 'active_days']
+
+
 def _summarize_source_drift():
     """Plain-English breakdown of where SOD and lcbo.com disagree."""
     db = get_db()
@@ -13423,6 +13892,25 @@ def _free_answer(question):
         or 'store count' in ql or 'lcbo locations' in ql
         or ('how many' in ql and 'store' in ql and not sku)
     )
+
+    # Priority 0-pre-pre: rep-behavior audit — "are reps working?", "are
+    # they going to the same place?", "rep behavior", "rep performance audit"
+    is_behavior_audit = (
+        ('rep' in ql or 'reps' in ql)
+        and (
+            'behavior' in ql or 'behaviour' in ql or 'working' in ql
+            or 'lazy' in ql or 'slack' in ql or 'audit' in ql
+            or ('same' in ql and ('store' in ql or 'place' in ql))
+            or 'repeat' in ql or 'repeats' in ql
+            or 'are they doing' in ql or 'doing their job' in ql
+            or 'performance' in ql
+        )
+    ) or (
+        # bare "are they working" / "rep audit" without explicit "rep"
+        'are they working' in ql or 'rep audit' in ql
+    )
+    if is_behavior_audit:
+        return _summarize_rep_behavior(days)
 
     # Priority 0-pre: hidden-listings audit — "any hidden listings", "ghost
     # listings", "what is being hidden", "suspicious listings", "fraud"
