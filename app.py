@@ -13893,21 +13893,24 @@ def _free_answer(question):
         or ('how many' in ql and 'store' in ql and not sku)
     )
 
-    # Priority 0-pre-pre: rep-behavior audit — "are reps working?", "are
-    # they going to the same place?", "rep behavior", "rep performance audit"
+    # Priority 0-pre-pre: rep-behavior audit — only fires when the question
+    # is about REPS COLLECTIVELY (not a single rep). 'rep' singular is
+    # detected → handled by the per-rep summary intent later.
+    has_reps_plural = 'reps' in ql or 'team' in ql or 'all reps' in ql
     is_behavior_audit = (
-        ('rep' in ql or 'reps' in ql)
-        and (
+        has_reps_plural and (
             'behavior' in ql or 'behaviour' in ql or 'working' in ql
             or 'lazy' in ql or 'slack' in ql or 'audit' in ql
             or ('same' in ql and ('store' in ql or 'place' in ql))
             or 'repeat' in ql or 'repeats' in ql
-            or 'are they doing' in ql or 'doing their job' in ql
+            or 'doing' in ql        # 'are reps doing their job', 'how are reps doing'
             or 'performance' in ql
+            or 'how' in ql           # 'how are reps' / 'how is the team'
+            or 'visit' in ql         # 'how often do reps visit'
+            or 'work' in ql
         )
     ) or (
-        # bare "are they working" / "rep audit" without explicit "rep"
-        'are they working' in ql or 'rep audit' in ql
+        'are they working' in ql or 'rep audit' in ql or 'team audit' in ql
     )
     if is_behavior_audit:
         return _summarize_rep_behavior(days)
