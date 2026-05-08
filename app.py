@@ -8240,6 +8240,21 @@ def api_admin_new_listings_by_range():
     # listed before our SOD history begins) and are NOT real new
     # listings. Pass strict_mode=0 to include them.
     strict_mode = (request.args.get('strict_mode', '1') in ('1', 'true', 'yes'))
+    # fresh_lcbo (default OFF — slow). When ON, kicks off a synchronous
+    # lcbo.com scrape for all 8 tracked SKUs BEFORE the diff so the
+    # cross-check uses live-as-of-this-moment data, not the most recent
+    # 30-min cron's snapshot. Adds ~30-60s to the request but produces
+    # the most accurate possible verification.
+    fresh_lcbo = (request.args.get('fresh_lcbo', '0') in ('1', 'true', 'yes'))
+    if fresh_lcbo and include_lcbo:
+        try:
+            scrape_worker = globals().get('_lcbo_daily_scrape_worker')
+            if callable(scrape_worker):
+                print('[new-listings] Triggering live lcbo.com scrape before diff...')
+                scrape_worker()
+                print('[new-listings] Live scrape complete; running diff with fresh data')
+        except Exception as e:
+            print(f'[new-listings] Live scrape failed (proceeding with stale data): {e}')
     skus_to_audit = (
         [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
         else list(SOD_TRACKED_SKUS.keys())
@@ -8776,6 +8791,18 @@ def api_admin_sod_compare_uploads():
     include_lcbo = (request.form.get('include_lcbo', '1') in ('1', 'true', 'yes'))
     from_date_pick = (request.form.get('from_date') or '').strip()
     to_date_pick = (request.form.get('to_date') or '').strip()
+    # When fresh_lcbo=1, kick off a live lcbo.com scrape before computing
+    # the diff so the cross-check has the freshest possible inventory data.
+    fresh_lcbo = (request.form.get('fresh_lcbo', '0') in ('1', 'true', 'yes'))
+    if fresh_lcbo and include_lcbo:
+        try:
+            scrape_worker = globals().get('_lcbo_daily_scrape_worker')
+            if callable(scrape_worker):
+                print('[compare-uploads] Triggering live lcbo.com scrape before diff...')
+                scrape_worker()
+                print('[compare-uploads] Live scrape complete')
+        except Exception as e:
+            print(f'[compare-uploads] Live scrape failed: {e}')
 
     if not from_file:
         return jsonify({'error': 'from_zip is required (the historical snapshot)'}), 400
@@ -9308,6 +9335,228 @@ def api_admin_sod_upload_historical():
             "Historical snapshot backfilled into sod_inventory. The /new-listings "
             "page can now compare any date range that includes these dates."
         ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD HISTORY COVERAGE — shows the operator the date range we have data
+# for, per SKU. The "you don't need to upload anything if your window
+# falls inside this range" indicator.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/history-coverage', methods=['GET'])
+def api_admin_sod_history_coverage():
+    """Return the date range of SOD history we have, per tracked SKU.
+
+    No params. Used by /new-listings frontend to show the user how far
+    back they can compare without uploading a historical ZIP.
+    """
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    out_per_sku = []
+    for sku in SOD_TRACKED_SKUS.keys():
+        brand, name = SOD_TRACKED_SKUS[sku]
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT MIN(snapshot_date)::text, MAX(snapshot_date)::text, "
+                    "       COUNT(DISTINCT snapshot_date)::int "
+                    "FROM sod_inventory WHERE sku = %s",
+                    (sku,))
+                r = cur.fetchone()
+            else:
+                r = cur.execute(
+                    "SELECT MIN(snapshot_date), MAX(snapshot_date), "
+                    "       COUNT(DISTINCT snapshot_date) "
+                    "FROM sod_inventory WHERE sku = ?",
+                    (sku,)).fetchone()
+            min_d = str(r[0]) if r and r[0] else None
+            max_d = str(r[1]) if r and r[1] else None
+            days = int(r[2] or 0) if r else 0
+            # Find any gaps (missed snapshot days within the range)
+            gaps_sql = (
+                "SELECT (s + INTERVAL '1 day')::date::text AS gap_start "
+                "FROM (SELECT snapshot_date AS s, "
+                "       LEAD(snapshot_date) OVER (ORDER BY snapshot_date) AS next "
+                "       FROM sod_inventory WHERE sku=%s "
+                "       GROUP BY snapshot_date) t "
+                "WHERE next IS NOT NULL AND next - s > 1 "
+                "ORDER BY s LIMIT 30"
+            ) if USE_POSTGRES else None
+            gaps = []
+            if USE_POSTGRES and min_d and max_d:
+                try:
+                    cur.execute(gaps_sql, (sku,))
+                    for gr in cur.fetchall():
+                        gaps.append(str(gr[0]))
+                except Exception:
+                    try: db.rollback()
+                    except Exception: pass
+            out_per_sku.append({
+                'sku': sku,
+                'product_name': name,
+                'brand': brand,
+                'earliest_date': min_d,
+                'latest_date': max_d,
+                'distinct_days_in_history': days,
+                'gap_starts_first_30': gaps,
+            })
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            out_per_sku.append({'sku': sku, 'error': str(e)})
+    if USE_POSTGRES:
+        cur.close()
+
+    # Compute overall range
+    earliest_all = min(
+        (r['earliest_date'] for r in out_per_sku if r.get('earliest_date')),
+        default=None)
+    latest_all = max(
+        (r['latest_date'] for r in out_per_sku if r.get('latest_date')),
+        default=None)
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'overall_earliest': earliest_all,
+        'overall_latest': latest_all,
+        'overall_days': (
+            (datetime.fromisoformat(latest_all).date() -
+             datetime.fromisoformat(earliest_all).date()).days + 1
+            if (earliest_all and latest_all) else 0
+        ),
+        'per_sku': out_per_sku,
+        'how_to_read': (
+            "earliest_date is the first SOD snapshot we have for each SKU. "
+            "If your /new-listings window starts AFTER this, the diff is "
+            "real and self-contained. If your window starts BEFORE this, "
+            "upload a historical SOD ZIP via /sod-compare to fill the gap. "
+            "gap_starts_first_30 lists the first 30 missed snapshot days "
+            "(if any) — these create false 'new listing' rows in loose "
+            "mode but are invisible in strict mode."
+        ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD BULK HISTORICAL UPLOAD — accept multiple ZIPs in one POST so the
+# operator can backfill a long history in one go.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/bulk-upload-historical', methods=['POST'])
+@require_app_origin
+def api_admin_sod_bulk_upload_historical():
+    """Backfill MULTIPLE historical SOD ZIPs at once.
+
+    Multipart form: each field name beginning with 'zip' (e.g. zip0,
+    zip1, zip2 ... or just zip[]) is treated as a SOD inventory ZIP.
+    Each is parsed + ingested independently with ON CONFLICT DO NOTHING.
+
+    Returns: per-file summary (filename, rows_inserted, dates_in_zip,
+    error if any). Same idempotency guarantees as /upload-historical.
+    """
+    files = []
+    for k in request.files:
+        files.extend(request.files.getlist(k))
+    if not files:
+        return jsonify({'error': 'no zip files provided (use form fields zip0, zip1, ... or zip[])'}), 400
+
+    keep_all = request.form.get('keep_all_rows') in ('1', 'true', 'yes')
+
+    results = []
+    total_inserted = 0
+    total_skipped = 0
+    for f in files:
+        fname = getattr(f, 'filename', '') or ''
+        try:
+            zip_bytes = f.read()
+            if not zip_bytes:
+                results.append({'filename': fname, 'error': 'empty zip'})
+                continue
+            parsed = stream_parse_sod_zip(
+                zip_bytes, set(SOD_TRACKED_SKUS.keys()),
+                keep_all_rows=keep_all)
+            rows = parsed.get('rows_to_persist', [])
+            dates = sorted(parsed.get('dates_seen', set()))
+            if not rows:
+                results.append({
+                    'filename': fname,
+                    'dates_in_zip': dates,
+                    'tracked_rows': 0,
+                    'inserted': 0,
+                    'skipped_existing': 0,
+                    'note': 'no tracked-SKU rows in this ZIP',
+                })
+                continue
+            inserted = 0
+            conn = _sod_get_conn()
+            cur = conn.cursor()
+            BATCH = 5000
+            batch = []
+            for r in rows:
+                batch.append((
+                    r['sku'], r['store_number'], r['snapshot_date'],
+                    r['status'], r['on_hand'], r['product_name'],
+                    'historical_bulk_upload',
+                ))
+                if len(batch) >= BATCH:
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_values(
+                            cur,
+                            """INSERT INTO sod_inventory
+                               (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                               VALUES %s
+                               ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                            batch,
+                        )
+                        inserted += cur.rowcount
+                    else:
+                        cur.executemany(
+                            """INSERT OR IGNORE INTO sod_inventory
+                               (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            batch,
+                        )
+                        inserted += cur.rowcount
+                    batch = []
+            if batch:
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES %s
+                           ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+                else:
+                    cur.executemany(
+                        """INSERT OR IGNORE INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+            skipped = len(rows) - inserted
+            conn.commit()
+            cur.close()
+            conn.close()
+            total_inserted += inserted
+            total_skipped += skipped
+            results.append({
+                'filename': fname,
+                'dates_in_zip': dates,
+                'tracked_rows': len(rows),
+                'inserted': inserted,
+                'skipped_existing': skipped,
+            })
+        except Exception as e:
+            results.append({'filename': fname, 'error': str(e)})
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'files_processed': len(files),
+        'total_inserted': total_inserted,
+        'total_skipped': total_skipped,
+        'per_file': results,
     })
 
 
