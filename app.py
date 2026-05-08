@@ -8232,6 +8232,14 @@ def api_admin_new_listings_by_range():
 
     sku_filter = (request.args.get('sku') or '').strip()
     include_lcbo = (request.args.get('include_lcbo', '1') in ('1', 'true', 'yes'))
+    # strict_mode (default ON) — only count stores with a verified
+    # NEW_LISTING/RELISTED change event in window OR lcbo.com / rep
+    # confirmation. Filters out stores that appear in the snapshot diff
+    # but have no transition event recorded — those are usually just
+    # day-1 baseline gaps (we ingested them late, they were already
+    # listed before our SOD history begins) and are NOT real new
+    # listings. Pass strict_mode=0 to include them.
+    strict_mode = (request.args.get('strict_mode', '1') in ('1', 'true', 'yes'))
     skus_to_audit = (
         [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
         else list(SOD_TRACKED_SKUS.keys())
@@ -8245,6 +8253,8 @@ def api_admin_new_listings_by_range():
         'net_change': 0,
         'lcbo_confirmed_new': 0,
         'rep_confirmed_new': 0,
+        'total_confirmed_new': 0,
+        'total_unconfirmed': 0,
     }
 
     for sku in skus_to_audit:
@@ -8376,6 +8386,74 @@ def api_admin_new_listings_by_range():
         new_set = end_listed - start_listed     # listings won
         lost_set = start_listed - end_listed     # listings lost
 
+        # Pull NEW_LISTING change events for this SKU within window —
+        # this is the diff-engine's verified-transition signal. A store
+        # in new_set BUT NOT in this set is likely just a baseline gap
+        # (e.g. the store was listed all along but missing from our
+        # day-1 snapshot) — NOT a real new listing.
+        confirmed_new_event = set()
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT DISTINCT store_number FROM sod_listing_changes "
+                    "WHERE sku=%s "
+                    "  AND change_type IN ('NEW_LISTING','RELISTED') "
+                    "  AND change_date BETWEEN %s AND %s "
+                    "  AND store_number IS NOT NULL",
+                    (sku, start_d.isoformat(), end_d.isoformat()))
+                confirmed_new_event = {int(r[0]) for r in cur.fetchall()}
+                cur.close()
+            else:
+                confirmed_new_event = {
+                    int(r[0]) for r in cur.execute(
+                        "SELECT DISTINCT store_number FROM sod_listing_changes "
+                        "WHERE sku=? "
+                        "  AND change_type IN ('NEW_LISTING','RELISTED') "
+                        "  AND change_date BETWEEN ? AND ? "
+                        "  AND store_number IS NOT NULL",
+                        (sku, start_d.isoformat(), end_d.isoformat())).fetchall()
+                }
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+        # Pull last-seen-listed-before-window for each new_set store
+        # so we know if it's truly new or if it was Listed before our window.
+        last_listed_before: dict = {}
+        if new_set:
+            try:
+                cur = db.cursor() if USE_POSTGRES else db
+                if USE_POSTGRES:
+                    cur.execute(
+                        "SELECT store_number, MAX(snapshot_date)::text "
+                        "FROM sod_inventory "
+                        "WHERE sku=%s AND status='L' "
+                        "  AND snapshot_date < %s "
+                        "GROUP BY store_number",
+                        (sku, start_d.isoformat()))
+                    for r in cur.fetchall():
+                        try:
+                            last_listed_before[int(r[0])] = r[1]
+                        except (ValueError, TypeError):
+                            continue
+                    cur.close()
+                else:
+                    for r in cur.execute(
+                        "SELECT store_number, MAX(snapshot_date) "
+                        "FROM sod_inventory "
+                        "WHERE sku=? AND status='L' "
+                        "  AND snapshot_date < ? "
+                        "GROUP BY store_number",
+                        (sku, start_d.isoformat())).fetchall():
+                        try:
+                            last_listed_before[int(r[0])] = str(r[1]) if r[1] else None
+                        except (ValueError, TypeError):
+                            continue
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+
         # Cross-check new listings against lcbo.com (qty>0 within window)
         lcbo_confirmed = set()
         if include_lcbo and new_set:
@@ -8462,32 +8540,73 @@ def api_admin_new_listings_by_range():
         lcbo_only_new = (lcbo_confirmed - start_listed) - new_set
         rep_only_new = (rep_confirmed - start_listed) - new_set - lcbo_only_new
 
-        # Build per-store rows
+        # Build per-store rows with evidence per store. Each row carries:
+        #   confirmed_new        - True iff there's a NEW_LISTING/RELISTED
+        #                          event for (sku, store) in window OR
+        #                          discovered_via != 'sod' (lcbo/rep saw it).
+        #                          When False, the store appears in the diff
+        #                          but the change-event log doesn't back it up
+        #                          — usually means our day-1 snapshot was
+        #                          incomplete and this store was already
+        #                          listed before our ingest started.
+        #   evidence             - human-readable explanation
+        #   last_listed_before_window - if the SOD snapshot history shows
+        #                          this store WAS listed before window start,
+        #                          it's NOT actually new.
         store_rows = []
         for sn in sorted(new_set):
+            had_event = sn in confirmed_new_event
+            prior_listed = last_listed_before.get(sn)
+            confirmed_new = had_event or (sn in lcbo_confirmed) or (sn in rep_confirmed)
+            if had_event:
+                ev = 'NEW_LISTING/RELISTED event recorded in window'
+            elif prior_listed:
+                ev = f'⚠ Already Listed in our SOD on {prior_listed} (before window) — NOT actually new'
+            else:
+                ev = '⚠ No NEW_LISTING event in change log — likely day-1 baseline gap, not a real new listing'
             store_rows.append({
                 'store_number': sn,
                 'discovered_via': 'sod',
+                'confirmed_new': confirmed_new,
+                'has_change_event': had_event,
+                'last_listed_before_window': prior_listed,
                 'lcbo_confirmed': sn in lcbo_confirmed,
                 'rep_confirmed': sn in rep_confirmed,
+                'evidence': ev,
             })
         for sn in sorted(lcbo_only_new):
             store_rows.append({
                 'store_number': sn,
                 'discovered_via': 'lcbo_only',
+                'confirmed_new': True,
+                'has_change_event': sn in confirmed_new_event,
+                'last_listed_before_window': last_listed_before.get(sn),
                 'lcbo_confirmed': True,
                 'rep_confirmed': sn in rep_confirmed,
+                'evidence': 'lcbo.com showed qty>0 in window; SOD did not list (commission claim)',
             })
         for sn in sorted(rep_only_new):
             store_rows.append({
                 'store_number': sn,
                 'discovered_via': 'rep_only',
+                'confirmed_new': True,
+                'has_change_event': sn in confirmed_new_event,
+                'last_listed_before_window': last_listed_before.get(sn),
                 'lcbo_confirmed': sn in lcbo_confirmed,
                 'rep_confirmed': True,
+                'evidence': 'Rep observed on shelf in window',
             })
+
+        # If strict_mode, filter out unconfirmed rows BEFORE counting
+        if strict_mode:
+            store_rows = [s for s in store_rows if s['confirmed_new']]
+            new_set = {s['store_number'] for s in store_rows if s['discovered_via'] == 'sod'}
 
         # Combined "all sources" new-listing count (the union)
         union_new = new_set | lcbo_only_new | rep_only_new
+
+        confirmed_count = sum(1 for s in store_rows if s.get('confirmed_new'))
+        unconfirmed_count = len(store_rows) - confirmed_count
 
         out_rows.append({
             'sku': sku,
@@ -8500,6 +8619,8 @@ def api_admin_new_listings_by_range():
             'lcbo_only_new_count': len(lcbo_only_new),
             'rep_only_new_count': len(rep_only_new),
             'union_new_count': len(union_new),
+            'confirmed_new_count': confirmed_count,
+            'unconfirmed_count': unconfirmed_count,
             'sod_lost_count': len(lost_set),
             'net_change': len(new_set) - len(lost_set),
             'start_listed_count': len(start_listed),
@@ -8515,6 +8636,10 @@ def api_admin_new_listings_by_range():
         summary['net_change'] += len(new_set) - len(lost_set)
         summary['lcbo_confirmed_new'] += len(lcbo_confirmed & union_new)
         summary['rep_confirmed_new'] += len(rep_confirmed & union_new)
+        summary.setdefault('total_confirmed_new', 0)
+        summary.setdefault('total_unconfirmed', 0)
+        summary['total_confirmed_new'] += confirmed_count
+        summary['total_unconfirmed'] += unconfirmed_count
 
     fmt = (request.args.get('format') or 'json').lower()
     if fmt == 'csv':
@@ -8525,20 +8650,24 @@ def api_admin_new_listings_by_range():
         w = _csv.writer(buf)
         w.writerow([
             'window_start', 'window_end', 'sku', 'product_name', 'brand',
-            'verdict', 'store_number', 'discovered_via', 'lcbo_confirmed',
-            'rep_confirmed', 'start_snapshot_date', 'end_snapshot_date',
-            'start_was_clipped',
+            'verdict', 'store_number', 'discovered_via',
+            'confirmed_new', 'has_change_event', 'last_listed_before_window',
+            'evidence',
+            'lcbo_confirmed', 'rep_confirmed',
+            'start_snapshot_date', 'end_snapshot_date',
+            'start_was_clipped', 'strict_mode',
         ])
         for r in out_rows:
             if r.get('start_was_clipped'):
-                # Mark the SKU as "no diff possible" — keep one row per SKU
                 w.writerow([
                     start_d.isoformat(), end_d.isoformat(), r['sku'],
                     r['product_name'], r['brand'], 'INSUFFICIENT_HISTORY',
-                    '', '', '', '',
+                    '', '', '', '', '',
+                    'No SOD snapshot at-or-before window start; upload a historical ZIP',
+                    '', '',
                     r.get('start_snapshot_date') or '',
                     r.get('end_snapshot_date') or '',
-                    True,
+                    True, strict_mode,
                 ])
                 continue
             for s in r.get('new_stores') or []:
@@ -8546,24 +8675,29 @@ def api_admin_new_listings_by_range():
                     start_d.isoformat(), end_d.isoformat(), r['sku'],
                     r['product_name'], r['brand'], 'ADDED',
                     s.get('store_number'), s.get('discovered_via'),
+                    bool(s.get('confirmed_new')),
+                    bool(s.get('has_change_event')),
+                    s.get('last_listed_before_window') or '',
+                    s.get('evidence') or '',
                     bool(s.get('lcbo_confirmed')),
                     bool(s.get('rep_confirmed')),
                     r.get('start_snapshot_date') or '',
                     r.get('end_snapshot_date') or '',
-                    False,
+                    False, strict_mode,
                 ])
             for sn in r.get('lost_stores') or []:
                 w.writerow([
                     start_d.isoformat(), end_d.isoformat(), r['sku'],
                     r['product_name'], r['brand'], 'LOST',
-                    sn, 'sod', '', '',
+                    sn, 'sod', '', '', '', '', '', '',
                     r.get('start_snapshot_date') or '',
                     r.get('end_snapshot_date') or '',
-                    False,
+                    False, strict_mode,
                 ])
         fname = (
             f"anu-new-listings-{start_d.isoformat()}-to-{end_d.isoformat()}"
             + (f'-{sku_filter}' if sku_filter else '')
+            + ('-strict' if strict_mode else '-loose')
             + '.csv'
         )
         return Response(
@@ -8580,16 +8714,20 @@ def api_admin_new_listings_by_range():
         },
         'sku_filter': sku_filter or None,
         'include_lcbo_cross_check': include_lcbo,
+        'strict_mode': strict_mode,
         'summary': summary,
         'per_sku': out_rows,
         'how_to_read': (
-            "Each per-SKU row compares two SOD snapshots: 'start' (closest at/before "
-            "the requested start date) and 'end' (closest at/before the requested end). "
-            "union_new_count = stores that became Listed in the window AS DETECTED BY "
-            "ANY SOURCE (SOD diff + lcbo.com confirmation + rep observations). "
-            "discovered_via='lcbo_only' means SOD didn't show this listing — those "
-            "are the listings hidden from SOD that you can claim commission on. "
-            "Add &format=csv to download a flat CSV of every store added/lost."
+            "STRICT MODE (default) shows only stores with a verified "
+            "NEW_LISTING/RELISTED change event in window OR independent "
+            "confirmation from lcbo.com or a rep. Unconfirmed stores (in "
+            "the snapshot diff but with no transition event) are filtered "
+            "out — they're usually just day-1 baseline gaps where the "
+            "store was already listed before our SOD ingest started, not "
+            "real new listings. Pass &strict_mode=0 to see them. "
+            "Each store row carries 'confirmed_new', 'has_change_event', "
+            "'last_listed_before_window', and 'evidence' for full audit. "
+            "Add &format=csv to download."
         ),
         'as_of': datetime.utcnow().isoformat() + 'Z',
     })
