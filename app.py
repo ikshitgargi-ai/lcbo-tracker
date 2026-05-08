@@ -3128,6 +3128,166 @@ class SODClient:
         """
         return self.download_option(source, filename=filename)
 
+    # ───── CATALOG DISCOVERY (annual archives, options, informative) ─────
+    # SOD portal exposes way more than just the daily files. Categories
+    # include Informative 2025 (annual), Option 1/3/5 2025 (agent options
+    # for tracking-over-time), etc. The portal index lists everything as
+    # links of the form /downloads/general/{cat_id}/{filename} or
+    # /downloads/agent/{agent_id}/{cat_id}/{filename}.
+    #
+    # list_catalog() crawls the index and returns the parsed tree.
+    # download_url() fetches any file given its full URL.
+    def list_catalog(self):
+        """Discover every available SOD download category + file.
+
+        Tries the known portal index URLs; for each successful page,
+        regex-extracts every /downloads/... link plus the surrounding
+        text label so we can present a navigable catalog.
+
+        Returns: {'index_url': str, 'categories': [...]}
+        """
+        import re as _re
+        self._ensure_logged_in()
+
+        index_candidates = [
+            f'{SOD_BASE}/subscribers',
+            f'{SOD_BASE}/subscribers/files',
+            f'{SOD_BASE}/downloads',
+        ]
+        # Walk known dirs too — agent-specific subscriptions live behind
+        # /downloads/agent/{agent_id}/...
+        if self.agent_id:
+            index_candidates.append(f'{SOD_BASE}/downloads/agent/{self.agent_id}')
+            index_candidates.append(f'{SOD_BASE}/subscribers/{self.agent_id}')
+
+        # Aggregate links seen on ANY of the discovered index pages.
+        files_by_cat: dict = {}      # cat_key -> list of file dicts
+        cat_labels: dict = {}        # cat_key -> human label (best-effort)
+        index_url_used = None
+
+        # Pattern 1: file link
+        # Matches: /downloads/general/14/something.zip
+        #          /downloads/agent/1113/13/something.zip
+        FILE_RE = _re.compile(
+            r'href="(/downloads/(general|agent/\d+)/(\d+)/([^/"][^"]*\.zip))"',
+            _re.IGNORECASE,
+        )
+        # Pattern 2: section heading near a link — try to capture an h3/h4/strong
+        # immediately preceding a download anchor so we can label categories.
+        LABEL_NEAR_RE = _re.compile(
+            r'(?:<(?:h[2-5]|strong|td)[^>]*>([^<]{3,80})</(?:h[2-5]|strong|td)>'
+            r'|<a[^>]+>([^<]{3,80})</a>)',
+            _re.IGNORECASE,
+        )
+
+        for url in index_candidates:
+            try:
+                r = self.session.get(url, timeout=self.timeout)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            html = r.text or ''
+            if 'Sign out' not in html and 'sign-out' not in html.lower():
+                continue  # not actually logged in / wrong page
+            if not index_url_used:
+                index_url_used = url
+            # Extract every file link
+            for m in FILE_RE.finditer(html):
+                rel_url, scope, cat_id, fname = m.groups()
+                cat_key = f'{scope}/{cat_id}'
+                files_by_cat.setdefault(cat_key, []).append({
+                    'url': SOD_BASE + rel_url,
+                    'filename': fname,
+                    'category_scope': scope,
+                    'category_id': int(cat_id),
+                })
+            # Try to label categories — find the nearest preceding heading
+            # for each unique category-id seen.
+            seen_ids = {m.group(3) for m in FILE_RE.finditer(html)}
+            for cat_id_str in seen_ids:
+                # Look at the 500 chars BEFORE the first occurrence
+                first = html.find(f'/{cat_id_str}/')
+                if first < 0:
+                    continue
+                window = html[max(0, first - 600):first]
+                # Last heading-like text in that window
+                labels = LABEL_NEAR_RE.findall(window)
+                if labels:
+                    label = next((s1 or s2 for s1, s2 in reversed(labels) if (s1 or s2).strip()), '')
+                    label = label.strip()
+                    if label and 'sign' not in label.lower() and 'menu' not in label.lower():
+                        # Pick best label per cat_id (any scope) — agent and general
+                        # often share the id label
+                        for k in [f'general/{cat_id_str}', f'agent/{self.agent_id}/{cat_id_str}']:
+                            if k in files_by_cat:
+                                cat_labels.setdefault(k, label)
+
+        # Also check sub-page index for each category (some portals hide files
+        # behind a per-category page rather than listing everything on one).
+        for cat_key in list(files_by_cat.keys()):
+            try:
+                cat_url = f'{SOD_BASE}/downloads/{cat_key}'
+                r = self.session.get(cat_url, timeout=self.timeout)
+                if r.status_code == 200:
+                    for m in FILE_RE.finditer(r.text or ''):
+                        rel_url, scope, cat_id, fname = m.groups()
+                        sub_key = f'{scope}/{cat_id}'
+                        files_by_cat.setdefault(sub_key, [])
+                        # Dedupe
+                        existing_names = {f['filename'] for f in files_by_cat[sub_key]}
+                        if fname not in existing_names:
+                            files_by_cat[sub_key].append({
+                                'url': SOD_BASE + rel_url,
+                                'filename': fname,
+                                'category_scope': scope,
+                                'category_id': int(cat_id),
+                            })
+            except Exception:
+                pass
+
+        # Build response
+        categories = []
+        for cat_key, files in files_by_cat.items():
+            # Sort files by filename (newest dates often last in YYMMDD names)
+            files.sort(key=lambda f: f['filename'])
+            categories.append({
+                'category_key': cat_key,
+                'category_label': cat_labels.get(cat_key) or cat_key,
+                'category_scope': files[0]['category_scope'],
+                'category_id': files[0]['category_id'],
+                'file_count': len(files),
+                'files': files[:200],  # cap response size
+            })
+        # Sort categories: agent-scoped first, then by id
+        categories.sort(key=lambda c: (c['category_scope'] != 'general', c['category_id']))
+
+        return {
+            'index_url_used': index_url_used,
+            'categories': categories,
+            'agent_id': self.agent_id,
+        }
+
+    def download_url(self, full_url):
+        """Download a file by its full SOD URL. Returns raw bytes.
+
+        Used by the portal-driven import flow to fetch any file the
+        catalog discovered (annual archives, options, informative, etc).
+        """
+        self._ensure_logged_in()
+        if not full_url.startswith(SOD_BASE):
+            raise RuntimeError(f"Refusing to fetch URL outside {SOD_BASE}: {full_url}")
+        r = self.session.get(full_url, timeout=max(self.timeout, 600))
+        r.raise_for_status()
+        body = r.content or b''
+        if not body[:2] == b'PK':
+            raise RuntimeError(
+                f"Downloaded {full_url} is not a ZIP "
+                f"(first bytes: {body[:8]!r}). Possibly an HTML error page; "
+                f"check that the agent has access to this file."
+            )
+        return body
+
 
 def _parse_sod_line(line):
     """Parse one SOD fixed-width row string. Returns dict or None if invalid."""
@@ -9335,6 +9495,180 @@ def api_admin_sod_upload_historical():
             "Historical snapshot backfilled into sod_inventory. The /new-listings "
             "page can now compare any date range that includes these dates."
         ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD PORTAL CATALOG — discover every file the supplier portal serves,
+# including annual archives (Informative 2025, Option 1/3/5 2025) that
+# can backfill our entire history in one shot.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/portal-catalog', methods=['GET'])
+@require_app_origin
+def api_admin_sod_portal_catalog():
+    """Crawl the SOD supplier portal and return the discovered catalog.
+
+    Returns: {
+      index_url_used: str (which page we successfully scraped)
+      agent_id: str
+      categories: [
+        {category_key, category_label, category_scope, category_id,
+         file_count, files: [{url, filename, ...}]},
+        ...
+      ]
+    }
+    """
+    try:
+        client = SODClient()
+        catalog = client.list_catalog()
+    except Exception as e:
+        return jsonify({'error': f'catalog discovery failed: {e}'}), 500
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        **catalog,
+        'how_to_use': (
+            "Pick any file URL and POST to /api/admin/sod/import-from-portal "
+            "with body {url}. The file is downloaded, parsed, and ingested "
+            "into sod_inventory. Annual archives (e.g. Option 5 2025) "
+            "backfill our entire SOD history in one shot."
+        ),
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SOD PORTAL IMPORT — given a catalog file URL, download it and ingest.
+# Same persistence path as upload-historical, just sourced from the
+# portal directly instead of via manual upload.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/sod/import-from-portal', methods=['POST'])
+@require_app_origin
+def api_admin_sod_import_from_portal():
+    """Download a SOD file from the portal and ingest into sod_inventory.
+
+    Body (JSON): {
+      url: str (REQUIRED) — full SOD portal URL of the .zip
+      keep_all_rows: bool (default false) — ingest all SKUs vs tracked-only
+      only_dates: list[str] (optional) — restrict to specific dates within
+                                         multi-day archives
+    }
+
+    Returns import summary same as /upload-historical.
+    """
+    body = request.get_json(silent=True) or {}
+    url = (body.get('url') or '').strip()
+    keep_all = bool(body.get('keep_all_rows', False))
+    only_dates_list = body.get('only_dates') or []
+    only_dates = (
+        {d for d in only_dates_list if d}
+        if isinstance(only_dates_list, list) else None
+    )
+    if only_dates:
+        try:
+            from datetime import date as _date
+            for d in only_dates:
+                _date.fromisoformat(d)
+        except ValueError:
+            return jsonify({'error': 'only_dates must be YYYY-MM-DD strings'}), 400
+
+    if not url or not url.startswith(SOD_BASE):
+        return jsonify({'error': f'url must start with {SOD_BASE}'}), 400
+
+    try:
+        client = SODClient()
+        zip_bytes = client.download_url(url)
+    except Exception as e:
+        return jsonify({'error': f'download failed: {e}'}), 502
+
+    if not zip_bytes:
+        return jsonify({'error': 'downloaded file was empty'}), 502
+
+    try:
+        parsed = stream_parse_sod_zip(
+            zip_bytes, set(SOD_TRACKED_SKUS.keys()),
+            keep_all_rows=keep_all)
+    except Exception as e:
+        return jsonify({'error': f'parse failed: {e}'}), 422
+
+    rows = parsed.get('rows_to_persist', [])
+    dates = sorted(parsed.get('dates_seen', set()))
+    if only_dates:
+        rows = [r for r in rows if r['snapshot_date'] in only_dates]
+        dates = [d for d in dates if d in only_dates]
+    if not rows:
+        return jsonify({
+            'error': 'no rows for tracked SKUs found in this download'
+                     + (' for the requested dates' if only_dates else ''),
+            'dates_in_zip': sorted(parsed.get('dates_seen', set())),
+            'only_dates_filter': sorted(only_dates) if only_dates else None,
+            'url': url,
+        }), 422
+
+    inserted = 0
+    try:
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        BATCH = 5000
+        batch = []
+        for r in rows:
+            batch.append((
+                r['sku'], r['store_number'], r['snapshot_date'],
+                r['status'], r['on_hand'], r['product_name'],
+                'portal_archive_import',
+            ))
+            if len(batch) >= BATCH:
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES %s
+                           ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+                else:
+                    cur.executemany(
+                        """INSERT OR IGNORE INTO sod_inventory
+                           (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        batch,
+                    )
+                    inserted += cur.rowcount
+                batch = []
+        if batch:
+            if USE_POSTGRES:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO sod_inventory
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                       VALUES %s
+                       ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING""",
+                    batch,
+                )
+                inserted += cur.rowcount
+            else:
+                cur.executemany(
+                    """INSERT OR IGNORE INTO sod_inventory
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    batch,
+                )
+                inserted += cur.rowcount
+        skipped = len(rows) - inserted
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': f'DB insert failed: {e}'}), 500
+
+    return jsonify({
+        'status': 'ok',
+        'url': url,
+        'dates_in_zip': dates,
+        'tracked_rows': len(rows),
+        'inserted': inserted,
+        'skipped_existing': skipped,
+        'note': 'Portal archive imported into sod_inventory.',
     })
 
 
