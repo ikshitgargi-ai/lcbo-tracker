@@ -8516,6 +8516,62 @@ def api_admin_new_listings_by_range():
         summary['lcbo_confirmed_new'] += len(lcbo_confirmed & union_new)
         summary['rep_confirmed_new'] += len(rep_confirmed & union_new)
 
+    fmt = (request.args.get('format') or 'json').lower()
+    if fmt == 'csv':
+        # Flat CSV: one row per (sku, store) added or lost. Designed for
+        # direct import into Excel / submission to NB Distillers.
+        import csv as _csv, io as _io
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow([
+            'window_start', 'window_end', 'sku', 'product_name', 'brand',
+            'verdict', 'store_number', 'discovered_via', 'lcbo_confirmed',
+            'rep_confirmed', 'start_snapshot_date', 'end_snapshot_date',
+            'start_was_clipped',
+        ])
+        for r in out_rows:
+            if r.get('start_was_clipped'):
+                # Mark the SKU as "no diff possible" — keep one row per SKU
+                w.writerow([
+                    start_d.isoformat(), end_d.isoformat(), r['sku'],
+                    r['product_name'], r['brand'], 'INSUFFICIENT_HISTORY',
+                    '', '', '', '',
+                    r.get('start_snapshot_date') or '',
+                    r.get('end_snapshot_date') or '',
+                    True,
+                ])
+                continue
+            for s in r.get('new_stores') or []:
+                w.writerow([
+                    start_d.isoformat(), end_d.isoformat(), r['sku'],
+                    r['product_name'], r['brand'], 'ADDED',
+                    s.get('store_number'), s.get('discovered_via'),
+                    bool(s.get('lcbo_confirmed')),
+                    bool(s.get('rep_confirmed')),
+                    r.get('start_snapshot_date') or '',
+                    r.get('end_snapshot_date') or '',
+                    False,
+                ])
+            for sn in r.get('lost_stores') or []:
+                w.writerow([
+                    start_d.isoformat(), end_d.isoformat(), r['sku'],
+                    r['product_name'], r['brand'], 'LOST',
+                    sn, 'sod', '', '',
+                    r.get('start_snapshot_date') or '',
+                    r.get('end_snapshot_date') or '',
+                    False,
+                ])
+        fname = (
+            f"anu-new-listings-{start_d.isoformat()}-to-{end_d.isoformat()}"
+            + (f'-{sku_filter}' if sku_filter else '')
+            + '.csv'
+        )
+        return Response(
+            buf.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="{fname}"'},
+        )
+
     return jsonify({
         'window': {
             'start': start_d.isoformat(),
@@ -8532,7 +8588,8 @@ def api_admin_new_listings_by_range():
             "union_new_count = stores that became Listed in the window AS DETECTED BY "
             "ANY SOURCE (SOD diff + lcbo.com confirmation + rep observations). "
             "discovered_via='lcbo_only' means SOD didn't show this listing — those "
-            "are the listings hidden from SOD that you can claim commission on."
+            "are the listings hidden from SOD that you can claim commission on. "
+            "Add &format=csv to download a flat CSV of every store added/lost."
         ),
         'as_of': datetime.utcnow().isoformat() + 'Z',
     })
