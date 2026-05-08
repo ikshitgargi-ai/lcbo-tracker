@@ -3137,136 +3137,177 @@ class SODClient:
     #
     # list_catalog() crawls the index and returns the parsed tree.
     # download_url() fetches any file given its full URL.
-    def list_catalog(self):
+    def list_catalog(self, debug=False):
         """Discover every available SOD download category + file.
 
-        Tries the known portal index URLs; for each successful page,
-        regex-extracts every /downloads/... link plus the surrounding
-        text label so we can present a navigable catalog.
+        STRATEGY:
+          1. Fetch /subscribers (the portal landing page after login)
+          2. From it, extract every anchor href — not just /downloads/...
+             Categories are listed as table rows where the LABEL column
+             names the category and the third column has an 'Available
+             documents' link to the per-category file list.
+          3. For each candidate "category page" link found on the index
+             (typical paths: /subscribers/N, /downloads/general/N,
+              /downloads/agent/AGENT/N), follow it.
+          4. On each category page, regex-extract every .zip file link
+             and use the page's H1/title as the category label.
 
-        Returns: {'index_url': str, 'categories': [...]}
+        Returns: {'index_url_used', 'agent_id', 'categories', 'discovery_log'}
         """
         import re as _re
+        from urllib.parse import urljoin
         self._ensure_logged_in()
 
-        index_candidates = [
-            f'{SOD_BASE}/subscribers',
-            f'{SOD_BASE}/subscribers/files',
-            f'{SOD_BASE}/downloads',
-        ]
-        # Walk known dirs too — agent-specific subscriptions live behind
-        # /downloads/agent/{agent_id}/...
-        if self.agent_id:
-            index_candidates.append(f'{SOD_BASE}/downloads/agent/{self.agent_id}')
-            index_candidates.append(f'{SOD_BASE}/subscribers/{self.agent_id}')
-
-        # Aggregate links seen on ANY of the discovered index pages.
-        files_by_cat: dict = {}      # cat_key -> list of file dicts
-        cat_labels: dict = {}        # cat_key -> human label (best-effort)
-        index_url_used = None
-
-        # Pattern 1: file link
-        # Matches: /downloads/general/14/something.zip
-        #          /downloads/agent/1113/13/something.zip
+        # ANCHOR_RE captures: full href + visible label text
+        ANCHOR_RE = _re.compile(
+            r'<a[^>]+href="([^"]+)"[^>]*>([^<]{0,200})</a>',
+            _re.IGNORECASE | _re.DOTALL,
+        )
         FILE_RE = _re.compile(
-            r'href="(/downloads/(general|agent/\d+)/(\d+)/([^/"][^"]*\.zip))"',
+            r'href="([^"]*?/downloads/[^"]*?\.zip)"',
             _re.IGNORECASE,
         )
-        # Pattern 2: section heading near a link — try to capture an h3/h4/strong
-        # immediately preceding a download anchor so we can label categories.
-        LABEL_NEAR_RE = _re.compile(
-            r'(?:<(?:h[2-5]|strong|td)[^>]*>([^<]{3,80})</(?:h[2-5]|strong|td)>'
-            r'|<a[^>]+>([^<]{3,80})</a>)',
+        TITLE_RE = _re.compile(
+            r'<(?:h1|h2)[^>]*>([^<]{3,200})</(?:h1|h2)>',
             _re.IGNORECASE,
         )
 
+        index_candidates = [f'{SOD_BASE}/subscribers']
+        if self.agent_id:
+            index_candidates += [
+                f'{SOD_BASE}/subscribers/{self.agent_id}',
+                f'{SOD_BASE}/downloads/agent/{self.agent_id}',
+            ]
+        index_candidates += [f'{SOD_BASE}/downloads', f'{SOD_BASE}/']
+
+        discovery_log: list = []
+        index_url_used = None
+        page_anchors: dict = {}     # url -> [(href, label), ...]
+
+        # ── Pass 1: scan known index pages for any anchor links ────────
         for url in index_candidates:
             try:
                 r = self.session.get(url, timeout=self.timeout)
-            except Exception:
+            except Exception as e:
+                discovery_log.append(f'{url} → {e}')
                 continue
+            discovery_log.append(f'{url} → {r.status_code} ({len(r.text or "")} bytes)')
             if r.status_code != 200:
                 continue
             html = r.text or ''
             if 'Sign out' not in html and 'sign-out' not in html.lower():
-                continue  # not actually logged in / wrong page
+                continue
             if not index_url_used:
                 index_url_used = url
-            # Extract every file link
+            anchors = []
+            for m in ANCHOR_RE.finditer(html):
+                href, label = m.groups()
+                href_abs = urljoin(url, href)
+                anchors.append((href_abs, ' '.join(label.split())[:200]))
+            page_anchors[url] = anchors
+
+        # ── Pass 2: collect candidate category-page URLs ────────────────
+        # Heuristics:
+        #   1. Anything under /downloads/* that's NOT directly a .zip
+        #   2. Anything under /subscribers/* deeper than the root
+        #   3. Anchors with text matching "available documents" / "files"
+        candidates: dict = {}   # cat_url -> {label: str, anchor_label: str}
+        for src_url, anchors in page_anchors.items():
+            for href, label in anchors:
+                if not href.startswith(SOD_BASE):
+                    continue
+                if href.lower().endswith('.zip'):
+                    continue
+                lower_label = label.lower()
+                is_dl_path = '/downloads/' in href and href.rstrip('/') != f'{SOD_BASE}/downloads'
+                is_sub_path = '/subscribers/' in href and href.rstrip('/') != f'{SOD_BASE}/subscribers'
+                is_doc_link = (
+                    'available document' in lower_label
+                    or 'documents' == lower_label
+                    or 'files' == lower_label
+                )
+                if is_dl_path or is_sub_path or is_doc_link:
+                    candidates.setdefault(href, {
+                        'anchor_label': label or '',
+                        'discovered_from': src_url,
+                    })
+
+        # ── Pass 3: visit each candidate; harvest .zip links + page title ─
+        files_by_cat: dict = {}
+        labels_by_cat: dict = {}
+        for cat_url, meta in candidates.items():
+            try:
+                r = self.session.get(cat_url, timeout=self.timeout)
+            except Exception as e:
+                discovery_log.append(f'{cat_url} → {e}')
+                continue
+            discovery_log.append(f'{cat_url} → {r.status_code}')
+            if r.status_code != 200:
+                continue
+            html = r.text or ''
+            # Page title often names the category
+            title_m = TITLE_RE.search(html)
+            page_title = ' '.join(title_m.group(1).split()) if title_m else ''
+            label = page_title or meta.get('anchor_label') or cat_url
+            # Use cat_url as the category key
             for m in FILE_RE.finditer(html):
-                rel_url, scope, cat_id, fname = m.groups()
-                cat_key = f'{scope}/{cat_id}'
+                rel = m.group(1)
+                full = urljoin(cat_url, rel)
+                fname = full.rsplit('/', 1)[-1]
+                # Derive a stable category_id from the URL path
+                # (e.g. /downloads/general/12/foo.zip → ('general', '12'))
+                segs = full.split('/downloads/', 1)[-1].split('/')
+                if len(segs) >= 2:
+                    if segs[0] == 'agent' and len(segs) >= 3:
+                        scope = f'agent/{segs[1]}'
+                        cat_id = segs[2] if segs[2].isdigit() else 0
+                    else:
+                        scope = segs[0]
+                        cat_id = segs[1] if segs[1].isdigit() else 0
+                else:
+                    scope = 'unknown'
+                    cat_id = 0
+                cat_key = cat_url  # use the page URL as a stable grouping key
                 files_by_cat.setdefault(cat_key, []).append({
-                    'url': SOD_BASE + rel_url,
+                    'url': full,
                     'filename': fname,
                     'category_scope': scope,
-                    'category_id': int(cat_id),
+                    'category_id': int(cat_id) if str(cat_id).isdigit() else 0,
                 })
-            # Try to label categories — find the nearest preceding heading
-            # for each unique category-id seen.
-            seen_ids = {m.group(3) for m in FILE_RE.finditer(html)}
-            for cat_id_str in seen_ids:
-                # Look at the 500 chars BEFORE the first occurrence
-                first = html.find(f'/{cat_id_str}/')
-                if first < 0:
-                    continue
-                window = html[max(0, first - 600):first]
-                # Last heading-like text in that window
-                labels = LABEL_NEAR_RE.findall(window)
-                if labels:
-                    label = next((s1 or s2 for s1, s2 in reversed(labels) if (s1 or s2).strip()), '')
-                    label = label.strip()
-                    if label and 'sign' not in label.lower() and 'menu' not in label.lower():
-                        # Pick best label per cat_id (any scope) — agent and general
-                        # often share the id label
-                        for k in [f'general/{cat_id_str}', f'agent/{self.agent_id}/{cat_id_str}']:
-                            if k in files_by_cat:
-                                cat_labels.setdefault(k, label)
+                labels_by_cat.setdefault(cat_key, label)
 
-        # Also check sub-page index for each category (some portals hide files
-        # behind a per-category page rather than listing everything on one).
-        for cat_key in list(files_by_cat.keys()):
-            try:
-                cat_url = f'{SOD_BASE}/downloads/{cat_key}'
-                r = self.session.get(cat_url, timeout=self.timeout)
-                if r.status_code == 200:
-                    for m in FILE_RE.finditer(r.text or ''):
-                        rel_url, scope, cat_id, fname = m.groups()
-                        sub_key = f'{scope}/{cat_id}'
-                        files_by_cat.setdefault(sub_key, [])
-                        # Dedupe
-                        existing_names = {f['filename'] for f in files_by_cat[sub_key]}
-                        if fname not in existing_names:
-                            files_by_cat[sub_key].append({
-                                'url': SOD_BASE + rel_url,
-                                'filename': fname,
-                                'category_scope': scope,
-                                'category_id': int(cat_id),
-                            })
-            except Exception:
-                pass
-
-        # Build response
+        # ── Build response ─────────────────────────────────────────────
         categories = []
-        for cat_key, files in files_by_cat.items():
-            # Sort files by filename (newest dates often last in YYMMDD names)
+        for cat_url, files in files_by_cat.items():
             files.sort(key=lambda f: f['filename'])
+            scope = files[0]['category_scope']
+            cat_id = files[0]['category_id']
             categories.append({
-                'category_key': cat_key,
-                'category_label': cat_labels.get(cat_key) or cat_key,
-                'category_scope': files[0]['category_scope'],
-                'category_id': files[0]['category_id'],
+                'category_key': f'{scope}/{cat_id}',
+                'category_label': labels_by_cat.get(cat_url, cat_url),
+                'category_url': cat_url,
+                'category_scope': scope,
+                'category_id': cat_id,
                 'file_count': len(files),
-                'files': files[:200],  # cap response size
+                'files': files[:200],
             })
-        # Sort categories: agent-scoped first, then by id
         categories.sort(key=lambda c: (c['category_scope'] != 'general', c['category_id']))
 
-        return {
+        out = {
             'index_url_used': index_url_used,
             'categories': categories,
             'agent_id': self.agent_id,
+            'candidates_scanned': len(candidates),
         }
+        if debug:
+            # Trim discovery log to keep response small
+            out['discovery_log'] = discovery_log[:80]
+            # Sample anchors from /subscribers so the operator can see what's there
+            sample = (page_anchors.get(f'{SOD_BASE}/subscribers') or [])[:40]
+            out['sample_subscribers_anchors'] = [
+                {'href': h, 'text': t} for h, t in sample
+            ]
+        return out
 
     def download_url(self, full_url):
         """Download a file by its full SOD URL. Returns raw bytes.
@@ -9518,9 +9559,10 @@ def api_admin_sod_portal_catalog():
       ]
     }
     """
+    debug = request.args.get('debug') in ('1', 'true', 'yes')
     try:
         client = SODClient()
-        catalog = client.list_catalog()
+        catalog = client.list_catalog(debug=debug)
     except Exception as e:
         return jsonify({'error': f'catalog discovery failed: {e}'}), 500
     return jsonify({
@@ -9530,7 +9572,8 @@ def api_admin_sod_portal_catalog():
             "Pick any file URL and POST to /api/admin/sod/import-from-portal "
             "with body {url}. The file is downloaded, parsed, and ingested "
             "into sod_inventory. Annual archives (e.g. Option 5 2025) "
-            "backfill our entire SOD history in one shot."
+            "backfill our entire SOD history in one shot. Add ?debug=1 to "
+            "include the discovery log + sample anchors from /subscribers."
         ),
     })
 
