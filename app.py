@@ -8337,6 +8337,8 @@ def api_admin_new_listings_by_range():
                 'lcbo_only_new_count': 0,
                 'rep_only_new_count': 0,
                 'union_new_count': 0,
+                'confirmed_new_count': 0,
+                'unconfirmed_count': 0,
                 'sod_lost_count': 0,
                 'net_change': 0,
                 'start_listed_count': 0,
