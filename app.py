@@ -5095,15 +5095,32 @@ def api_sod_health():
 
 @app.route('/healthz', methods=['GET'])
 def api_healthz():
-    """Standard health probe used by Render / uptime monitors. 503 if data > 1d stale."""
+    """Render / uptime probe.
+
+    Default behavior (=process-liveness check): always returns 200 if the
+    Flask worker is responsive. SOD freshness is reported as a field but
+    does NOT affect the HTTP code — uptime monitors stay green even when
+    SOD ingest is naturally 1-2 days behind on weekends.
+
+    Pass ?deep=1 to flip to the strict check (503 when snapshot >2d old).
+    Use the strict check from internal monitoring (the existing _stale_watch
+    cron) but NOT from public uptime services like UptimeRobot.
+    """
+    deep = request.args.get('deep') in ('1', 'true', 'yes')
     fresh = _sod_freshness()
-    age_days = fresh['snapshot_age_days']
-    healthy = age_days is not None and age_days <= 1
-    return jsonify({
-        'status': 'healthy' if healthy else 'unhealthy',
+    age_days = fresh.get('snapshot_age_days')
+    # Strict (deep) freshness threshold relaxed to 2 days — accounts for
+    # weekends where LCBO may not publish a fresh file Sat/Sun. The hourly
+    # _stale_watch escalates to email alert at >24h independently.
+    fresh_ok = age_days is None or age_days <= 2
+    payload = {
+        'status': 'healthy' if (not deep or fresh_ok) else 'unhealthy',
         'build': 'finder-stale-1d-v3',
+        'mode': 'deep' if deep else 'liveness',
         **fresh,
-    }), 200 if healthy else 503
+    }
+    code = 200 if (not deep or fresh_ok) else 503
+    return jsonify(payload), code
 
 
 # ============================================================================
@@ -9840,7 +9857,7 @@ def api_admin_sod_history_coverage():
         (r['latest_date'] for r in out_per_sku if r.get('latest_date')),
         default=None)
 
-    return jsonify({
+    response = jsonify({
         'as_of': datetime.utcnow().isoformat() + 'Z',
         'overall_earliest': earliest_all,
         'overall_latest': latest_all,
@@ -9854,12 +9871,12 @@ def api_admin_sod_history_coverage():
             "earliest_date is the first SOD snapshot we have for each SKU. "
             "If your /new-listings window starts AFTER this, the diff is "
             "real and self-contained. If your window starts BEFORE this, "
-            "upload a historical SOD ZIP via /sod-compare to fill the gap. "
-            "gap_starts_first_30 lists the first 30 missed snapshot days "
-            "(if any) — these create false 'new listing' rows in loose "
-            "mode but are invisible in strict mode."
+            "upload a historical SOD ZIP via /sod-compare to fill the gap."
         ),
     })
+    # Cache 5 min — coverage only changes on new daily ingest
+    response.headers['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=600'
+    return response
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -10794,6 +10811,141 @@ def api_admin_movement():
         'listings': listings_section,
         'as_of': datetime.utcnow().isoformat() + 'Z',
     })
+
+
+# ───────────────────────────────────────────────────────────────────────
+# SYSTEM STATUS — single endpoint for an at-a-glance dashboard
+# (frontend renders a green/amber/red dot using these signals).
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/system-status', methods=['GET'])
+def api_admin_system_status():
+    """Aggregate health signals into one tier: ok | degraded | down.
+
+    Cached for 30s — this endpoint is hit on every page nav.
+    """
+    fresh = _sod_freshness()
+    age_days = fresh.get('snapshot_age_days')
+    last_run_h = fresh.get('last_run_age_hours')
+
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    issues = []
+    signals = {
+        'sod_snapshot_age_days': age_days,
+        'sod_last_run_age_hours': last_run_h,
+    }
+
+    # SOD freshness
+    if age_days is not None and age_days > 2:
+        issues.append(f'SOD snapshot is {age_days} days old (catchup runs every 6h)')
+    if last_run_h is not None and last_run_h > 25:
+        issues.append(f'No successful SOD sync in {last_run_h:.0f}h')
+
+    # Inventory_history (lcbo.com scrape) freshness
+    try:
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT MAX(recorded_at) FROM inventory_history "
+                "WHERE store_number <> 'SUMMARY'"
+            )
+            r = cur.fetchone()
+            last_lcbo = r[0] if r else None
+        else:
+            r = cur.execute(
+                "SELECT MAX(recorded_at) FROM inventory_history "
+                "WHERE store_number <> 'SUMMARY'"
+            ).fetchone()
+            last_lcbo = r[0] if r else None
+        if last_lcbo:
+            try:
+                from datetime import datetime as _dt
+                if isinstance(last_lcbo, str):
+                    last_lcbo = _dt.fromisoformat(last_lcbo.split('+')[0].split('Z')[0])
+                lcbo_age_h = (datetime.utcnow() - last_lcbo).total_seconds() / 3600.0
+                signals['lcbo_scrape_age_hours'] = round(lcbo_age_h, 1)
+                if lcbo_age_h > 6:
+                    issues.append(f'lcbo.com cross-check is {lcbo_age_h:.1f}h stale (cron runs every 30min)')
+            except Exception:
+                pass
+        else:
+            signals['lcbo_scrape_age_hours'] = None
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+
+    # Latest activity log entry (rep activity heartbeat)
+    try:
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT MAX(created_at) FROM activities WHERE deleted_at IS NULL"
+            )
+            r = cur.fetchone()
+            last_act = r[0] if r else None
+        else:
+            r = cur.execute(
+                "SELECT MAX(created_at) FROM activities WHERE deleted_at IS NULL"
+            ).fetchone()
+            last_act = r[0] if r else None
+        if last_act:
+            try:
+                from datetime import datetime as _dt
+                if isinstance(last_act, str):
+                    last_act = _dt.fromisoformat(last_act.split('+')[0].split('Z')[0])
+                act_age_h = (datetime.utcnow() - last_act).total_seconds() / 3600.0
+                signals['last_activity_age_hours'] = round(act_age_h, 1)
+                if act_age_h > 72:
+                    issues.append(f'No rep visits logged in {act_age_h/24:.1f} days')
+            except Exception:
+                pass
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+
+    # Failed sync runs in last 24h
+    try:
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT COUNT(*) FROM sod_sync_runs "
+                "WHERE status = 'failed' AND run_at >= NOW() - INTERVAL '24 hours'"
+            )
+            failed_24h = int(cur.fetchone()[0] or 0)
+        else:
+            failed_24h = int(cur.execute(
+                "SELECT COUNT(*) FROM sod_sync_runs "
+                "WHERE status = 'failed' AND run_at >= datetime('now','-24 hours')"
+            ).fetchone()[0] or 0)
+        signals['sod_failed_runs_24h'] = failed_24h
+        if failed_24h >= 3:
+            issues.append(f'{failed_24h} SOD sync failures in the last 24h')
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+
+    if USE_POSTGRES:
+        cur.close()
+
+    # Tier the overall status
+    if not issues:
+        tier = 'ok'
+    elif any(
+        ('age >' in issue) or ('No successful SOD sync' in issue)
+        for issue in issues
+    ):
+        tier = 'degraded'
+    else:
+        tier = 'degraded'
+
+    payload = {
+        'tier': tier,
+        'issues': issues,
+        'signals': signals,
+        'sod_latest_snapshot': fresh.get('latest_snapshot'),
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+    }
+    response = jsonify(payload)
+    # Cache 30s — this is hit on every page nav
+    response.headers['Cache-Control'] = 'public, max-age=30, stale-while-revalidate=60'
+    return response
 
 
 @app.route('/api/admin/db-stats', methods=['GET'])
