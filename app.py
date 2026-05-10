@@ -7440,6 +7440,234 @@ def api_admin_rep_behavior():
     })
 
 
+# ───────────────────────────────────────────────────────────────────────
+# REP ACTIVITY REPORT — daily/weekly/monthly downloadable activity log
+# with per-rep filter. CSV-exportable for direct submission or pivot.
+# ───────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/rep-activity-report', methods=['GET'])
+def api_admin_rep_activity_report():
+    """Per-rep activity log with day/week/month filtering.
+
+    Query params:
+      rep        (str, OPTIONAL)   — filter to one rep (case-insensitive)
+      period     (str, OPTIONAL)   — 'today' / 'yesterday' / 'this_week' /
+                                     'last_week' / 'this_month' / 'last_month' /
+                                     'last_7d' / 'last_30d' / 'last_90d' / 'ytd'
+                                     (overridden by start/end if both given)
+      start, end (YYYY-MM-DD)      — explicit window
+      format     (json|csv)        — default json
+
+    Returns per-activity row + per-rep summary + per-day rollup.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    rep_filter = (request.args.get('rep') or '').strip()
+    period = (request.args.get('period') or '').strip().lower()
+    start_q = (request.args.get('start') or '').strip()
+    end_q = (request.args.get('end') or '').strip()
+    fmt = (request.args.get('format') or 'json').lower()
+
+    today_d = _toronto_today()
+
+    # Resolve window
+    if start_q and end_q:
+        try:
+            start_d = _date.fromisoformat(start_q)
+            end_d = _date.fromisoformat(end_q)
+        except ValueError:
+            return jsonify({'error': 'start/end must be YYYY-MM-DD'}), 400
+    elif period == 'today':
+        start_d = end_d = today_d
+    elif period == 'yesterday':
+        start_d = end_d = today_d - _td(days=1)
+    elif period == 'this_week':
+        start_d = today_d - _td(days=today_d.weekday())  # Monday
+        end_d = today_d
+    elif period == 'last_week':
+        end_d = today_d - _td(days=today_d.weekday() + 1)  # last Sunday
+        start_d = end_d - _td(days=6)                       # last Monday
+    elif period == 'this_month':
+        start_d = today_d.replace(day=1)
+        end_d = today_d
+    elif period == 'last_month':
+        first_this_month = today_d.replace(day=1)
+        end_d = first_this_month - _td(days=1)
+        start_d = end_d.replace(day=1)
+    elif period == 'last_7d':
+        start_d = today_d - _td(days=7)
+        end_d = today_d
+    elif period == 'last_30d':
+        start_d = today_d - _td(days=30)
+        end_d = today_d
+    elif period == 'last_90d':
+        start_d = today_d - _td(days=90)
+        end_d = today_d
+    elif period == 'ytd':
+        start_d = _date(today_d.year, 1, 1)
+        end_d = today_d
+    else:
+        # Default: last 30d
+        start_d = today_d - _td(days=30)
+        end_d = today_d
+
+    if start_d > end_d:
+        return jsonify({'error': 'start must be <= end'}), 400
+
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    rows = []
+    try:
+        sql = """
+            SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
+                   a.store_id, s.store_number, s.account, s.address,
+                   s.city, s.postal, s.priority, s.rep AS store_rep
+            FROM activities a
+            LEFT JOIN stores s ON s.id = a.store_id
+            WHERE a.deleted_at IS NULL
+              AND a.created_at::date >= %s::date
+              AND a.created_at::date <= %s::date
+        """ if USE_POSTGRES else """
+            SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
+                   a.store_id, s.store_number, s.account, s.address,
+                   s.city, s.postal, s.priority, s.rep AS store_rep
+            FROM activities a
+            LEFT JOIN stores s ON s.id = a.store_id
+            WHERE a.deleted_at IS NULL
+              AND date(a.created_at) >= ?
+              AND date(a.created_at) <= ?
+        """
+        params: list = [start_d.isoformat(), end_d.isoformat()]
+        if rep_filter:
+            sql += " AND LOWER(TRIM(a.rep)) = LOWER(TRIM(%s))" if USE_POSTGRES else " AND LOWER(TRIM(a.rep)) = LOWER(TRIM(?))"
+            params.append(rep_filter)
+        sql += " ORDER BY a.created_at DESC LIMIT 50000"
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            rows.append({cols[i]: _json_safe(v) for i, v in enumerate(r)})
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        return jsonify({'error': f'query failed: {e}'}), 500
+    finally:
+        if USE_POSTGRES:
+            try: cur.close()
+            except Exception: pass
+
+    # Per-rep summary
+    by_rep: dict = {}
+    by_day: dict = {}
+    by_type: dict = {}
+    for r in rows:
+        rep_name = (r.get('rep') or '').strip() or '(unknown)'
+        rep_lower = rep_name.lower()
+        d_key = (str(r.get('created_at') or ''))[:10]
+        a_type = (r.get('activity_type') or '').strip().lower() or '(unspecified)'
+
+        bucket = by_rep.setdefault(rep_lower, {
+            'rep': rep_name, 'visits': 0, 'unique_stores': set(),
+            'activity_types': {}, 'first_at': None, 'last_at': None,
+        })
+        bucket['visits'] += 1
+        if r.get('store_id') is not None:
+            bucket['unique_stores'].add(r['store_id'])
+        bucket['activity_types'][a_type] = bucket['activity_types'].get(a_type, 0) + 1
+        ts = str(r.get('created_at') or '')
+        if not bucket['first_at'] or ts < bucket['first_at']:
+            bucket['first_at'] = ts
+        if not bucket['last_at'] or ts > bucket['last_at']:
+            bucket['last_at'] = ts
+
+        if d_key:
+            by_day[d_key] = by_day.get(d_key, 0) + 1
+        by_type[a_type] = by_type.get(a_type, 0) + 1
+
+    summary_rows = []
+    for b in by_rep.values():
+        summary_rows.append({
+            'rep': b['rep'],
+            'visits': b['visits'],
+            'unique_stores': len(b['unique_stores']),
+            'repeat_visit_pct': round(
+                (b['visits'] - len(b['unique_stores'])) / b['visits'] * 100, 1
+            ) if b['visits'] else 0.0,
+            'activity_types': b['activity_types'],
+            'first_at': b['first_at'],
+            'last_at': b['last_at'],
+        })
+    summary_rows.sort(key=lambda x: -x['visits'])
+
+    daily_rollup = sorted(
+        [{'date': d, 'visits': n} for d, n in by_day.items()],
+        key=lambda x: x['date'],
+    )
+
+    if fmt == 'csv':
+        import csv as _csv, io as _io
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow([
+            'created_at', 'date', 'time', 'rep', 'activity_type',
+            'store_number', 'account', 'address', 'city', 'postal',
+            'store_priority', 'store_assigned_rep', 'notes',
+        ])
+        for r in rows:
+            ts = str(r.get('created_at') or '')
+            w.writerow([
+                ts,
+                ts[:10],
+                ts[11:19] if len(ts) >= 19 else '',
+                r.get('rep') or '',
+                r.get('activity_type') or '',
+                r.get('store_number') or '',
+                r.get('account') or '',
+                r.get('address') or '',
+                r.get('city') or '',
+                r.get('postal') or '',
+                r.get('priority') or '',
+                r.get('store_rep') or '',
+                (r.get('notes') or '').replace('\n', ' ').replace('\r', ' '),
+            ])
+        fname = (
+            f"anu-rep-activity-{start_d.isoformat()}-to-{end_d.isoformat()}"
+            + (f'-{rep_filter}' if rep_filter else '-all-reps')
+            + '.csv'
+        )
+        return Response(
+            buf.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="{fname}"'},
+        )
+
+    return jsonify({
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'window': {
+            'start': start_d.isoformat(),
+            'end': end_d.isoformat(),
+            'days': (end_d - start_d).days + 1,
+            'period_resolved_from': period or 'last_30d (default)',
+        },
+        'rep_filter': rep_filter or None,
+        'totals': {
+            'rows': len(rows),
+            'unique_reps': len(by_rep),
+            'unique_active_days': len(by_day),
+            'activity_type_counts': by_type,
+        },
+        'per_rep_summary': summary_rows,
+        'daily_rollup': daily_rollup,
+        'rows': rows[:1000],   # cap response size; CSV path returns all
+        'how_to_read': (
+            "Each row is one activity (visit / call / email / tasting). "
+            "per_rep_summary aggregates per rep within the window. "
+            "daily_rollup is the bar-chart series. "
+            "Add &format=csv to download the full row-level log "
+            "(up to 50,000 rows) — designed for Excel pivots and "
+            "submission to NB Distillers / brand owners."
+        ),
+    })
+
+
 @app.route('/api/admin/data-integrity', methods=['GET'])
 def api_admin_data_integrity():
     """Comprehensive data-accuracy audit. Read-only, no auth (just diagnostic).
