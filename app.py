@@ -579,6 +579,14 @@ def init_db():
             ('products', 'delisting_date', "TEXT DEFAULT ''"),
             ('activities', 'status_code', "INTEGER DEFAULT 0"),
             ('stores', 'lcbo_store_id', "TEXT DEFAULT ''"),
+            # Silent GPS capture on activity submission. Existing lat/lng
+            # columns hold the position; these new fields add precision +
+            # capture-time + distance from the store's known coords. Never
+            # surfaced in the rep-facing UI — operator-only via reports.
+            ('activities', 'accuracy_m', 'REAL'),
+            ('activities', 'client_ts', 'TIMESTAMP'),
+            ('activities', 'distance_from_store_m', 'REAL'),
+            ('activities', 'deleted_at', 'TIMESTAMP'),
         ])
         for table, col, coltype in migrate_cols:
             try:
@@ -7520,7 +7528,9 @@ def api_admin_rep_activity_report():
         sql = """
             SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
                    a.store_id, s.store_number, s.account, s.address,
-                   s.city, s.postal, s.priority, s.rep AS store_rep
+                   s.city, s.postal, s.priority, s.rep AS store_rep,
+                   a.lat AS client_lat, a.lng AS client_lng,
+                   a.accuracy_m, a.client_ts, a.distance_from_store_m
             FROM activities a
             LEFT JOIN stores s ON s.id = a.store_id
             WHERE a.deleted_at IS NULL
@@ -7529,7 +7539,9 @@ def api_admin_rep_activity_report():
         """ if USE_POSTGRES else """
             SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
                    a.store_id, s.store_number, s.account, s.address,
-                   s.city, s.postal, s.priority, s.rep AS store_rep
+                   s.city, s.postal, s.priority, s.rep AS store_rep,
+                   a.lat AS client_lat, a.lng AS client_lng,
+                   a.accuracy_m, a.client_ts, a.distance_from_store_m
             FROM activities a
             LEFT JOIN stores s ON s.id = a.store_id
             WHERE a.deleted_at IS NULL
@@ -7610,9 +7622,13 @@ def api_admin_rep_activity_report():
             'created_at', 'date', 'time', 'rep', 'activity_type',
             'store_number', 'account', 'address', 'city', 'postal',
             'store_priority', 'store_assigned_rep', 'notes',
+            'logged_lat', 'logged_lng', 'logged_accuracy_m',
+            'logged_at_client', 'distance_from_store_m',
         ])
         for r in rows:
             ts = str(r.get('created_at') or '')
+            cl_lat = r.get('client_lat')
+            cl_lng = r.get('client_lng')
             w.writerow([
                 ts,
                 ts[:10],
@@ -7627,6 +7643,11 @@ def api_admin_rep_activity_report():
                 r.get('priority') or '',
                 r.get('store_rep') or '',
                 (r.get('notes') or '').replace('\n', ' ').replace('\r', ' '),
+                cl_lat if (cl_lat is not None and cl_lat != 0) else '',
+                cl_lng if (cl_lng is not None and cl_lng != 0) else '',
+                r.get('accuracy_m') or '',
+                r.get('client_ts') or '',
+                r.get('distance_from_store_m') or '',
             ])
         fname = (
             f"anu-rep-activity-{start_d.isoformat()}-to-{end_d.isoformat()}"
@@ -16319,17 +16340,61 @@ def api_crm_activities_create():
     # happened. Defaults to today if not provided.
     visit_date = d.get('visit_date') or _toronto_today().isoformat()
 
+    # Silent geo capture — frontend sends GPS coords + accuracy + read-time
+    # silently on every activity submit. NEVER displayed in rep-facing UI;
+    # operator-only via /api/admin/rep-activity-report CSV. Compute distance
+    # from the store's known coords (haversine) so we can flag visits logged
+    # from far away (e.g. logged from home).
+    def _f(v):
+        try:
+            return float(v) if v not in (None, '', 'null') else None
+        except (TypeError, ValueError):
+            return None
+    in_lat = _f(d.get('lat'))
+    in_lng = _f(d.get('lng'))
+    accuracy_m = _f(d.get('accuracy_m'))
+    client_ts_raw = d.get('client_ts') or None
+    client_ts = (
+        client_ts_raw[:19].replace('T', ' ')
+        if (client_ts_raw and isinstance(client_ts_raw, str)) else None
+    )
+    distance_from_store_m = None
+    if in_lat and in_lng and store_id:
+        try:
+            if USE_POSTGRES:
+                _c = db.cursor()
+                _c.execute("SELECT lat, lng FROM stores WHERE id=%s", (store_id,))
+                srow = _c.fetchone()
+                _c.close()
+            else:
+                srow = db.execute("SELECT lat, lng FROM stores WHERE id=?", (store_id,)).fetchone()
+            if srow and srow[0] and srow[1]:
+                import math
+                slat, slng = float(srow[0]), float(srow[1])
+                R = 6371000.0
+                dlat = math.radians(slat - in_lat)
+                dlng = math.radians(slng - in_lng)
+                a = (math.sin(dlat / 2) ** 2
+                     + math.cos(math.radians(in_lat))
+                     * math.cos(math.radians(slat))
+                     * math.sin(dlng / 2) ** 2)
+                distance_from_store_m = round(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)), 1)
+        except Exception:
+            distance_from_store_m = None
+
     insert_cols = ['store_id', 'rep_id', 'activity_type', 'notes', 'rep',
                    'outcome', 'duration_minutes', 'rating',
                    'next_action', 'next_action_date', 'horeca_account_id',
-                   'lat', 'lng', 'visit_date']
+                   'lat', 'lng', 'visit_date',
+                   'accuracy_m', 'client_ts', 'distance_from_store_m']
     vals = (
         store_id, rep_id, activity_type, d.get('notes', ''), rep_name,
         d.get('outcome', ''), int(d.get('duration_minutes') or 0), int(d.get('rating') or 0),
         d.get('next_action', ''), d.get('next_action_date') or None,
         d.get('horeca_account_id'),
-        float(d.get('lat') or 0), float(d.get('lng') or 0),
+        float(in_lat or 0), float(in_lng or 0),
         visit_date,
+        accuracy_m, client_ts, distance_from_store_m,
     )
     if USE_POSTGRES:
         cur = db.cursor()
@@ -17665,6 +17730,164 @@ def api_crm_manager_dashboard():
 
 
 REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
+
+# Module-level TERRITORY map — single source of truth for postal-prefix
+# routing assignments. Reps can STILL log activities anywhere; this just
+# drives /api/crm/territory-plan + the auto-stamp on stores.rep.
+TERRITORY_MAP = {
+    'Namit': {
+        # Full GTA — Toronto core (all M*), the 905 ring (L1*/L3*/L4*/L6*),
+        # plus the 416/905 boundary corridors. Reps can still log anywhere.
+        'name': 'Greater Toronto Area',
+        'postal_prefixes': [
+            'M',                                           # Toronto (416)
+            'L1',                                          # Durham (Pickering/Ajax/Whitby/Oshawa)
+            'L3R', 'L3S', 'L3T', 'L3X', 'L3Y',             # Markham/Newmarket
+            'L4A', 'L4B', 'L4C', 'L4E', 'L4G', 'L4H',     # Stouffville/Aurora/RH/Vaughan
+            'L4J', 'L4K', 'L4L',                           # Vaughan/Concord/Woodbridge
+            'L6A', 'L6B', 'L6C', 'L6E',                    # Markham
+        ],
+        'fallback_cities': [
+            'Toronto', 'North York', 'Etobicoke', 'Scarborough',
+            'Woodbridge', 'Vaughan', 'Maple', 'Markham', 'Stouffville',
+            'Newmarket', 'Aurora', 'Richmond Hill', 'Thornhill',
+            'Concord', 'Kleinburg', 'Pickering', 'Ajax', 'Whitby',
+            'Oshawa', 'East Gwillimbury',
+        ],
+        'target_min': 120, 'target_max': 200,
+    },
+    'Surya': {
+        # Ottawa + immediate surroundings. Not Kingston/Brockville/Belleville.
+        'name': 'Ottawa region',
+        'postal_prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
+        'fallback_cities': [
+            'Ottawa', 'Kanata', 'Nepean', 'Orleans', 'Stittsville',
+            'Manotick', 'Rockland', 'Embrun', 'Carleton Place',
+            'Almonte', 'Smiths Falls', 'Gloucester', 'Vanier',
+            'Russell', 'Kemptville', 'Cumberland', 'Greely',
+        ],
+        'target_min': 40, 'target_max': 70,
+    },
+    'Ikshit': {
+        # Burlington + Oakville (Halton south) — overlaps with GTA west edge.
+        'name': 'Burlington + Oakville',
+        'postal_prefixes': ['L7L', 'L7M', 'L7N', 'L7P', 'L7R', 'L7S', 'L7T'],
+        'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
+        'target_min': 25, 'target_max': 45,
+    },
+    'Virat': {
+        'name': 'Mississauga + Milton + Caledon + Brampton',
+        'postal_prefixes': ['L4Z', 'L5', 'L6P', 'L6R', 'L6S', 'L6T',
+                            'L6V', 'L6W', 'L6X', 'L6Y',
+                            'L7A', 'L7C', 'L7E', 'L7G', 'L7K'],
+        'fallback_cities': ['Mississauga', 'Milton', 'Caledon', 'Bolton',
+                            'Georgetown', 'Brampton'],
+        'target_min': 40, 'target_max': 70,
+    },
+    'Neeraj': {
+        'name': 'Guelph + Cambridge + KW + Hamilton',
+        'postal_prefixes': ['N1', 'N2', 'N3', 'L8', 'L9G', 'L9H', 'L9J', 'L9K'],
+        'fallback_cities': ['Hamilton', 'Niagara Falls', 'Guelph',
+                            'Cambridge', 'Kitchener', 'Waterloo',
+                            'Stoney Creek', 'Ancaster', 'Dundas',
+                            'Acton', 'Rockwood', 'Fergus', 'Elora', 'Erin'],
+        'target_min': 50, 'target_max': 100,
+    },
+}
+
+
+@app.route('/api/crm/admin/restamp-territories', methods=['POST'])
+@require_admin_token
+def api_crm_admin_restamp_territories():
+    """Re-stamp the stores.rep column based on TERRITORY_MAP postal prefixes.
+
+    Walks every store; for each store, finds the first rep in TERRITORY_MAP
+    whose postal_prefixes match the store's postal code; sets stores.rep
+    accordingly. Stores that match no territory are left unchanged.
+
+    This is the canonical way to assign Namit=GTA, Surya=Ottawa, etc.
+    Returns per-rep counts of stores stamped.
+    """
+    db = get_db()
+    cur = db.cursor() if USE_POSTGRES else db
+    try:
+        if USE_POSTGRES:
+            cur.execute("SELECT id, postal, city FROM stores")
+        else:
+            cur.execute("SELECT id, postal, city FROM stores")
+        all_stores = cur.fetchall()
+    except Exception as e:
+        return jsonify({'error': f'read failed: {e}'}), 500
+
+    per_rep_counts: dict = {r: 0 for r in TERRITORY_MAP.keys()}
+    unmatched = 0
+    updates: list = []  # (rep, store_id)
+
+    for row in all_stores:
+        store_id = row[0] if not isinstance(row, dict) else row['id']
+        postal = (row[1] if not isinstance(row, dict) else row['postal']) or ''
+        city = (row[2] if not isinstance(row, dict) else row['city']) or ''
+        postal_clean = postal.upper().replace(' ', '')
+        city_lower = city.lower().strip()
+
+        matched_rep = None
+        # Postal-prefix match first (longest prefix wins)
+        best_pfx_len = 0
+        for rep, cfg in TERRITORY_MAP.items():
+            for pfx in cfg.get('postal_prefixes', []):
+                if postal_clean.startswith(pfx.upper()) and len(pfx) > best_pfx_len:
+                    matched_rep = rep
+                    best_pfx_len = len(pfx)
+        # City fallback if no postal match
+        if not matched_rep:
+            for rep, cfg in TERRITORY_MAP.items():
+                if city_lower in [c.lower() for c in cfg.get('fallback_cities', [])]:
+                    matched_rep = rep
+                    break
+        if matched_rep:
+            per_rep_counts[matched_rep] += 1
+            updates.append((matched_rep, store_id))
+        else:
+            unmatched += 1
+
+    # Bulk update
+    try:
+        if USE_POSTGRES:
+            psycopg2.extras.execute_batch(
+                cur,
+                "UPDATE stores SET rep = %s WHERE id = %s",
+                updates, page_size=500,
+            )
+        else:
+            cur.executemany(
+                "UPDATE stores SET rep = ? WHERE id = ?",
+                updates,
+            )
+        db.commit()
+        if USE_POSTGRES:
+            cur.close()
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        return jsonify({'error': f'update failed: {e}'}), 500
+
+    try:
+        _log_event('territory_restamp', 'admin', None, '',
+                   {'per_rep': per_rep_counts, 'unmatched': unmatched})
+    except Exception:
+        pass
+
+    return jsonify({
+        'status': 'ok',
+        'total_stores': len(all_stores),
+        'per_rep_counts': per_rep_counts,
+        'unmatched': unmatched,
+        'note': (
+            "Stores assignment updated from TERRITORY_MAP. Reps can still log "
+            "activities at any store — this only sets the default rep for "
+            "territory-plan + rep-performance views."
+        ),
+    })
 
 
 @app.route('/api/crm/admin/roster', methods=['GET'])
