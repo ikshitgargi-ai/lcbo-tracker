@@ -10279,7 +10279,7 @@ def api_admin_sod_bulk_upload_historical():
 # ───────────────────────────────────────────────────────────────────────
 @app.route('/api/admin/hidden-listings', methods=['GET'])
 def api_admin_hidden_listings():
-    """Detect listings hidden in SOD via 4 distinct patterns.
+    """Detect listings hidden in SOD via 5 distinct patterns.
 
     Query params:
       sku=<7-digit>      filter to one SKU (optional)
@@ -10287,14 +10287,31 @@ def api_admin_hidden_listings():
       flicker_min=3      min status changes to count as flicker (default 3)
       mass_delist_pct=10 day-over-day drop threshold (default 10%)
       lcbo_window_h=72   lcbo.com inventory window for hidden-inventory check
+      start=YYYY-MM-DD   override start of inspection window (else: lookback_days)
+      end=YYYY-MM-DD     override end of inspection window (else: latest snapshot)
+      min_on_hand=1      min on_hand units for the inventory-no-listing detector
     """
+    from datetime import date as _date, timedelta as _td
+
     try:
         lookback_days = max(7, min(int(request.args.get('lookback_days', '90')), 365))
         flicker_min = max(2, min(int(request.args.get('flicker_min', '3')), 20))
         mass_delist_pct = max(1, min(int(request.args.get('mass_delist_pct', '10')), 100))
         lcbo_window_h = max(1, min(int(request.args.get('lcbo_window_h', '72')), 720))
+        min_on_hand = max(1, min(int(request.args.get('min_on_hand', '1')), 9999))
     except ValueError:
         return jsonify({'error': 'numeric params must be integers'}), 400
+
+    # Optional explicit date-range overrides
+    start_q = (request.args.get('start') or '').strip()
+    end_q = (request.args.get('end') or '').strip()
+    try:
+        range_start = _date.fromisoformat(start_q) if start_q else None
+        range_end = _date.fromisoformat(end_q) if end_q else None
+    except ValueError:
+        return jsonify({'error': 'start/end must be YYYY-MM-DD'}), 400
+    if range_start and range_end and range_start > range_end:
+        return jsonify({'error': 'start must be <= end'}), 400
 
     sku_filter = (request.args.get('sku') or '').strip()
     skus_to_audit = (
@@ -10308,12 +10325,14 @@ def api_admin_hidden_listings():
         'hidden_inventory': [],
         'flicker_patterns': [],
         'mass_delist_days': [],
+        'inventory_no_listing': [],
     }
     summary = {
         'total_ghost': 0,
         'total_hidden_inventory': 0,
         'total_flicker': 0,
         'total_mass_delist_events': 0,
+        'total_inventory_no_listing': 0,
     }
 
     for sku in skus_to_audit:
@@ -10660,6 +10679,74 @@ def api_admin_hidden_listings():
             except Exception: pass
             print(f"[hidden] mass-delist-detect failed for {sku}: {e}")
 
+        # ── PATTERN 5: INVENTORY-NO-LISTING ────────────────────────────
+        # SOD's own on_hand column shows units > 0 but the row's status
+        # is 'D' (Delisting) or 'F' (Fully Delisted) — i.e. LCBO claims
+        # the listing is gone, but the warehouse data still reports
+        # bottles on the floor. These are the "blank-status with stock"
+        # cases listings hide in. Scanned across the requested date range,
+        # not just the latest snapshot, so movements aren't lost.
+        try:
+            cur = db.cursor() if USE_POSTGRES else db
+            if USE_POSTGRES:
+                # Window: explicit start/end, else last lookback_days
+                if range_start and range_end:
+                    cur.execute(
+                        "SELECT store_number, snapshot_date::text, status, "
+                        "       on_hand, product_name "
+                        "FROM sod_inventory "
+                        "WHERE sku=%s AND status IN ('D','F') "
+                        "  AND on_hand >= %s "
+                        "  AND snapshot_date BETWEEN %s::date AND %s::date "
+                        "ORDER BY snapshot_date DESC, store_number ASC "
+                        "LIMIT 2000",
+                        (sku, min_on_hand, range_start.isoformat(),
+                         range_end.isoformat()))
+                else:
+                    cur.execute(
+                        "SELECT store_number, snapshot_date::text, status, "
+                        "       on_hand, product_name "
+                        "FROM sod_inventory "
+                        "WHERE sku=%s AND status IN ('D','F') "
+                        "  AND on_hand >= %s "
+                        "  AND snapshot_date >= CURRENT_DATE - "
+                        "      (INTERVAL '1 day' * %s) "
+                        "ORDER BY snapshot_date DESC, store_number ASC "
+                        "LIMIT 2000",
+                        (sku, min_on_hand, lookback_days))
+                rows = cur.fetchall()
+                # Aggregate per (store, status) — show latest snapshot per store
+                seen: set = set()
+                for r in rows:
+                    try:
+                        sn = int(r[0])
+                    except (ValueError, TypeError):
+                        continue
+                    key = (sn, r[2])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    output['inventory_no_listing'].append({
+                        'sku': sku,
+                        'product_name': r[4] or name,
+                        'brand': brand,
+                        'store_number': sn,
+                        'snapshot_date': r[1],
+                        'sod_status': r[2],
+                        'on_hand': int(r[3] or 0),
+                        'pattern': 'inventory_no_listing',
+                        'evidence': (
+                            f"SOD status={r[2]} ({'Delisting' if r[2]=='D' else 'Fully Delisted'}) "
+                            f"but on_hand={int(r[3] or 0)} units in snapshot {r[1]}."
+                        ),
+                    })
+                summary['total_inventory_no_listing'] += len(seen)
+                cur.close()
+        except Exception as e:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[hidden] inventory-no-listing-detect failed for {sku}: {e}")
+
     # Sort each section by recency / severity
     output['ghost_listings'].sort(
         key=lambda x: x.get('last_listed_date') or '', reverse=True)
@@ -10669,6 +10756,8 @@ def api_admin_hidden_listings():
         key=lambda x: -x.get('flip_count', 0))
     output['mass_delist_days'].sort(
         key=lambda x: x.get('snapshot_date') or '', reverse=True)
+    output['inventory_no_listing'].sort(
+        key=lambda x: -(x.get('on_hand') or 0))
 
     return jsonify({
         'as_of': datetime.utcnow().isoformat() + 'Z',
@@ -10678,6 +10767,9 @@ def api_admin_hidden_listings():
             'mass_delist_pct': mass_delist_pct,
             'lcbo_window_h': lcbo_window_h,
             'sku_filter': sku_filter or None,
+            'start': range_start.isoformat() if range_start else None,
+            'end': range_end.isoformat() if range_end else None,
+            'min_on_hand': min_on_hand,
         },
         'summary': summary,
         'patterns': output,
@@ -10688,6 +10780,11 @@ def api_admin_hidden_listings():
             "FLICKER = same store-SKU flipped status 3+ times in 30 days "
             "(unusual for real listings). "
             "MASS-DELIST = a snapshot day where >10% of our listings dropped at once. "
+            "INVENTORY-NO-LISTING = SOD's own row shows on_hand>0 units but status is "
+            "D (Delisting) or F (Fully Delisted). Bottles on the warehouse floor "
+            "with no active listing — the most common 'blank-with-stock' hiding pattern. "
+            "Scanned across the full date range (start/end or lookback_days), not just "
+            "the latest snapshot, so nothing slips through. "
             "Together these surface every documented disappearance pattern."
         ),
     })
