@@ -7525,6 +7525,9 @@ def api_admin_rep_activity_report():
     cur = db.cursor() if USE_POSTGRES else db
     rows = []
     try:
+        # created_at is stored as naive UTC; reps work in America/Toronto.
+        # Convert UTC → Toronto before truncating to date so a 23:50 ET log
+        # (which is 03:50 UTC the next day) shows up on the correct day.
         sql = """
             SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
                    a.store_id, s.store_number, s.account, s.address,
@@ -7534,8 +7537,8 @@ def api_admin_rep_activity_report():
             FROM activities a
             LEFT JOIN stores s ON s.id = a.store_id
             WHERE a.deleted_at IS NULL
-              AND a.created_at::date >= %s::date
-              AND a.created_at::date <= %s::date
+              AND ((a.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Toronto')::date >= %s::date
+              AND ((a.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Toronto')::date <= %s::date
         """ if USE_POSTGRES else """
             SELECT a.id, a.created_at, a.rep, a.activity_type, a.notes,
                    a.store_id, s.store_number, s.account, s.address,
@@ -7545,8 +7548,8 @@ def api_admin_rep_activity_report():
             FROM activities a
             LEFT JOIN stores s ON s.id = a.store_id
             WHERE a.deleted_at IS NULL
-              AND date(a.created_at) >= ?
-              AND date(a.created_at) <= ?
+              AND date(a.created_at, '-4 hours') >= ?
+              AND date(a.created_at, '-4 hours') <= ?
         """
         params: list = [start_d.isoformat(), end_d.isoformat()]
         if rep_filter:
