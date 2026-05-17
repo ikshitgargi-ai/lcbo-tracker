@@ -230,21 +230,47 @@ if _sentry_dsn:
 # decorator usage. Python evaluates decorators at module-import time, so
 # referencing an undefined symbol → NameError → gunicorn worker dies → deploy fails.
 
+import hmac as _hmac
+
+# API_KEY gates ALL endpoints (read + write). Set in Render env vars.
+# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+API_KEY = os.environ.get('API_KEY', '').strip()
+
+# Public paths that skip API key auth (health probes, static assets, root page)
+_PUBLIC_PATHS = frozenset(('/', '/healthz', '/favicon.ico'))
+
+
+@app.before_request
+def _require_api_key():
+    """Gate every /api/* request behind X-API-Key header.
+    If API_KEY env var is unset, allow everything (dev mode only).
+    """
+    if not API_KEY:
+        return
+    if request.path in _PUBLIC_PATHS:
+        return
+    if request.path.startswith('/static'):
+        return
+    if not request.path.startswith('/api'):
+        return
+    got = (request.headers.get('X-API-Key') or '').strip()
+    if not got:
+        return jsonify({'error': 'unauthorized', 'detail': 'X-API-Key header required.'}), 401
+    if not _hmac.compare_digest(got, API_KEY):
+        return jsonify({'error': 'forbidden', 'detail': 'Invalid API key.'}), 403
+
+
 def _admin_token_ok() -> bool:
     """Verify X-Admin-Token header against ADMIN_TOKEN env var.
     If ADMIN_TOKEN is not set, only allow from localhost (dev convenience).
-    Constant-time comparison to defeat timing attacks.
     """
     expected = os.environ.get('ADMIN_TOKEN', '').strip()
     if not expected:
         return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
     got = request.headers.get('X-Admin-Token', '').strip()
-    if not got:
-        got = (request.args.get('admin_token') or '').strip()
     if not got or len(got) != len(expected):
         return False
-    import hmac
-    return hmac.compare_digest(got, expected)
+    return _hmac.compare_digest(got, expected)
 
 
 def require_admin_token(fn):
@@ -256,15 +282,12 @@ def require_admin_token(fn):
         if not _admin_token_ok():
             return jsonify({
                 'error': 'forbidden',
-                'detail': 'Provide a valid X-Admin-Token header (or ?admin_token= query param).',
+                'detail': 'Provide a valid X-Admin-Token header.',
             }), 403
         return fn(*args, **kwargs)
     return wrapped
 
 
-# Mutation gate (Origin/Referer-based — frontend pays no UX cost).
-# Stops random internet curl from wiping CRM data without requiring tokens
-# in every fetch. Verified domains pass; everything else 403s.
 _ALLOWED_ORIGINS = {
     'https://lcbo-tracker-web.vercel.app',
     'https://lcbo.anu-spirits.com',
@@ -275,19 +298,17 @@ _ALLOWED_ORIGINS = {
 
 
 def _request_origin_ok() -> bool:
-    """Return True if the request's Origin or Referer is on the allowlist."""
+    """Return True if the request's Origin or Referer is on the explicit allowlist."""
     origin = (request.headers.get('Origin') or '').strip().rstrip('/')
     referer = (request.headers.get('Referer') or '').strip()
     if origin and origin in _ALLOWED_ORIGINS:
-        return True
-    if origin.endswith('.vercel.app'):
         return True
     if referer:
         try:
             from urllib.parse import urlparse
             p = urlparse(referer)
             host_root = f"{p.scheme}://{p.netloc}".rstrip('/')
-            if host_root in _ALLOWED_ORIGINS or host_root.endswith('.vercel.app'):
+            if host_root in _ALLOWED_ORIGINS:
                 return True
         except Exception:
             pass
@@ -296,8 +317,7 @@ def _request_origin_ok() -> bool:
 
 def require_app_origin(fn):
     """Decorator for mutating CRM endpoints. Requires browser Origin from the
-    Anu CRM frontend OR a valid X-Admin-Token. Frontend fetch() attaches
-    Origin automatically — zero UX cost. Blocks random internet curl.
+    Anu CRM frontend OR a valid X-Admin-Token.
     """
     from functools import wraps
 
@@ -310,6 +330,20 @@ def require_app_origin(fn):
             'detail': 'This endpoint is callable only from the Anu CRM frontend or with a valid X-Admin-Token.',
         }), 403
     return wrapped
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['X-Frame-Options'] = 'DENY'
+    resp.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    resp.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=(self)'
+    resp.headers['X-XSS-Protection'] = '1; mode=block'
+    if request.path.startswith('/api'):
+        resp.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'"
+        resp.headers['Cache-Control'] = resp.headers.get('Cache-Control', 'no-store')
+    return resp
 
 
 DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
@@ -4659,6 +4693,40 @@ def _toronto_today():
         return (datetime.utcnow() - timedelta(hours=5)).date()
 
 
+def _utc_to_et_str(ts) -> tuple[str, str, str]:
+    """Convert a naive-UTC timestamp into ET strings for CSV/email.
+
+    Returns (iso_et_with_offset, date_et, time_et). Handles strings
+    (postgres format) and datetime objects. Falls back to raw strings
+    if anything fails — never throws, never blocks export.
+    """
+    if ts in (None, ''):
+        return ('', '', '')
+    try:
+        from zoneinfo import ZoneInfo
+        if isinstance(ts, str):
+            s = ts.strip().replace(' ', 'T')
+            if not (s.endswith('Z') or '+' in s[10:] or '-' in s[10:]):
+                # Bare timestamp → treat as UTC
+                s = s + '+00:00'
+            dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        else:
+            dt = ts
+            if dt.tzinfo is None:
+                from datetime import timezone
+                dt = dt.replace(tzinfo=timezone.utc)
+        et = dt.astimezone(ZoneInfo('America/Toronto'))
+        return (
+            et.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            et.strftime('%Y-%m-%d'),
+            et.strftime('%H:%M:%S'),
+        )
+    except Exception:
+        # Fallback: best-effort string split
+        raw = str(ts)
+        return (raw, raw[:10], raw[11:19] if len(raw) >= 19 else '')
+
+
 @app.route('/api/reports/daily', methods=['GET'])
 def api_report_daily():
     day_str = request.args.get('date')
@@ -7652,21 +7720,23 @@ def api_admin_rep_activity_report():
         import csv as _csv, io as _io
         buf = _io.StringIO()
         w = _csv.writer(buf)
+        # All time columns rendered in America/Toronto (rep local time).
+        # Internal UTC timestamp kept as `created_at_utc` for audit.
         w.writerow([
-            'created_at', 'date', 'time', 'rep', 'activity_type',
+            'created_at_et', 'date_et', 'time_et', 'created_at_utc',
+            'rep', 'activity_type',
             'store_number', 'account', 'address', 'city', 'postal',
             'store_priority', 'store_assigned_rep', 'notes',
             'logged_lat', 'logged_lng', 'logged_accuracy_m',
             'logged_at_client', 'distance_from_store_m',
         ])
         for r in rows:
-            ts = str(r.get('created_at') or '')
+            ts_raw = r.get('created_at') or ''
+            et_iso, et_date, et_time = _utc_to_et_str(ts_raw)
             cl_lat = r.get('client_lat')
             cl_lng = r.get('client_lng')
             w.writerow([
-                ts,
-                ts[:10],
-                ts[11:19] if len(ts) >= 19 else '',
+                et_iso, et_date, et_time, str(ts_raw),
                 r.get('rep') or '',
                 r.get('activity_type') or '',
                 r.get('store_number') or '',
@@ -11404,12 +11474,22 @@ def _render_morning_digest_html(digest: dict) -> str:
             f'font-family:Arial,sans-serif">{header}{body}</table>{more}'
         )
 
+    # Render "generated" timestamp in ET so the rep sees their local time
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timezone as _tz
+        gen_et = (
+            datetime.utcnow().replace(tzinfo=_tz.utc)
+            .astimezone(ZoneInfo('America/Toronto'))
+        )
+        gen_str = gen_et.strftime('%Y-%m-%d %I:%M %p ET')
+    except Exception:
+        gen_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
     body = f'''
     <div style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;color:#2a1f0f">
       <h1 style="color:#d4a574;margin:0 0 4px">Anu Spirits — Morning Digest</h1>
       <p style="color:#666;margin:0 0 16px;font-size:13px">
-        Snapshot {snap} · threshold &lt; {thr} bottles · generated
-        {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+        Snapshot {snap} · threshold &lt; {thr} bottles · generated {gen_str}
       </p>
       <table style="border-collapse:collapse;margin-bottom:18px">
         <tr>
@@ -16304,7 +16384,8 @@ def api_ai_ask():
         if f' {w} ' in sql_word_lower or sql_word_lower.startswith(f' {w} '):
             return jsonify({'error': f'AI returned dangerous SQL (keyword: {w})', 'sql': sql}), 422
 
-    # Run on a fresh autocommit connection so we can't poison the request transaction.
+    # Run on a fresh autocommit READ-ONLY connection so even if validation is
+    # bypassed, Postgres itself refuses DML.
     rows: list = []
     cols: list = []
     try:
@@ -16313,6 +16394,7 @@ def api_ai_ask():
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute('SET statement_timeout = 5000')
+                cur.execute('SET default_transaction_read_only = ON')
                 cur.execute(sql)
                 rows = cur.fetchmany(1000)
                 cols = [d[0] for d in cur.description] if cur.description else []
