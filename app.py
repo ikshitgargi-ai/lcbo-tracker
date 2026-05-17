@@ -587,6 +587,10 @@ def init_db():
             ('activities', 'client_ts', 'TIMESTAMP'),
             ('activities', 'distance_from_store_m', 'REAL'),
             ('activities', 'deleted_at', 'TIMESTAMP'),
+            # Store profile: spirits ambassador name + freeform notes.
+            # Surfaces on /stores/[id] for rep updates during visits.
+            ('stores', 'spirits_ambassador', "TEXT DEFAULT ''"),
+            ('stores', 'store_notes', "TEXT DEFAULT ''"),
         ])
         for table, col, coltype in migrate_cols:
             try:
@@ -1457,7 +1461,8 @@ def api_store_update(store_id):
     data = request.json
     fields = ['account', 'address', 'city', 'postal', 'phone', 'email', 'contacts',
               'priority', 'status', 'rep', 'manager_name', 'asst_manager_name',
-              'manager_phone', 'store_email', 'producer']
+              'manager_phone', 'store_email', 'producer',
+              'spirits_ambassador', 'store_notes']
     sets, params = [], []
     for f in fields:
         if f in data:
@@ -6781,6 +6786,22 @@ def api_crm_store_inventory(store_number):
         'brand': SOD_TRACKED_SKUS.get(r[0], ('', ''))[0],
     } for r in sod_rows]
 
+    # Build "missing_skus" — every tracked SKU that does NOT appear in the
+    # store's latest snapshot. These are missed opportunities the rep can
+    # pitch on a store visit. Sorted by brand → product name for stable UI.
+    present_skus = {r['sku'] for r in sod}
+    missing_skus = []
+    for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+        if sku in present_skus:
+            continue
+        missing_skus.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': name,
+            'pattern': 'missing_opportunity',
+        })
+    missing_skus.sort(key=lambda x: (x['brand'], x['product_name']))
+
     live = []
     if include_live:
         # Use existing scrape_lcbo_inventory for each tracked SKU, filter for this store
@@ -6804,7 +6825,12 @@ def api_crm_store_inventory(store_number):
                         break
         except Exception as e:
             live = [{'error': f'live fetch failed: {e}'}]
-    return jsonify({'store_number': store_number, 'sod': sod, 'live': live})
+    return jsonify({
+        'store_number': store_number,
+        'sod': sod,
+        'missing_skus': missing_skus,
+        'live': live,
+    })
 
 
 # ------- Full-DB backup (JSON) -------
@@ -15950,7 +15976,8 @@ def api_crm_store_full(store_number):
             """SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
                       s.phone, s.email, s.priority, s.rep, s.lat, s.lng,
                       s.manager_name, s.asst_manager_name, s.manager_phone, s.store_email,
-                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+                      COALESCE(s.spirits_ambassador, ''), COALESCE(s.store_notes, '')
                FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
                WHERE s.store_number = %s LIMIT 1""",
             (store_number,),
@@ -15962,7 +15989,8 @@ def api_crm_store_full(store_number):
             """SELECT s.id, s.store_number, s.account, s.address, s.city, s.postal,
                       s.phone, s.email, s.priority, s.rep, s.lat, s.lng,
                       s.manager_name, s.asst_manager_name, s.manager_phone, s.store_email,
-                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888')
+                      COALESCE(t.id, 0), COALESCE(t.code, ''), COALESCE(t.name, ''), COALESCE(t.color, '#888'),
+                      COALESCE(s.spirits_ambassador, ''), COALESCE(s.store_notes, '')
                FROM stores s LEFT JOIN territories t ON t.id = s.territory_id
                WHERE s.store_number = ? LIMIT 1""",
             (store_number,),
@@ -15977,8 +16005,148 @@ def api_crm_store_full(store_number):
         'manager_phone': s[14], 'store_email': s[15],
         'territory_id': s[16] or None, 'territory_code': s[17],
         'territory_name': s[18], 'territory_color': s[19],
+        'spirits_ambassador': s[20] or '', 'store_notes': s[21] or '',
     }
     return jsonify({'store': store, 'snapshot_date': str(_max_snapshot_date()) if _max_snapshot_date() else None})
+
+
+@app.route('/api/crm/resolve-store', methods=['GET'])
+def api_crm_resolve_store():
+    """Smart store resolver — rep types address OR store# and we find the match.
+
+    Accepts:
+      q   any of: store_number (e.g. "217"), postal code (e.g. "M5V 2H1"),
+                  address fragment ("King St W"), account name fragment ("LCBO #217"),
+                  city name ("Toronto").
+      limit  max matches to return (default 8, max 25)
+
+    Returns ranked matches with a confidence score so the UI can show the
+    best hit at the top and let the rep tap to confirm. The same query gets
+    re-tried across multiple fields so one input handles every common rep
+    typing pattern.
+    """
+    q = (request.args.get('q') or '').strip()
+    if not q:
+        return jsonify({'query': '', 'matches': []})
+    try:
+        limit = max(1, min(int(request.args.get('limit', '8')), 25))
+    except ValueError:
+        limit = 8
+
+    q_norm = q.strip()
+    q_postal = q_norm.upper().replace(' ', '')  # postal codes without spaces
+    q_like = f"%{q_norm}%"
+    q_lower = q_norm.lower()
+
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    matches: list = []
+    seen_ids: set = set()
+
+    def _row_to_match(row, confidence: int, reason: str):
+        sid = row[0]
+        if sid in seen_ids:
+            return None
+        seen_ids.add(sid)
+        return {
+            'id': sid,
+            'store_number': row[1],
+            'account': row[2] or '',
+            'address': row[3] or '',
+            'city': row[4] or '',
+            'postal': row[5] or '',
+            'rep': row[6] or '',
+            'priority': row[7] or '',
+            'lat': row[8],
+            'lng': row[9],
+            'confidence': confidence,
+            'match_reason': reason,
+        }
+
+    cols = ("s.id, s.store_number, s.account, s.address, s.city, s.postal, "
+            "s.rep, s.priority, s.lat, s.lng")
+
+    def _exec(sql: str, params: tuple):
+        if USE_POSTGRES:
+            cur = db.cursor()
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cur.close()
+            return rows
+        return db.execute(sql, params).fetchall()
+
+    try:
+        # 1) exact store number — highest confidence
+        if q_norm.isdigit():
+            sn = int(q_norm)
+            rows = _exec(
+                f"SELECT {cols} FROM stores s WHERE s.store_number = {ph} LIMIT 5",
+                (sn,),
+            )
+            for r in rows:
+                m = _row_to_match(r, 100, 'exact store number')
+                if m: matches.append(m)
+
+        # 2) exact postal code (normalize spaces)
+        if len(matches) < limit and len(q_postal) >= 3 and q_postal[0].isalpha():
+            rows = _exec(
+                f"SELECT {cols} FROM stores s "
+                f"WHERE UPPER(REPLACE(COALESCE(s.postal,''), ' ', '')) "
+                f"      LIKE {ph} LIMIT 10",
+                (q_postal + '%',),
+            )
+            for r in rows:
+                m = _row_to_match(r, 90, f"postal starts with {q_postal}")
+                if m: matches.append(m)
+
+        # 3) address fragment
+        if len(matches) < limit:
+            rows = _exec(
+                f"SELECT {cols} FROM stores s "
+                f"WHERE LOWER(COALESCE(s.address,'')) LIKE {ph} LIMIT 15",
+                (f'%{q_lower}%',),
+            )
+            for r in rows:
+                m = _row_to_match(r, 70, 'address match')
+                if m: matches.append(m)
+
+        # 4) account name fragment (e.g. "LCBO #217", "Bedford Park")
+        if len(matches) < limit:
+            rows = _exec(
+                f"SELECT {cols} FROM stores s "
+                f"WHERE LOWER(COALESCE(s.account,'')) LIKE {ph} LIMIT 15",
+                (f'%{q_lower}%',),
+            )
+            for r in rows:
+                m = _row_to_match(r, 55, 'account name match')
+                if m: matches.append(m)
+
+        # 5) city match (lowest confidence — broad)
+        if len(matches) < limit:
+            rows = _exec(
+                f"SELECT {cols} FROM stores s "
+                f"WHERE LOWER(COALESCE(s.city,'')) LIKE {ph} LIMIT 15",
+                (f'%{q_lower}%',),
+            )
+            for r in rows:
+                m = _row_to_match(r, 40, f"city match: {q_norm}")
+                if m: matches.append(m)
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        return jsonify({'query': q, 'matches': [], 'error': f'lookup failed: {e}'}), 500
+
+    matches.sort(key=lambda m: (-m['confidence'], m['store_number']))
+    return jsonify({
+        'query': q,
+        'count': len(matches[:limit]),
+        'matches': matches[:limit],
+        'how_to_read': (
+            "confidence 100 = exact store#; 90 = postal-prefix; "
+            "70 = address fragment; 55 = account name; 40 = city. "
+            "Pick the top match unless the address looks wrong."
+        ),
+    })
 
 
 @app.route('/api/crm/shelf-share/<int:store_number>', methods=['GET'])
