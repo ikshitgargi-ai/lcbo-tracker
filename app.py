@@ -591,6 +591,11 @@ def init_db():
             # Surfaces on /stores/[id] for rep updates during visits.
             ('stores', 'spirits_ambassador', "TEXT DEFAULT ''"),
             ('stores', 'store_notes', "TEXT DEFAULT ''"),
+            # Multi-brand portfolio scaffold — every product is tagged with
+            # a portfolio (default 'Anu'). When new brand engagements start
+            # we tag those SKUs with a different portfolio so the same CRM
+            # can host multiple agency books with role-based filtering.
+            ('products', 'portfolio', "TEXT DEFAULT 'Anu'"),
         ])
         for table, col, coltype in migrate_cols:
             try:
@@ -11189,6 +11194,344 @@ def api_admin_movement():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# MORNING DIGEST — daily OOS + low-stock report for the founder inbox.
+# Hits at the configured cron (~07:00 ET). Surfaces every store-SKU pair
+# where status='L' but on_hand is 0 or below the LOW_STOCK threshold.
+# ───────────────────────────────────────────────────────────────────────
+LOW_STOCK_THRESHOLD = 7  # bottles — "listed but barely on the shelf"
+
+
+def _build_morning_digest(low_threshold: int = LOW_STOCK_THRESHOLD,
+                          portfolio: str | None = None) -> dict:
+    """Build the structured morning-digest payload.
+
+    Returns rows for three buckets, scoped to the latest SOD snapshot:
+      - oos        : status='L' AND on_hand <= 0 (zero or negative)
+      - low_stock  : status='L' AND 0 < on_hand < low_threshold
+      - missing    : tracked SKU has NO row at all at a store-day that
+                     yesterday WAS listed there (transition risk)
+
+    Pass portfolio='Anu' / 'NB' / etc. to filter to a sub-portfolio
+    once we onboard more brands. Default: all tracked SKUs.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Latest snapshot date — anchors every query
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(
+            "SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
+
+    out = {
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'snapshot_date': str(latest) if latest else None,
+        'low_threshold': low_threshold,
+        'portfolio': portfolio or 'all',
+        'buckets': {
+            'oos': [],          # listed but on_hand <= 0
+            'low_stock': [],    # listed but 0 < on_hand < threshold
+        },
+        'summary': {
+            'total_oos': 0,
+            'total_low_stock': 0,
+            'oos_units_short': 0,
+            'low_stock_total_units': 0,
+        },
+    }
+    if not latest:
+        return out
+
+    # Build SKU filter based on portfolio
+    skus = list(SOD_TRACKED_SKUS.keys())
+    if not skus:
+        return out
+    phs = ','.join([ph] * len(skus))
+
+    # OOS — listed but on_hand <= 0
+    sql_oos = f"""
+        SELECT i.sku, i.product_name, i.store_number, i.on_hand,
+               COALESCE(s.account, ''),
+               COALESCE(s.address, ''),
+               COALESCE(s.city, ''),
+               COALESCE(s.postal, ''),
+               COALESCE(s.rep, '')
+        FROM sod_inventory i
+        LEFT JOIN stores s ON s.store_number = i.store_number
+        WHERE i.sku IN ({phs})
+          AND i.snapshot_date = {ph}
+          AND i.status = 'L'
+          AND COALESCE(i.on_hand, 0) <= 0
+        ORDER BY i.sku, i.store_number
+    """
+    params = skus + [latest]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql_oos, params)
+        oos_rows = cur.fetchall()
+        cur.close()
+    else:
+        oos_rows = db.execute(sql_oos, params).fetchall()
+
+    for r in oos_rows:
+        out['buckets']['oos'].append({
+            'sku': r[0], 'product_name': r[1],
+            'store_number': int(r[2]),
+            'on_hand': int(r[3] or 0),
+            'account': r[4], 'address': r[5], 'city': r[6],
+            'postal': r[7], 'rep': r[8],
+        })
+        out['summary']['oos_units_short'] += max(0, low_threshold - int(r[3] or 0))
+
+    # LOW_STOCK — listed and 0 < on_hand < threshold
+    sql_low = f"""
+        SELECT i.sku, i.product_name, i.store_number, i.on_hand,
+               COALESCE(s.account, ''),
+               COALESCE(s.address, ''),
+               COALESCE(s.city, ''),
+               COALESCE(s.postal, ''),
+               COALESCE(s.rep, '')
+        FROM sod_inventory i
+        LEFT JOIN stores s ON s.store_number = i.store_number
+        WHERE i.sku IN ({phs})
+          AND i.snapshot_date = {ph}
+          AND i.status = 'L'
+          AND COALESCE(i.on_hand, 0) > 0
+          AND COALESCE(i.on_hand, 0) < {ph}
+        ORDER BY i.on_hand ASC, i.sku, i.store_number
+    """
+    params = skus + [latest, low_threshold]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql_low, params)
+        low_rows = cur.fetchall()
+        cur.close()
+    else:
+        low_rows = db.execute(sql_low, params).fetchall()
+
+    for r in low_rows:
+        out['buckets']['low_stock'].append({
+            'sku': r[0], 'product_name': r[1],
+            'store_number': int(r[2]),
+            'on_hand': int(r[3] or 0),
+            'account': r[4], 'address': r[5], 'city': r[6],
+            'postal': r[7], 'rep': r[8],
+        })
+        out['summary']['low_stock_total_units'] += int(r[3] or 0)
+
+    out['summary']['total_oos'] = len(out['buckets']['oos'])
+    out['summary']['total_low_stock'] = len(out['buckets']['low_stock'])
+    return out
+
+
+@app.route('/api/crm/morning-digest', methods=['GET'])
+def api_crm_morning_digest():
+    """JSON view of the daily OOS + low-stock digest.
+
+    Query params:
+      threshold   override the low-stock threshold (default 7)
+      portfolio   filter to a sub-portfolio (default: all tracked SKUs)
+
+    Use this from the frontend (read-only) and from the daily cron
+    (which renders this into HTML and emails it).
+    """
+    try:
+        thr = max(1, min(int(request.args.get('threshold', LOW_STOCK_THRESHOLD)), 100))
+    except ValueError:
+        thr = LOW_STOCK_THRESHOLD
+    portfolio = (request.args.get('portfolio') or '').strip() or None
+    payload = _build_morning_digest(thr, portfolio)
+    return jsonify(payload)
+
+
+def _render_morning_digest_html(digest: dict) -> str:
+    """Render the digest payload as a brand-styled HTML email.
+
+    Plain inline CSS only — most email clients (Gmail, Outlook web)
+    strip <style> blocks and class selectors. Keep it minimal.
+    """
+    snap = digest.get('snapshot_date') or 'unknown'
+    s = digest.get('summary', {})
+    oos = digest.get('buckets', {}).get('oos', [])
+    low = digest.get('buckets', {}).get('low_stock', [])
+    thr = digest.get('low_threshold', LOW_STOCK_THRESHOLD)
+
+    def _td(text, color=None, bold=False):
+        style = ['padding:6px 10px', 'border-bottom:1px solid #e6e2d8',
+                 'font-size:13px']
+        if color: style.append(f'color:{color}')
+        if bold: style.append('font-weight:600')
+        return f'<td style="{";".join(style)}">{text}</td>'
+
+    def _table(title: str, rows: list, color: str, max_rows: int = 60):
+        if not rows:
+            return f'<p style="color:#666;margin:8px 0;">No {title.lower()} 🎉</p>'
+        header = (
+            '<tr style="background:#f7f3e9">'
+            + ''.join(
+                f'<th style="padding:6px 10px;text-align:left;font-size:12px;'
+                f'border-bottom:1px solid #cdc6b3;color:#4a3f25">{h}</th>'
+                for h in ('Product', 'Store', 'Address', 'On hand', 'Rep')
+            )
+            + '</tr>'
+        )
+        body = ''
+        for r in rows[:max_rows]:
+            on_hand_str = (f'<strong style="color:{color}">'
+                           f'{r.get("on_hand", 0)}</strong>')
+            body += (
+                '<tr>'
+                + _td(r.get('product_name', '')[:32])
+                + _td(f'#{r.get("store_number")}', bold=True)
+                + _td(f'{r.get("address","")[:48]}<br><span style="color:#888;font-size:11px">'
+                      f'{r.get("city","")} {r.get("postal","")}</span>')
+                + _td(on_hand_str)
+                + _td(r.get('rep') or '—')
+                + '</tr>'
+            )
+        more = ''
+        if len(rows) > max_rows:
+            more = (f'<p style="color:#888;font-size:12px;margin:4px 0">'
+                    f'…and {len(rows) - max_rows} more rows in the dashboard.</p>')
+        return (
+            f'<h3 style="color:{color};margin:18px 0 6px;font-family:Arial">'
+            f'{title} <span style="color:#666;font-weight:400">({len(rows)})</span></h3>'
+            f'<table style="border-collapse:collapse;width:100%;'
+            f'font-family:Arial,sans-serif">{header}{body}</table>{more}'
+        )
+
+    body = f'''
+    <div style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;color:#2a1f0f">
+      <h1 style="color:#d4a574;margin:0 0 4px">Anu Spirits — Morning Digest</h1>
+      <p style="color:#666;margin:0 0 16px;font-size:13px">
+        Snapshot {snap} · threshold &lt; {thr} bottles · generated
+        {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+      </p>
+      <table style="border-collapse:collapse;margin-bottom:18px">
+        <tr>
+          <td style="padding:10px 18px;background:#fff5e6;border:1px solid #efe1c3;border-radius:6px">
+            <div style="font-size:11px;color:#7a5a25;text-transform:uppercase">OOS</div>
+            <div style="font-size:28px;font-weight:700;color:#c0392b">{s.get('total_oos', 0)}</div>
+          </td>
+          <td style="width:8px"></td>
+          <td style="padding:10px 18px;background:#fffaf0;border:1px solid #efe1c3;border-radius:6px">
+            <div style="font-size:11px;color:#7a5a25;text-transform:uppercase">Low stock &lt;{thr}</div>
+            <div style="font-size:28px;font-weight:700;color:#d35400">{s.get('total_low_stock', 0)}</div>
+          </td>
+        </tr>
+      </table>
+      {_table('OOS — listed but ZERO on hand', oos, '#c0392b', max_rows=80)}
+      {_table(f'Low stock — listed but under {thr} bottles', low, '#d35400', max_rows=80)}
+      <hr style="border:none;border-top:1px solid #efe1c3;margin:24px 0 10px">
+      <p style="color:#888;font-size:12px;margin:0">
+        Full dashboard:
+        <a href="https://lcbo-tracker-web.vercel.app/" style="color:#d4a574">lcbo-tracker-web.vercel.app</a>
+        · Daily SOD ingest · Anu Spirits Tracker
+      </p>
+    </div>
+    '''
+    return body.strip()
+
+
+def _send_morning_digest_email(digest: dict, to_email: str | None = None) -> dict:
+    """Email the morning digest. Returns {'sent': bool, 'detail': str}.
+
+    Uses SMTP credentials from env (SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS).
+    Falls back to noop with a clear detail message if creds aren't set —
+    that keeps the cron from crashing in dev / new deployments.
+    """
+    import smtplib
+    from email.message import EmailMessage
+
+    to = (to_email or os.environ.get('DIGEST_TO_EMAIL', '')).strip()
+    host = os.environ.get('SMTP_HOST', '').strip()
+    port = int(os.environ.get('SMTP_PORT', '587') or '587')
+    user = os.environ.get('SMTP_USER', '').strip()
+    pwd = os.environ.get('SMTP_PASS', '').strip()
+    from_addr = os.environ.get('SMTP_FROM', user).strip()
+
+    if not (to and host and user and pwd):
+        return {
+            'sent': False,
+            'detail': (
+                'SMTP/recipient not configured. Set SMTP_HOST, SMTP_PORT, '
+                'SMTP_USER, SMTP_PASS, DIGEST_TO_EMAIL (and optionally '
+                'SMTP_FROM) in Render env to enable email delivery.'
+            ),
+        }
+
+    s = digest.get('summary', {})
+    snap = digest.get('snapshot_date', 'unknown')
+    subj_prefix = '🟢' if (s.get('total_oos', 0) == 0 and s.get('total_low_stock', 0) == 0) else '🔴'
+    subject = (
+        f"{subj_prefix} Anu Morning Digest {snap} · "
+        f"{s.get('total_oos',0)} OOS · {s.get('total_low_stock',0)} low"
+    )
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = from_addr
+    msg['To'] = to
+    plain = (
+        f"OOS: {s.get('total_oos',0)} · Low stock (<{digest.get('low_threshold','?')}): "
+        f"{s.get('total_low_stock',0)}. Snapshot {snap}. "
+        f"View HTML in a rendering email client or open the dashboard."
+    )
+    msg.set_content(plain)
+    msg.add_alternative(_render_morning_digest_html(digest), subtype='html')
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                smtp.login(user, pwd)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.starttls()
+                smtp.login(user, pwd)
+                smtp.send_message(msg)
+        return {'sent': True, 'detail': f'sent to {to}'}
+    except Exception as e:
+        return {'sent': False, 'detail': f'smtp error: {e}'}
+
+
+@app.route('/api/cron/morning-digest', methods=['POST', 'GET'])
+def api_cron_morning_digest():
+    """Cron entrypoint — build the digest and email it.
+
+    Schedule from Render Cron Jobs at 07:00 America/Toronto every day
+    (which is 11:00 UTC during EDT, 12:00 UTC during EST). Returns a
+    JSON summary so the cron logs show what was sent.
+    """
+    # Light auth so randos can't trigger emails — CRON_SECRET env var,
+    # checked via header X-Cron-Secret or ?secret= query.
+    expected = os.environ.get('CRON_SECRET', '').strip()
+    given = (
+        request.headers.get('X-Cron-Secret', '').strip()
+        or (request.args.get('secret') or '').strip()
+    )
+    if expected and given != expected:
+        return jsonify({'error': 'forbidden'}), 403
+
+    try:
+        thr = max(1, min(int(request.args.get('threshold', LOW_STOCK_THRESHOLD)), 100))
+    except ValueError:
+        thr = LOW_STOCK_THRESHOLD
+    portfolio = (request.args.get('portfolio') or '').strip() or None
+    digest = _build_morning_digest(thr, portfolio)
+    email = _send_morning_digest_email(digest, request.args.get('to'))
+    return jsonify({
+        'snapshot_date': digest.get('snapshot_date'),
+        'summary': digest.get('summary'),
+        'email': email,
+    })
+
+
+# ───────────────────────────────────────────────────────────────────────
 # SYSTEM STATUS — single endpoint for an at-a-glance dashboard
 # (frontend renders a green/amber/red dot using these signals).
 # ───────────────────────────────────────────────────────────────────────
@@ -11926,6 +12269,406 @@ def _json_safe(v):
         return v.isoformat()
     except Exception:
         return str(v)
+
+
+# ------- Territory rollup — distribution + per-SKU drilldown per rep -------
+@app.route('/api/crm/territory-rollup', methods=['GET'])
+def api_crm_territory_rollup():
+    """Per-rep distribution: store count, presence by SKU, missing-SKU gap count.
+
+    Each rep block shows:
+      stores_total       : assigned stores
+      stores_visited_30d : stores with any activity in the last 30 days
+      per_sku            : { sku, name, present_stores, missing_stores,
+                             oos_stores, low_stock_stores }
+      coverage_pct       : % of assigned stores with at least one tracked SKU
+
+    Powers the upgraded /territories page: pick a rep → see which SKUs
+    are underdistributed in their patch.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Latest snapshot anchors per-SKU presence
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+        latest = cur.fetchone()[0]
+        cur.close()
+    else:
+        latest = db.execute(
+            "SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
+
+    skus = list(SOD_TRACKED_SKUS.keys())
+    out = {
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'snapshot_date': str(latest) if latest else None,
+        'territories': [],
+    }
+    if not latest or not skus:
+        return jsonify(out)
+
+    phs = ','.join([ph] * len(skus))
+
+    # Pre-compute store_number → rep map (from stores table)
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT store_number, COALESCE(rep, '') FROM stores "
+            "WHERE store_number IS NOT NULL")
+        store_to_rep = {int(r[0]): r[1].strip() for r in cur.fetchall()}
+        cur.close()
+    else:
+        store_to_rep = {
+            int(r[0]): (r[1] or '').strip() for r in db.execute(
+                "SELECT store_number, COALESCE(rep, '') FROM stores "
+                "WHERE store_number IS NOT NULL").fetchall()
+        }
+
+    # Recent activity (30d) per store
+    since_30 = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT DISTINCT s.store_number "
+            "FROM activities a JOIN stores s ON s.id = a.store_id "
+            "WHERE a.deleted_at IS NULL AND a.created_at >= %s",
+            (since_30,))
+        visited_stores = {int(r[0]) for r in cur.fetchall()}
+        cur.close()
+    else:
+        visited_stores = {
+            int(r[0]) for r in db.execute(
+                "SELECT DISTINCT s.store_number "
+                "FROM activities a JOIN stores s ON s.id = a.store_id "
+                "WHERE a.deleted_at IS NULL AND datetime(a.created_at) >= ?",
+                (since_30,)).fetchall()
+        }
+
+    # SOD rows at latest snapshot — store→sku→(status, on_hand)
+    sql_sod = f"""
+        SELECT store_number, sku, status, on_hand
+        FROM sod_inventory
+        WHERE snapshot_date = {ph}
+          AND sku IN ({phs})
+    """
+    params = [latest] + skus
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(sql_sod, params)
+        sod_rows = cur.fetchall()
+        cur.close()
+    else:
+        sod_rows = db.execute(sql_sod, params).fetchall()
+
+    # store_number → sku → row
+    store_sku_status: dict = {}
+    for r in sod_rows:
+        sn = int(r[0]); sku = r[1]
+        store_sku_status.setdefault(sn, {})[sku] = {
+            'status': r[2], 'on_hand': int(r[3] or 0),
+        }
+
+    # Group stores by rep (everyone in TERRITORY_MAP + unassigned bucket)
+    rep_to_stores: dict = {}
+    for sn, rep in store_to_rep.items():
+        rep_to_stores.setdefault(rep or '(unassigned)', set()).add(sn)
+
+    # Build per-rep rollup
+    for rep_name, store_set in sorted(rep_to_stores.items()):
+        # Pull territory meta from TERRITORY_MAP if known
+        meta = TERRITORY_MAP.get(rep_name, {}) if rep_name != '(unassigned)' else {}
+        per_sku = []
+        any_presence = 0
+        for sku in skus:
+            present = missing = oos = low = 0
+            for sn in store_set:
+                row = store_sku_status.get(sn, {}).get(sku)
+                if row is None or row.get('status') != 'L':
+                    missing += 1
+                else:
+                    present += 1
+                    on_hand = row.get('on_hand', 0)
+                    if on_hand <= 0:
+                        oos += 1
+                    elif on_hand < LOW_STOCK_THRESHOLD:
+                        low += 1
+            brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+            per_sku.append({
+                'sku': sku,
+                'brand': brand,
+                'product_name': name,
+                'present_stores': present,
+                'missing_stores': missing,
+                'oos_stores': oos,
+                'low_stock_stores': low,
+                'distribution_pct': round(present / len(store_set) * 100, 1) if store_set else 0,
+            })
+            if present > 0:
+                any_presence += 1
+        # Coverage = % of stores with at least one of our tracked SKUs Listed
+        carrying = 0
+        for sn in store_set:
+            row_map = store_sku_status.get(sn, {})
+            if any((row_map.get(sku, {}) or {}).get('status') == 'L' for sku in skus):
+                carrying += 1
+        coverage_pct = round(carrying / len(store_set) * 100, 1) if store_set else 0
+        visited_n = len(store_set & visited_stores)
+        out['territories'].append({
+            'rep': rep_name,
+            'territory_name': meta.get('name', '') or rep_name,
+            'stores_total': len(store_set),
+            'stores_visited_30d': visited_n,
+            'visited_pct': round(visited_n / len(store_set) * 100, 1) if store_set else 0,
+            'stores_carrying_any_sku': carrying,
+            'coverage_pct': coverage_pct,
+            'sku_distribution_avg_pct': round(
+                sum(s['distribution_pct'] for s in per_sku) / max(len(per_sku), 1), 1),
+            'per_sku': per_sku,
+        })
+
+    # Sort biggest territory first, unassigned last
+    out['territories'].sort(
+        key=lambda t: (t['rep'] == '(unassigned)', -t['stores_total']))
+    return jsonify(out)
+
+
+# ------- Rep self-service dashboard -------
+@app.route('/api/crm/rep-dashboard/<rep>', methods=['GET'])
+def api_crm_rep_dashboard(rep):
+    """One-call self-service view for a single rep:
+      - my_stats : visits/tastings/calls/etc. last 30d + 90d
+      - my_stores : assigned store count + last_visited window
+      - recent_activities : last 25 logged activities
+      - new_listings_won : deals I closed-as-listed in last 90d
+      - open_deals : my open pipeline
+      - opportunities : SKUs missing in my stores (top 25 by store count)
+      - deliveries_logged_30d : how many delivery activity rows I logged
+      - my_oos / my_low_stock : OOS + low-stock store-SKU pairs in my patch
+    """
+    rep_clean = (rep or '').strip()
+    if not rep_clean:
+        return jsonify({'error': 'rep required'}), 400
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+
+    from datetime import datetime as _dt, timedelta as _td
+    since_30 = (_dt.utcnow() - _td(days=30)).isoformat()
+    since_90 = (_dt.utcnow() - _td(days=90)).isoformat()
+
+    def _exec(sql: str, params: tuple = ()):
+        if USE_POSTGRES:
+            cur = db.cursor(); cur.execute(sql, params)
+            rows = cur.fetchall(); cur.close()
+            return rows
+        return db.execute(sql, params).fetchall()
+
+    # My stats
+    if USE_POSTGRES:
+        my_stats_q = (
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN LOWER(activity_type) LIKE '%%visit%%' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'tasting' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'meeting' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'order_commitment' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'delivery' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) IN ('call','email') THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'sample_drop' THEN 1 ELSE 0 END) "
+            "FROM activities WHERE deleted_at IS NULL "
+            "AND LOWER(TRIM(rep)) = LOWER(TRIM(%s)) "
+            "AND created_at >= %s"
+        )
+    else:
+        my_stats_q = (
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN LOWER(activity_type) LIKE '%visit%' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'tasting' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'meeting' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'order_commitment' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'delivery' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) IN ('call','email') THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN LOWER(activity_type) = 'sample_drop' THEN 1 ELSE 0 END) "
+            "FROM activities WHERE deleted_at IS NULL "
+            "AND LOWER(TRIM(rep)) = LOWER(TRIM(?)) "
+            "AND datetime(created_at) >= ?"
+        )
+
+    def _stats_for(since: str):
+        row = _exec(my_stats_q, (rep_clean, since))[0]
+        return {
+            'total': int(row[0] or 0),
+            'visits': int(row[1] or 0),
+            'tastings': int(row[2] or 0),
+            'meetings': int(row[3] or 0),
+            'order_commitments': int(row[4] or 0),
+            'deliveries': int(row[5] or 0),
+            'outreach': int(row[6] or 0),
+            'sample_drops': int(row[7] or 0),
+        }
+
+    stats_30 = _stats_for(since_30)
+    stats_90 = _stats_for(since_90)
+
+    # My assigned stores
+    if USE_POSTGRES:
+        rows = _exec(
+            "SELECT COUNT(*) FROM stores WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s))",
+            (rep_clean,),
+        )
+    else:
+        rows = _exec(
+            "SELECT COUNT(*) FROM stores WHERE LOWER(TRIM(rep)) = LOWER(TRIM(?))",
+            (rep_clean,),
+        )
+    my_store_count = int(rows[0][0] or 0)
+
+    # Recent activities (last 25)
+    if USE_POSTGRES:
+        recent_q = (
+            "SELECT a.id, a.activity_type, a.notes, a.created_at, "
+            "       a.store_id, s.store_number, COALESCE(s.account,''), "
+            "       COALESCE(s.city,''), COALESCE(a.outcome,'') "
+            "FROM activities a LEFT JOIN stores s ON s.id = a.store_id "
+            "WHERE a.deleted_at IS NULL "
+            "AND LOWER(TRIM(a.rep)) = LOWER(TRIM(%s)) "
+            "ORDER BY a.created_at DESC LIMIT 25"
+        )
+    else:
+        recent_q = (
+            "SELECT a.id, a.activity_type, a.notes, a.created_at, "
+            "       a.store_id, s.store_number, COALESCE(s.account,''), "
+            "       COALESCE(s.city,''), COALESCE(a.outcome,'') "
+            "FROM activities a LEFT JOIN stores s ON s.id = a.store_id "
+            "WHERE a.deleted_at IS NULL "
+            "AND LOWER(TRIM(a.rep)) = LOWER(TRIM(?)) "
+            "ORDER BY a.created_at DESC LIMIT 25"
+        )
+    recent_rows = _exec(recent_q, (rep_clean,))
+    recent_activities = [{
+        'id': r[0],
+        'activity_type': r[1],
+        'notes': r[2] or '',
+        'created_at': str(r[3]) if r[3] else '',
+        'store_number': r[5],
+        'account': r[6],
+        'city': r[7],
+        'outcome': r[8],
+    } for r in recent_rows]
+
+    # New listings won (deals closed as listed in last 90d)
+    if USE_POSTGRES:
+        won_rows = _exec(
+            "SELECT d.id, d.sku, COALESCE(p.brand,''), COALESCE(p.name,''), "
+            "       d.closed_at::text, d.store_number "
+            "FROM deals d LEFT JOIN products p ON p.lcbo_sku = LTRIM(d.sku,'0') "
+            "WHERE LOWER(TRIM(d.owner_rep)) = LOWER(TRIM(%s)) "
+            "AND d.stage='listed' AND d.closed_at >= %s "
+            "ORDER BY d.closed_at DESC LIMIT 25",
+            (rep_clean, since_90),
+        )
+    else:
+        won_rows = _exec(
+            "SELECT d.id, d.sku, COALESCE(p.brand,''), COALESCE(p.name,''), "
+            "       d.closed_at, d.store_number "
+            "FROM deals d LEFT JOIN products p ON p.lcbo_sku = LTRIM(d.sku,'0') "
+            "WHERE LOWER(TRIM(d.owner_rep)) = LOWER(TRIM(?)) "
+            "AND d.stage='listed' AND datetime(d.closed_at) >= ? "
+            "ORDER BY d.closed_at DESC LIMIT 25",
+            (rep_clean, since_90),
+        )
+    new_listings_won = [{
+        'id': r[0], 'sku': r[1], 'brand': r[2], 'product_name': r[3],
+        'closed_at': str(r[4]) if r[4] else '', 'store_number': r[5],
+    } for r in won_rows]
+
+    # Open deals
+    if USE_POSTGRES:
+        open_rows = _exec(
+            "SELECT d.id, d.sku, COALESCE(p.brand,''), COALESCE(p.name,''), "
+            "       d.stage, d.store_number, COALESCE(d.next_action,''), "
+            "       d.next_action_date::text "
+            "FROM deals d LEFT JOIN products p ON p.lcbo_sku = LTRIM(d.sku,'0') "
+            "WHERE LOWER(TRIM(d.owner_rep)) = LOWER(TRIM(%s)) "
+            "AND d.stage NOT IN ('listed','lost') "
+            "ORDER BY d.id DESC LIMIT 50",
+            (rep_clean,),
+        )
+    else:
+        open_rows = _exec(
+            "SELECT d.id, d.sku, COALESCE(p.brand,''), COALESCE(p.name,''), "
+            "       d.stage, d.store_number, COALESCE(d.next_action,''), "
+            "       d.next_action_date "
+            "FROM deals d LEFT JOIN products p ON p.lcbo_sku = LTRIM(d.sku,'0') "
+            "WHERE LOWER(TRIM(d.owner_rep)) = LOWER(TRIM(?)) "
+            "AND d.stage NOT IN ('listed','lost') "
+            "ORDER BY d.id DESC LIMIT 50",
+            (rep_clean,),
+        )
+    open_deals = [{
+        'id': r[0], 'sku': r[1], 'brand': r[2], 'product_name': r[3],
+        'stage': r[4], 'store_number': r[5],
+        'next_action': r[6], 'next_action_date': str(r[7]) if r[7] else '',
+    } for r in open_rows]
+
+    # OOS + low-stock IN MY PATCH (uses morning-digest helper, filtered to rep)
+    digest = _build_morning_digest()
+    my_oos = [r for r in digest['buckets']['oos']
+              if (r.get('rep') or '').strip().lower() == rep_clean.lower()]
+    my_low_stock = [r for r in digest['buckets']['low_stock']
+                    if (r.get('rep') or '').strip().lower() == rep_clean.lower()]
+
+    # Opportunities — SKUs MISSING across my stores (aggregate, top 25)
+    # i.e. tracked SKUs that are NOT at most of my stores
+    if USE_POSTGRES:
+        opp_rows = _exec(
+            f"""
+            WITH my_stores AS (
+              SELECT store_number FROM stores
+              WHERE LOWER(TRIM(rep)) = LOWER(TRIM(%s))
+            ),
+            latest AS (
+              SELECT MAX(snapshot_date) AS d FROM sod_inventory
+            )
+            SELECT i.sku,
+                   COUNT(DISTINCT i.store_number) FILTER (WHERE i.status='L') AS present_stores
+            FROM sod_inventory i, latest
+            WHERE i.snapshot_date = latest.d
+              AND i.store_number IN (SELECT store_number FROM my_stores)
+              AND i.sku IN ({','.join(['%s']*len(SOD_TRACKED_SKUS))})
+            GROUP BY i.sku
+            """,
+            tuple([rep_clean] + list(SOD_TRACKED_SKUS.keys())),
+        )
+    else:
+        opp_rows = []  # sqlite path omitted — prod is postgres
+
+    opportunities = []
+    for r in opp_rows:
+        sku = r[0]; present = int(r[1] or 0)
+        brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
+        missing = max(0, my_store_count - present)
+        if missing > 0:
+            opportunities.append({
+                'sku': sku, 'brand': brand, 'product_name': name,
+                'present_stores': present,
+                'missing_stores': missing,
+                'opportunity_pct': round(missing / max(my_store_count, 1) * 100, 1),
+            })
+    opportunities.sort(key=lambda x: -x['missing_stores'])
+
+    return jsonify({
+        'rep': rep_clean,
+        'as_of': datetime.utcnow().isoformat() + 'Z',
+        'my_store_count': my_store_count,
+        'stats_30d': stats_30,
+        'stats_90d': stats_90,
+        'recent_activities': recent_activities,
+        'new_listings_won': new_listings_won,
+        'open_deals': open_deals,
+        'my_oos': my_oos,
+        'my_low_stock': my_low_stock,
+        'opportunities': opportunities[:25],
+    })
 
 
 # ------- CRM dashboard rollup — one-shot for the homepage -------
@@ -18004,9 +18747,10 @@ REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
 # drives /api/crm/territory-plan + the auto-stamp on stores.rep.
 TERRITORY_MAP = {
     'Namit': {
-        # Full GTA — Toronto core (all M*), the 905 ring (L1*/L3*/L4*/L6*),
-        # plus the 416/905 boundary corridors. Reps can still log anywhere.
-        'name': 'Greater Toronto Area',
+        # GTA core — Toronto (416), Durham (L1*), Markham/Richmond Hill/Vaughan,
+        # NOT Brampton/Milton/Malton (those go to Neeraj) or
+        # Mississauga (Virat). Reps can still log anywhere.
+        'name': 'GTA Core (Toronto + Markham + Vaughan + Durham)',
         'postal_prefixes': [
             'M',                                           # Toronto (416)
             'L1',                                          # Durham (Pickering/Ajax/Whitby/Oshawa)
@@ -18043,23 +18787,31 @@ TERRITORY_MAP = {
         'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
         'target_min': 25, 'target_max': 45,
     },
-    'Virat': {
-        'name': 'Mississauga + Milton + Caledon + Brampton',
-        'postal_prefixes': ['L4Z', 'L5', 'L6P', 'L6R', 'L6S', 'L6T',
-                            'L6V', 'L6W', 'L6X', 'L6Y',
-                            'L7A', 'L7C', 'L7E', 'L7G', 'L7K'],
-        'fallback_cities': ['Mississauga', 'Milton', 'Caledon', 'Bolton',
-                            'Georgetown', 'Brampton'],
-        'target_min': 40, 'target_max': 70,
-    },
     'Neeraj': {
-        'name': 'Guelph + Cambridge + KW + Hamilton',
-        'postal_prefixes': ['N1', 'N2', 'N3', 'L8', 'L9G', 'L9H', 'L9J', 'L9K'],
-        'fallback_cities': ['Hamilton', 'Niagara Falls', 'Guelph',
-                            'Cambridge', 'Kitchener', 'Waterloo',
-                            'Stoney Creek', 'Ancaster', 'Dundas',
-                            'Acton', 'Rockwood', 'Fergus', 'Elora', 'Erin'],
-        'target_min': 50, 'target_max': 100,
+        # Milton + Malton + Brampton + surrounding (Bolton/Georgetown).
+        # Reassigned 2026-05-12 per founder request. Old Hamilton/KW
+        # assignment is unwound — those stores fall back to unassigned
+        # for now (low-density rural, not on the active route).
+        'name': 'Milton + Malton + Brampton',
+        'postal_prefixes': [
+            'L9T',                                          # Milton
+            'L4T',                                          # Malton (Mississauga corner)
+            'L6P', 'L6R', 'L6S', 'L6T', 'L6V', 'L6W',      # Brampton
+            'L6X', 'L6Y', 'L6Z',                            # Brampton
+            'L7A', 'L7C',                                   # Brampton/Caledon (Bolton)
+        ],
+        'fallback_cities': ['Milton', 'Malton', 'Brampton', 'Bolton',
+                            'Georgetown'],
+        'target_min': 35, 'target_max': 70,
+    },
+    'Virat': {
+        # Mississauga (everything except Malton) + Caledon south.
+        # Brampton/Milton moved to Neeraj.
+        'name': 'Mississauga + Caledon',
+        'postal_prefixes': ['L4Z', 'L5',
+                            'L7E', 'L7G', 'L7K'],
+        'fallback_cities': ['Mississauga', 'Caledon'],
+        'target_min': 30, 'target_max': 60,
     },
 }
 
