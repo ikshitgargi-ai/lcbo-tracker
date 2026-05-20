@@ -18851,16 +18851,37 @@ TERRITORY_MAP = {
         'target_min': 120, 'target_max': 200,
     },
     'Surya': {
-        # Ottawa + immediate surroundings. Not Kingston/Brockville/Belleville.
-        'name': 'Ottawa region',
-        'postal_prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
+        # In + around Ottawa — the full Ottawa region + Eastern Ontario:
+        # Ottawa core (K1/K2), rural Ottawa (K0A), Prescott-Russell (K0B),
+        # SD&G / Cornwall (K0C, K6), Leeds-Grenville north (K0E), Lanark
+        # (K0G), the Ottawa Valley / Renfrew County (K0J, K7S Arnprior,
+        # K7V Renfrew, K8A Pembroke, K8H Petawawa), Smiths Falls / Carleton
+        # Place / Perth (K7A, K7C, K7H), Hawkesbury / Brockville (K6).
+        # Deliberately NOT Kingston (K7K-P), Napanee (K7R), Belleville
+        # (K8N/K8P), Trenton (K8V) or Peterborough (K9*) — separate region.
+        'name': 'Ottawa + Eastern Ontario',
+        'postal_prefixes': [
+            'K1', 'K2',                                    # Ottawa core
+            'K0A', 'K0B', 'K0C', 'K0E', 'K0G', 'K0J',      # rural ring + Valley
+            'K4A', 'K4B', 'K4C', 'K4K', 'K4M', 'K4P', 'K4R',  # Orleans/Cumberland/Rockland
+            'K6',                                           # Cornwall/Hawkesbury/Brockville
+            'K7A', 'K7C', 'K7H', 'K7S', 'K7V',             # Smiths Falls/Carleton Pl/Perth/Arnprior/Renfrew
+            'K8A', 'K8H',                                   # Pembroke/Petawawa (Ottawa Valley)
+        ],
         'fallback_cities': [
             'Ottawa', 'Kanata', 'Nepean', 'Orleans', 'Stittsville',
             'Manotick', 'Rockland', 'Embrun', 'Carleton Place',
             'Almonte', 'Smiths Falls', 'Gloucester', 'Vanier',
             'Russell', 'Kemptville', 'Cumberland', 'Greely',
+            'Cornwall', 'Hawkesbury', 'Brockville', 'Perth', 'Arnprior',
+            'Renfrew', 'Pembroke', 'Petawawa', 'Alexandria', 'Morrisburg',
+            'Prescott', 'Vankleek Hill', 'Plantagenet', 'Alfred',
+            'Chesterville', 'Winchester', 'Iroquois', 'Merrickville',
+            'Westport', 'Lanark', 'Deep River', 'Cobden', 'Eganville',
+            "Barry's Bay", 'Calabogie', 'Long Sault', 'Maxville',
+            'Casselman', 'Limoges', 'Metcalfe', 'Osgoode',
         ],
-        'target_min': 40, 'target_max': 70,
+        'target_min': 70, 'target_max': 120,
     },
     'Ikshit': {
         # Burlington + Oakville (Halton south) — overlaps with GTA west edge.
