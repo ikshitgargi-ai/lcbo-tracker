@@ -18976,11 +18976,18 @@ def api_crm_admin_restamp_territories():
 
     Walks every store; for each store, finds the first rep in TERRITORY_MAP
     whose postal_prefixes match the store's postal code; sets stores.rep
-    accordingly. Stores that match no territory are left unchanged.
+    accordingly.
+
+    Query params:
+      clear_unmatched=1  — stores matching no territory get rep='' (a clean
+                           full re-stamp; required when a rep's old patch is
+                           dropped from the map so stale assignments don't
+                           linger). Default 0 = leave unmatched stores as-is.
 
     This is the canonical way to assign Namit=GTA, Surya=Ottawa, etc.
     Returns per-rep counts of stores stamped.
     """
+    clear_unmatched = (request.args.get('clear_unmatched') or '').strip() in ('1', 'true', 'yes')
     db = get_db()
     cur = db.cursor() if USE_POSTGRES else db
     try:
@@ -19022,6 +19029,9 @@ def api_crm_admin_restamp_territories():
             updates.append((matched_rep, store_id))
         else:
             unmatched += 1
+            if clear_unmatched:
+                # Drop the stale rep so a removed territory doesn't linger
+                updates.append(('', store_id))
 
     # Bulk update
     try:
@@ -19055,10 +19065,13 @@ def api_crm_admin_restamp_territories():
         'total_stores': len(all_stores),
         'per_rep_counts': per_rep_counts,
         'unmatched': unmatched,
+        'clear_unmatched': clear_unmatched,
         'note': (
             "Stores assignment updated from TERRITORY_MAP. Reps can still log "
             "activities at any store — this only sets the default rep for "
             "territory-plan + rep-performance views."
+            + (" Unmatched stores were cleared to unassigned."
+               if clear_unmatched else "")
         ),
     })
 
