@@ -18899,7 +18899,7 @@ TERRITORY_MAP = {
 
 
 @app.route('/api/crm/admin/purge-test-activities', methods=['POST'])
-@require_admin_token
+@require_app_origin
 def api_crm_admin_purge_test_activities():
     """Soft-delete QA / stress-test activity rows.
 
@@ -18970,7 +18970,7 @@ def api_crm_admin_purge_test_activities():
 
 
 @app.route('/api/crm/admin/restamp-territories', methods=['POST'])
-@require_admin_token
+@require_app_origin
 def api_crm_admin_restamp_territories():
     """Re-stamp the stores.rep column based on TERRITORY_MAP postal prefixes.
 
