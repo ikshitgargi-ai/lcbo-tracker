@@ -18898,6 +18898,77 @@ TERRITORY_MAP = {
 }
 
 
+@app.route('/api/crm/admin/purge-test-activities', methods=['POST'])
+@require_admin_token
+def api_crm_admin_purge_test_activities():
+    """Soft-delete QA / stress-test activity rows.
+
+    Reversible: sets activities.deleted_at = now() for rows whose notes
+    begin with a known test prefix. NEVER hard-deletes. NEVER touches
+    real rep activity. The rep-activity-report and every rollup already
+    filter `deleted_at IS NULL`, so soft-deleted rows vanish from all
+    reporting but remain on disk for audit / undelete.
+
+    Matched prefixes (case-insensitive): 'stress-test', 'stress-check',
+    'final-test', 'qa-test'.
+
+    Returns the count soft-deleted and a sample of what was matched.
+    """
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    prefixes = ['stress-test%', 'stress-check%', 'final-test%', 'qa-test%']
+    where = ' OR '.join([f"LOWER(notes) LIKE {ph}" for _ in prefixes])
+
+    try:
+        cur = db.cursor() if USE_POSTGRES else db
+        # Preview what will be matched
+        cur.execute(
+            f"SELECT id, rep, activity_type, notes FROM activities "
+            f"WHERE deleted_at IS NULL AND ({where}) "
+            f"ORDER BY id",
+            prefixes,
+        )
+        matched = [
+            {'id': r[0], 'rep': r[1], 'activity_type': r[2],
+             'notes': (r[3] or '')[:60]}
+            for r in cur.fetchall()
+        ]
+        if not matched:
+            if USE_POSTGRES:
+                cur.close()
+            return jsonify({'soft_deleted': 0, 'matched': [],
+                            'status': 'nothing to purge'})
+
+        ids = [m['id'] for m in matched]
+        id_ph = ','.join([ph] * len(ids))
+        if USE_POSTGRES:
+            cur.execute(
+                f"UPDATE activities SET deleted_at = NOW() "
+                f"WHERE id IN ({id_ph}) AND deleted_at IS NULL",
+                ids,
+            )
+        else:
+            cur.execute(
+                f"UPDATE activities SET deleted_at = datetime('now') "
+                f"WHERE id IN ({id_ph}) AND deleted_at IS NULL",
+                ids,
+            )
+        db.commit()
+        if USE_POSTGRES:
+            cur.close()
+        return jsonify({
+            'soft_deleted': len(ids),
+            'matched': matched,
+            'status': 'ok',
+            'note': 'Reversible — rows kept on disk with deleted_at set. '
+                    'They no longer appear in any report or rollup.',
+        })
+    except Exception as e:
+        try: db.rollback()
+        except Exception: pass
+        return jsonify({'error': f'purge failed: {e}'}), 500
+
+
 @app.route('/api/crm/admin/restamp-territories', methods=['POST'])
 @require_admin_token
 def api_crm_admin_restamp_territories():
