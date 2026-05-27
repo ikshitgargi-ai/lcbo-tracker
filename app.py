@@ -8836,8 +8836,13 @@ def api_admin_new_listings_by_range():
     try:
         start = (request.args.get('start') or '').strip()
         end = (request.args.get('end') or '').strip()
+        # ALSO accept ?since=Nd / ?since=7 — convenience for callers
+        # (frontend uses start/end; this is for ad-hoc curl + reports).
+        since = (request.args.get('since') or '').strip().lower().rstrip('d')
         if start:
             start_d = _date.fromisoformat(start)
+        elif since and since.isdigit():
+            start_d = today - timedelta(days=int(since))
         else:
             start_d = today - timedelta(days=30)
         if end:
@@ -8847,7 +8852,7 @@ def api_admin_new_listings_by_range():
         if start_d > end_d:
             return jsonify({'error': 'start must be <= end'}), 400
     except ValueError:
-        return jsonify({'error': 'dates must be YYYY-MM-DD'}), 400
+        return jsonify({'error': 'dates must be YYYY-MM-DD (or since=Nd)'}), 400
 
     sku_filter = (request.args.get('sku') or '').strip()
     include_lcbo = (request.args.get('include_lcbo', '1') in ('1', 'true', 'yes'))
