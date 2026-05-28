@@ -2940,17 +2940,45 @@ SOD_AGENT_ID = os.environ.get('SOD_AGENT_ID', '1113').strip()  # default: VINETE
 # NB Distillers is the PRIMARY paying client. Goenchi + Fratelli are
 # Anu's secondary import portfolio — tracked separately in /anu-import.
 SOD_TRACKED_SKUS = {
-    # NB Distillers (PRIMARY paying client)
+    # NB Distillers (PRIMARY paying client — reps are NB-focused for now)
     '0020187': ('NB Distillers', 'Red Admiral Vodka'),
     '0022246': ('NB Distillers', 'Chak De Canadian Whisky'),
-    # Anu Import portfolio (SECONDARY)
+    # Anu Import portfolio (separate agency book — toggle to view)
     '0046340': ('Goenchi', 'Goenchi Cashew Feni'),
     '0046343': ('Goenchi', 'Goenchi Coconut Feni'),
     '0046282': ('Fratelli', 'Fratelli Classic Shiraz'),
     '0046285': ('Fratelli', 'Fratelli Chenin Blanc'),
     '0046286': ('Fratelli', 'Fratelli Sauvignon Blanc'),
     '0046287': ('Fratelli', 'Fratelli Cabernet Sauvignon'),
+    '0045378': ('Rock Paper', 'Rock Paper Rum'),  # NEW Anu import — added 2026-05-27
 }
+
+# Portfolio split — every tracked SKU belongs to exactly one agency book.
+# Used to scope rep dashboards / territory rollups / morning digest etc.
+# Default behavior on rep-facing surfaces is portfolio='NB' so the field
+# team's view stays clean; Anu data is one toggle away.
+SKU_PORTFOLIO = {
+    '0020187': 'NB',  '0022246': 'NB',
+    '0046340': 'Anu', '0046343': 'Anu',
+    '0046282': 'Anu', '0046285': 'Anu',
+    '0046286': 'Anu', '0046287': 'Anu',
+    '0045378': 'Anu',
+}
+
+
+def _skus_for_portfolio(portfolio: str | None) -> list[str]:
+    """Return tracked SKU codes that belong to the requested portfolio.
+
+    portfolio:
+      'NB'  → only NB Distillers SKUs (Red Admiral + Chak De)  ← rep default
+      'Anu' → only Anu Import SKUs (Goenchi/Fratelli/Rock Paper)
+      'all' / None / '' → every tracked SKU (operator view)
+    """
+    if not portfolio or str(portfolio).strip().lower() == 'all':
+        return list(SOD_TRACKED_SKUS.keys())
+    want = str(portfolio).strip().upper()
+    if want == 'ANU': want = 'Anu'  # canonical case
+    return [s for s, p in SKU_PORTFOLIO.items() if p == want]
 
 # Client classification — drives whether a SKU appears in NB-primary views vs the
 # /anu-import secondary section.
@@ -4385,6 +4413,29 @@ def api_sod_inventory():
         'count': len(rows),
         'rows': [row_to_dict(r) for r in rows],
     })
+
+
+@app.route('/api/sod/portfolios', methods=['GET'])
+def api_sod_portfolios():
+    """List portfolios and the SKUs in each — drives the NB/Anu toggle.
+
+    Returns:
+      portfolios: [{key, label, sku_count, skus: [{sku, brand, product_name}]}]
+      default: 'NB' (the rep-facing default)
+    """
+    out = []
+    for pkey, plabel in [('NB', 'NB Distillers'), ('Anu', 'Anu Imports')]:
+        skus = []
+        for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+            if SKU_PORTFOLIO.get(sku) == pkey:
+                skus.append({'sku': sku, 'brand': brand, 'product_name': name})
+        out.append({
+            'key': pkey,
+            'label': plabel,
+            'sku_count': len(skus),
+            'skus': skus,
+        })
+    return jsonify({'portfolios': out, 'default': 'NB'})
 
 
 @app.route('/api/sod/products', methods=['GET'])
@@ -6826,13 +6877,18 @@ def api_crm_store_inventory(store_number):
     """Return current tracked-SKU status at this store from BOTH sources:
       - SOD (last snapshot): status, on_hand
       - LCBO.com live (optional, set live=1): on_hand right now
+
+    Query params:
+      portfolio=NB|Anu|all  scope tracked SKUs (default 'NB' for rep view).
     """
     include_live = request.args.get('live', '').lower() in ('1', 'true', 'yes')
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
-    tracked = list(SOD_TRACKED_SKUS.keys())
+    tracked = _skus_for_portfolio(portfolio)
     if not tracked:
-        return jsonify({'store_number': store_number, 'sod': [], 'live': []})
+        return jsonify({'store_number': store_number, 'portfolio': portfolio,
+                        'sod': [], 'missing_skus': [], 'live': []})
     phs = ','.join([ph] * len(tracked))
     q = f"""
         WITH latest AS (
@@ -6859,12 +6915,15 @@ def api_crm_store_inventory(store_number):
         'brand': SOD_TRACKED_SKUS.get(r[0], ('', ''))[0],
     } for r in sod_rows]
 
-    # Build "missing_skus" — every tracked SKU that does NOT appear in the
-    # store's latest snapshot. These are missed opportunities the rep can
-    # pitch on a store visit. Sorted by brand → product name for stable UI.
+    # Build "missing_skus" — every tracked SKU in this portfolio that does
+    # NOT appear in the store's latest snapshot. These are missed
+    # opportunities the rep can pitch on a store visit.
+    portfolio_sku_set = set(tracked)
     present_skus = {r['sku'] for r in sod}
     missing_skus = []
     for sku, (brand, name) in SOD_TRACKED_SKUS.items():
+        if sku not in portfolio_sku_set:
+            continue
         if sku in present_skus:
             continue
         missing_skus.append({
@@ -6900,6 +6959,7 @@ def api_crm_store_inventory(store_number):
             live = [{'error': f'live fetch failed: {e}'}]
     return jsonify({
         'store_number': store_number,
+        'portfolio': portfolio,
         'sod': sod,
         'missing_skus': missing_skus,
         'live': live,
@@ -11321,8 +11381,8 @@ def _build_morning_digest(low_threshold: int = LOW_STOCK_THRESHOLD,
     if not latest:
         return out
 
-    # Build SKU filter based on portfolio
-    skus = list(SOD_TRACKED_SKUS.keys())
+    # Build SKU filter based on portfolio (default: all)
+    skus = _skus_for_portfolio(portfolio) if portfolio else list(SOD_TRACKED_SKUS.keys())
     if not skus:
         return out
     phs = ','.join([ph] * len(skus))
@@ -11606,7 +11666,9 @@ def api_cron_morning_digest():
         thr = max(1, min(int(request.args.get('threshold', LOW_STOCK_THRESHOLD)), 100))
     except ValueError:
         thr = LOW_STOCK_THRESHOLD
-    portfolio = (request.args.get('portfolio') or '').strip() or None
+    # Cron defaults to NB portfolio (rep team is NB-focused). Pass
+    # ?portfolio=Anu or ?portfolio=all to override.
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
     digest = _build_morning_digest(thr, portfolio)
     email = _send_morning_digest_email(digest, request.args.get('to'))
     return jsonify({
@@ -12384,10 +12446,13 @@ def api_crm_territory_rollup():
         latest = db.execute(
             "SELECT MAX(snapshot_date) FROM sod_inventory").fetchone()[0]
 
-    skus = list(SOD_TRACKED_SKUS.keys())
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
+    skus = _skus_for_portfolio(portfolio)
     out = {
         'as_of': datetime.utcnow().isoformat() + 'Z',
         'snapshot_date': str(latest) if latest else None,
+        'portfolio': portfolio,
+        'portfolio_skus': skus,
         'territories': [],
     }
     if not latest or not skus:
@@ -12530,10 +12595,20 @@ def api_crm_rep_dashboard(rep):
       - opportunities : SKUs missing in my stores (top 25 by store count)
       - deliveries_logged_30d : how many delivery activity rows I logged
       - my_oos / my_low_stock : OOS + low-stock store-SKU pairs in my patch
+
+    Query params:
+      portfolio=NB|Anu|all  scope all SKU-derived metrics (OOS, low-stock,
+                            opportunities, new_listings_won). Default 'NB'
+                            because the field team is NB-focused for now.
+                            Activity counts and recent_activities are
+                            never SKU-filtered.
     """
     rep_clean = (rep or '').strip()
     if not rep_clean:
         return jsonify({'error': 'rep required'}), 400
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
+    portfolio_skus = _skus_for_portfolio(portfolio)
+    portfolio_sku_set = set(portfolio_skus)
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
 
@@ -12664,7 +12739,7 @@ def api_crm_rep_dashboard(rep):
     new_listings_won = [{
         'id': r[0], 'sku': r[1], 'brand': r[2], 'product_name': r[3],
         'closed_at': str(r[4]) if r[4] else '', 'store_number': r[5],
-    } for r in won_rows]
+    } for r in won_rows if r[1] in portfolio_sku_set]
 
     # Open deals
     if USE_POSTGRES:
@@ -12693,18 +12768,18 @@ def api_crm_rep_dashboard(rep):
         'id': r[0], 'sku': r[1], 'brand': r[2], 'product_name': r[3],
         'stage': r[4], 'store_number': r[5],
         'next_action': r[6], 'next_action_date': str(r[7]) if r[7] else '',
-    } for r in open_rows]
+    } for r in open_rows if r[1] in portfolio_sku_set]
 
     # OOS + low-stock IN MY PATCH (uses morning-digest helper, filtered to rep)
-    digest = _build_morning_digest()
+    digest = _build_morning_digest(portfolio=portfolio)
     my_oos = [r for r in digest['buckets']['oos']
               if (r.get('rep') or '').strip().lower() == rep_clean.lower()]
     my_low_stock = [r for r in digest['buckets']['low_stock']
                     if (r.get('rep') or '').strip().lower() == rep_clean.lower()]
 
     # Opportunities — SKUs MISSING across my stores (aggregate, top 25)
-    # i.e. tracked SKUs that are NOT at most of my stores
-    if USE_POSTGRES:
+    # i.e. tracked SKUs that are NOT at most of my stores — portfolio-scoped
+    if USE_POSTGRES and portfolio_skus:
         opp_rows = _exec(
             f"""
             WITH my_stores AS (
@@ -12719,15 +12794,20 @@ def api_crm_rep_dashboard(rep):
             FROM sod_inventory i, latest
             WHERE i.snapshot_date = latest.d
               AND i.store_number IN (SELECT store_number FROM my_stores)
-              AND i.sku IN ({','.join(['%s']*len(SOD_TRACKED_SKUS))})
+              AND i.sku IN ({','.join(['%s']*len(portfolio_skus))})
             GROUP BY i.sku
             """,
-            tuple([rep_clean] + list(SOD_TRACKED_SKUS.keys())),
+            tuple([rep_clean] + portfolio_skus),
         )
     else:
         opp_rows = []  # sqlite path omitted — prod is postgres
 
     opportunities = []
+    seen_present = {r[0] for r in opp_rows}
+    # Also include portfolio SKUs that have ZERO presence (true 100% gap)
+    for sku in portfolio_skus:
+        if sku not in seen_present:
+            opp_rows = list(opp_rows) + [(sku, 0)]
     for r in opp_rows:
         sku = r[0]; present = int(r[1] or 0)
         brand, name = SOD_TRACKED_SKUS.get(sku, ('', sku))
@@ -12743,6 +12823,8 @@ def api_crm_rep_dashboard(rep):
 
     return jsonify({
         'rep': rep_clean,
+        'portfolio': portfolio,
+        'portfolio_skus': portfolio_skus,
         'as_of': datetime.utcnow().isoformat() + 'Z',
         'my_store_count': my_store_count,
         'stats_30d': stats_30,
