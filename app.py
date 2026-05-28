@@ -8939,14 +8939,17 @@ def api_admin_new_listings_by_range():
                 print('[new-listings] Live scrape complete; running diff with fresh data')
         except Exception as e:
             print(f'[new-listings] Live scrape failed (proceeding with stale data): {e}')
-    skus_to_audit = (
-        [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
-        else list(SOD_TRACKED_SKUS.keys())
-    )
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
+    portfolio_skus = _skus_for_portfolio(portfolio)
+    if sku_filter and sku_filter in SOD_TRACKED_SKUS:
+        skus_to_audit = [sku_filter] if sku_filter in set(portfolio_skus) else []
+    else:
+        skus_to_audit = portfolio_skus
 
     db = get_db()
     out_rows = []
     summary = {
+        'portfolio': portfolio,
         'total_new_listings': 0,
         'total_lost_listings': 0,
         'net_change': 0,
@@ -10480,13 +10483,17 @@ def api_admin_hidden_listings():
         return jsonify({'error': 'start must be <= end'}), 400
 
     sku_filter = (request.args.get('sku') or '').strip()
-    skus_to_audit = (
-        [sku_filter] if (sku_filter and sku_filter in SOD_TRACKED_SKUS)
-        else list(SOD_TRACKED_SKUS.keys())
-    )
+    portfolio = (request.args.get('portfolio') or 'NB').strip()
+    portfolio_skus = _skus_for_portfolio(portfolio)
+    if sku_filter and sku_filter in SOD_TRACKED_SKUS:
+        # Explicit sku always wins (and must be inside the portfolio to count)
+        skus_to_audit = [sku_filter] if sku_filter in set(portfolio_skus) else []
+    else:
+        skus_to_audit = portfolio_skus
 
     db = get_db()
     output = {
+        'portfolio': portfolio,
         'ghost_listings': [],
         'hidden_inventory': [],
         'flicker_patterns': [],
