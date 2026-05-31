@@ -18976,11 +18976,16 @@ TERRITORY_MAP = {
         'target_min': 48, 'target_max': 58,
     },
     'Ikshit': {
-        # Burlington + Oakville (Halton south).
+        # Burlington (L7L-T) + Oakville (L6H-M). Halton south.
+        # NOTE: longer prefixes here beat Namit's bare 'L6' / 'L7A/C/E/G/K',
+        # so Oakville stays with Ikshit even though it's geographically GTA.
         'name': 'Burlington + Oakville',
-        'postal_prefixes': ['L7L', 'L7M', 'L7N', 'L7P', 'L7R', 'L7S', 'L7T'],
+        'postal_prefixes': [
+            'L7L', 'L7M', 'L7N', 'L7P', 'L7R', 'L7S', 'L7T',  # Burlington
+            'L6H', 'L6J', 'L6K', 'L6L', 'L6M',                 # Oakville
+        ],
         'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
-        'target_min': 25, 'target_max': 45,
+        'target_min': 13, 'target_max': 30,
     },
     # Neeraj + Virat removed from TERRITORY_MAP on 2026-05-31 — their
     # patches (Brampton/Milton/Malton, Mississauga/Caledon) are now
