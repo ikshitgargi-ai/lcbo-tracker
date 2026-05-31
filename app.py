@@ -18923,93 +18923,69 @@ REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
 # drives /api/crm/territory-plan + the auto-stamp on stores.rep.
 TERRITORY_MAP = {
     'Namit': {
-        # GTA core — Toronto (416), Durham (L1*), Markham/Richmond Hill/Vaughan,
-        # NOT Brampton/Milton/Malton (those go to Neeraj) or
-        # Mississauga (Virat). Reps can still log anywhere.
-        'name': 'GTA Core (Toronto + Markham + Vaughan + Durham)',
+        # WHOLE GTA — Toronto + Durham + York + Peel (Brampton + Mississauga
+        # + Caledon + Milton + Malton) + Halton-north. Consolidated 2026-05-31
+        # per founder direction: "namit has whole in and around gta".
+        # ONLY exclusion within GTA: L7L-T (Burlington + Oakville = Ikshit).
+        # Reps can still log anywhere; this is the default-assignment map.
+        'name': 'Greater Toronto Area — entire',
         'postal_prefixes': [
             'M',                                           # Toronto (416)
-            'L1',                                          # Durham (Pickering/Ajax/Whitby/Oshawa)
+            'L1',                                          # Durham
             'L3R', 'L3S', 'L3T', 'L3X', 'L3Y',             # Markham/Newmarket
-            'L4A', 'L4B', 'L4C', 'L4E', 'L4G', 'L4H',     # Stouffville/Aurora/RH/Vaughan
-            'L4J', 'L4K', 'L4L',                           # Vaughan/Concord/Woodbridge
-            'L6A', 'L6B', 'L6C', 'L6E',                    # Markham
+            'L4',                                          # All L4 (Vaughan/Stouffville/Aurora/RH/Concord/Woodbridge/Malton/N.Mississauga)
+            'L5',                                          # Mississauga
+            'L6',                                          # Brampton + Markham
+            'L7A', 'L7C', 'L7E', 'L7G', 'L7K',             # Caledon/Bolton/Georgetown
+            'L9T',                                         # Milton
         ],
         'fallback_cities': [
             'Toronto', 'North York', 'Etobicoke', 'Scarborough',
             'Woodbridge', 'Vaughan', 'Maple', 'Markham', 'Stouffville',
             'Newmarket', 'Aurora', 'Richmond Hill', 'Thornhill',
             'Concord', 'Kleinburg', 'Pickering', 'Ajax', 'Whitby',
-            'Oshawa', 'East Gwillimbury',
+            'Oshawa', 'East Gwillimbury', 'Newcastle',
+            'Mississauga', 'Malton', 'Brampton', 'Milton',
+            'Bolton', 'Caledon', 'Georgetown', 'Schomberg',
         ],
-        'target_min': 120, 'target_max': 200,
+        'target_min': 220, 'target_max': 300,
     },
     'Surya': {
-        # In + around Ottawa — the full Ottawa region + Eastern Ontario:
-        # Ottawa core (K1/K2), rural Ottawa (K0A), Prescott-Russell (K0B),
-        # SD&G / Cornwall (K0C, K6), Leeds-Grenville north (K0E), Lanark
-        # (K0G), the Ottawa Valley / Renfrew County (K0J, K7S Arnprior,
-        # K7V Renfrew, K8A Pembroke, K8H Petawawa), Smiths Falls / Carleton
-        # Place / Perth (K7A, K7C, K7H), Hawkesbury / Brockville (K6).
-        # Deliberately NOT Kingston (K7K-P), Napanee (K7R), Belleville
-        # (K8N/K8P), Trenton (K8V) or Peterborough (K9*) — separate region.
-        'name': 'Ottawa + Eastern Ontario',
+        # Ottawa METRO only — capped 50-55 stores per founder direction
+        # 2026-05-31 (Surya can't travel too rural). Includes Ottawa core
+        # + immediate ring (rural K0A) + Orleans/Cumberland/Rockland (K4)
+        # + Carleton Place / Smiths Falls (K7A/C — close enough to Ottawa).
+        # EXCLUDES the Ottawa Valley / Eastern Ontario rural reach that was
+        # in the prior wider map (Cornwall/Brockville/Hawkesbury/Pembroke/
+        # Petawawa/Renfrew/Perth/all K0B-K0J).
+        'name': 'Ottawa metro (capped 50-55 stores)',
         'postal_prefixes': [
-            'K1', 'K2',                                    # Ottawa core
-            'K0A', 'K0B', 'K0C', 'K0E', 'K0G', 'K0J',      # rural ring + Valley
+            'K1', 'K2',                                    # Ottawa core (416-equivalent)
+            'K0A',                                         # Rural Ottawa ring
             'K4A', 'K4B', 'K4C', 'K4K', 'K4M', 'K4P', 'K4R',  # Orleans/Cumberland/Rockland
-            'K6',                                           # Cornwall/Hawkesbury/Brockville
-            'K7A', 'K7C', 'K7H', 'K7S', 'K7V',             # Smiths Falls/Carleton Pl/Perth/Arnprior/Renfrew
-            'K8A', 'K8H',                                   # Pembroke/Petawawa (Ottawa Valley)
+            'K7A', 'K7C',                                  # Smiths Falls + Carleton Place (close-in)
         ],
         'fallback_cities': [
             'Ottawa', 'Kanata', 'Nepean', 'Orleans', 'Stittsville',
             'Manotick', 'Rockland', 'Embrun', 'Carleton Place',
             'Almonte', 'Smiths Falls', 'Gloucester', 'Vanier',
             'Russell', 'Kemptville', 'Cumberland', 'Greely',
-            'Cornwall', 'Hawkesbury', 'Brockville', 'Perth', 'Arnprior',
-            'Renfrew', 'Pembroke', 'Petawawa', 'Alexandria', 'Morrisburg',
-            'Prescott', 'Vankleek Hill', 'Plantagenet', 'Alfred',
-            'Chesterville', 'Winchester', 'Iroquois', 'Merrickville',
-            'Westport', 'Lanark', 'Deep River', 'Cobden', 'Eganville',
-            "Barry's Bay", 'Calabogie', 'Long Sault', 'Maxville',
             'Casselman', 'Limoges', 'Metcalfe', 'Osgoode',
+            'Carp', 'Richmond', 'Bourget',
         ],
-        'target_min': 70, 'target_max': 120,
+        'target_min': 48, 'target_max': 58,
     },
     'Ikshit': {
-        # Burlington + Oakville (Halton south) — overlaps with GTA west edge.
+        # Burlington + Oakville (Halton south).
         'name': 'Burlington + Oakville',
         'postal_prefixes': ['L7L', 'L7M', 'L7N', 'L7P', 'L7R', 'L7S', 'L7T'],
         'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
         'target_min': 25, 'target_max': 45,
     },
-    'Neeraj': {
-        # Milton + Malton + Brampton + surrounding (Bolton/Georgetown).
-        # Reassigned 2026-05-12 per founder request. Old Hamilton/KW
-        # assignment is unwound — those stores fall back to unassigned
-        # for now (low-density rural, not on the active route).
-        'name': 'Milton + Malton + Brampton',
-        'postal_prefixes': [
-            'L9T',                                          # Milton
-            'L4T',                                          # Malton (Mississauga corner)
-            'L6P', 'L6R', 'L6S', 'L6T', 'L6V', 'L6W',      # Brampton
-            'L6X', 'L6Y', 'L6Z',                            # Brampton
-            'L7A', 'L7C',                                   # Brampton/Caledon (Bolton)
-        ],
-        'fallback_cities': ['Milton', 'Malton', 'Brampton', 'Bolton',
-                            'Georgetown'],
-        'target_min': 35, 'target_max': 70,
-    },
-    'Virat': {
-        # Mississauga (everything except Malton) + Caledon south.
-        # Brampton/Milton moved to Neeraj.
-        'name': 'Mississauga + Caledon',
-        'postal_prefixes': ['L4Z', 'L5',
-                            'L7E', 'L7G', 'L7K'],
-        'fallback_cities': ['Mississauga', 'Caledon'],
-        'target_min': 30, 'target_max': 60,
-    },
+    # Neeraj + Virat removed from TERRITORY_MAP on 2026-05-31 — their
+    # patches (Brampton/Milton/Malton, Mississauga/Caledon) are now
+    # consolidated under Namit's "whole GTA" assignment. They can still
+    # log activities anywhere; this just removes their default stamp.
 }
 
 
