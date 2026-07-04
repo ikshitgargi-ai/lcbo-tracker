@@ -2951,6 +2951,9 @@ SOD_TRACKED_SKUS = {
     '0046286': ('Fratelli', 'Fratelli Sauvignon Blanc'),
     '0046287': ('Fratelli', 'Fratelli Cabernet Sauvignon'),
     '0045378': ('Rock Paper', 'Rock Paper Rum'),  # NEW Anu import — added 2026-05-27
+    # Prospect analysis for the agency pitch — Mandakini (Oxford Beverage Group).
+    # Added 2026-07-04 so SOD carries store-level rows for #47587 (listed vs stocked).
+    '0047587': ('Mandakini', 'Mandakini Malabari Vaatte Desi Daaru'),
 }
 
 # Portfolio split — every tracked SKU belongs to exactly one agency book.
@@ -2963,6 +2966,7 @@ SKU_PORTFOLIO = {
     '0046282': 'Anu', '0046285': 'Anu',
     '0046286': 'Anu', '0046287': 'Anu',
     '0045378': 'Anu',
+    '0047587': 'Anu',  # Mandakini prospect
 }
 
 
