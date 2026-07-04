@@ -3995,6 +3995,13 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 # massive history table didn't complete), ON CONFLICT raises;
                 # we catch and fall back to plain INSERT to keep the daily
                 # sync from breaking.
+                # SAVEPOINT so a failure here can only lose THIS statement.
+                # The old fallback called conn.rollback(), which silently threw
+                # away the sod_inventory + sod_products writes of every sync
+                # since 2026-05-26 while still committing a 'success' run row
+                # (the uniq_sod_listing_changes index never exists in prod, so
+                # ON CONFLICT raised on every run).
+                cur.execute("SAVEPOINT sp_listing_changes")
                 try:
                     psycopg2.extras.execute_values(
                         cur,
@@ -4005,15 +4012,10 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                            DO NOTHING""",
                         change_inserts,
                     )
+                    cur.execute("RELEASE SAVEPOINT sp_listing_changes")
                 except Exception as _conflict_err:
-                    # If the unique index doesn't exist (e.g. dedupe step on a
-                    # massive history table didn't complete), ON CONFLICT raises.
-                    # Fall back to plain INSERT to keep the daily sync alive.
                     print(f"[SOD-{source}] ON CONFLICT failed ({_conflict_err}), retrying with plain INSERT")
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_listing_changes")
                     psycopg2.extras.execute_values(
                         cur,
                         """INSERT INTO sod_listing_changes
@@ -4021,6 +4023,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                            VALUES %s""",
                         change_inserts,
                     )
+                    cur.execute("RELEASE SAVEPOINT sp_listing_changes")
             else:
                 cur.executemany(
                     """INSERT OR IGNORE INTO sod_listing_changes
