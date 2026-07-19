@@ -2,12 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#b22222">
+<meta name="theme-color" content="#060c18">
 <link rel="manifest" href="/static/manifest.json">
-<title>Anu Spirits — LCBO Tracker</title>
+<link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<title>Anu Spirits LCBO Tracker</title>
 <link rel="stylesheet" href="/static/style.css">
 <!-- Leaflet for the Map view (free OpenStreetMap tiles, no API key) -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -21,9 +23,9 @@
     <div class="logo">
       <div class="brand-logo">
         <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
-          <rect width="42" height="42" rx="8" fill="#d4a574"/>
-          <text x="21" y="24" text-anchor="middle" fill="#b22222" font-size="16" font-weight="bold" font-family="serif">ANU</text>
-          <text x="21" y="34" text-anchor="middle" fill="#b22222" font-size="6" font-family="sans-serif">SPIRITS</text>
+          <rect x="1" y="1" width="40" height="40" rx="8" fill="#0b1424" stroke="#d8ad58"/>
+          <text x="21" y="24" text-anchor="middle" fill="#d8ad58" font-size="16" font-weight="bold" font-family="Cormorant Garamond, serif">ANU</text>
+          <text x="21" y="34" text-anchor="middle" fill="#d8ad58" font-size="6" font-family="Outfit, sans-serif">SPIRITS</text>
         </svg>
         <div>
           <h2>Anu Spirits</h2>
@@ -338,7 +340,7 @@
         <h1>Listing Gap Report</h1>
         <div class="live-badge">LIVE <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">For each tracked product — LCBO stores in your CRM that are NOT carrying it. These are listing opportunities.</p>
+      <p class="view-desc">For each tracked product - LCBO stores in your CRM that are NOT carrying it. These are listing opportunities.</p>
       <div class="filters">
         <button class="btn-primary" onclick="refreshLiveInventoryAll()">&#128260; Refresh Live Inventory (All Products)</button>
         <select id="gapSkuFilter" onchange="loadGapReport()"><option value="">All Products</option></select>
@@ -375,10 +377,10 @@
     <!-- ===== SOD LIVE (Sale of Data daily feed from LCBO) ===== -->
     <section id="view-sod" class="view">
       <div class="view-header">
-        <h1>SOD Live &mdash; LCBO Daily Feed</h1>
+        <h1>SOD Live - LCBO Daily Feed</h1>
         <div class="live-badge">LIVE <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">Official LCBO Sale-of-Data feed &mdash; ingested nightly from <code>sod.lcbo.com</code>. Every SKU, every store, every day. Filtered to Anu &amp; NB Distillers products for reports.</p>
+      <p class="view-desc">Official LCBO Sale-of-Data feed - ingested nightly from <code>sod.lcbo.com</code>. Every SKU, every store, every day. Filtered to Anu &amp; NB Distillers products for reports.</p>
       <div class="sod-status-grid" id="sodStatusGrid"></div>
       <div class="filters">
         <button class="btn-primary" onclick="triggerSodSync()" id="sodSyncBtn">&#128260; Sync Now (Daily A + B)</button>
@@ -434,7 +436,7 @@
         <h1>Reports</h1>
         <div class="live-badge">LIVE <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">Daily, weekly, and monthly summaries of SOD data + per-rep performance. Backed by the SOD feed &mdash; refreshed automatically every night.</p>
+      <p class="view-desc">Daily, weekly, and monthly summaries of SOD data + per-rep performance. Backed by the SOD feed - refreshed automatically every night.</p>
       <div class="filters">
         <div class="fu-filter-bar">
           <button class="tab-btn active" onclick="loadReport('daily', this)">Daily</button>
@@ -475,23 +477,23 @@
         </div>
         <div class="card export-card">
           <h3>&#128203; Activity Log</h3>
-          <p>Every activity ever logged — rep, store, producer, type, notes, date/time</p>
+          <p>Every activity ever logged - rep, store, producer, type, notes, date/time</p>
           <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#127979; Store Directory</h3>
-          <p>All store info — managers, contacts, phones, emails, producers</p>
+          <p>All store info - managers, contacts, phones, emails, producers</p>
           <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
         </div>
         <div class="card export-card">
           <h3>&#128190; Full Backup</h3>
-          <p>All data ever entered — activities, follow-ups, stores, inventory. Data is permanently stored in PostgreSQL cloud database and NEVER deleted.</p>
+          <p>All data ever entered - activities, follow-ups, stores, inventory. Data is permanently stored in PostgreSQL cloud database and NEVER deleted.</p>
           <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Backup</a>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <h3>&#128279; Google Sheets Live Sync</h3>
-        <p style="margin-bottom:12px">Paste in Google Sheets cell A1 — auto-refreshes hourly:</p>
+        <p style="margin-bottom:12px">Paste in Google Sheets cell A1 - auto-refreshes hourly:</p>
         <code class="code-block">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
       </div>
     </section>
@@ -505,10 +507,10 @@
       <p class="view-desc">One-glance view of tracked products, OOS risk, listing changes, territory health. Pulls from SOD daily feed + LCBO.com live data.</p>
 
       <div id="crmKpiGrid" class="crm-kpi-grid">
-        <div class="kpi-card"><div class="kpi-label">Latest SOD Snapshot</div><div class="kpi-value" id="kpiSnapshot">—</div></div>
-        <div class="kpi-card alert"><div class="kpi-label">Brink-of-OOS Stores</div><div class="kpi-value" id="kpiOos">—</div><div class="kpi-sub">Tracked SKU listed but on_hand &le; 2</div></div>
-        <div class="kpi-card good"><div class="kpi-label">New Listings (7d)</div><div class="kpi-value" id="kpiNewListings">—</div></div>
-        <div class="kpi-card warn"><div class="kpi-label">Delistings (7d)</div><div class="kpi-value" id="kpiDelistings">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">Latest SOD Snapshot</div><div class="kpi-value" id="kpiSnapshot">-</div></div>
+        <div class="kpi-card alert"><div class="kpi-label">Brink-of-OOS Stores</div><div class="kpi-value" id="kpiOos">-</div><div class="kpi-sub">Tracked SKU listed but on_hand &le; 2</div></div>
+        <div class="kpi-card good"><div class="kpi-label">New Listings (7d)</div><div class="kpi-value" id="kpiNewListings">-</div></div>
+        <div class="kpi-card warn"><div class="kpi-label">Delistings (7d)</div><div class="kpi-value" id="kpiDelistings">-</div></div>
       </div>
 
       <div class="card crm-card">
@@ -592,8 +594,8 @@
 
     <!-- ===== OPPORTUNITIES (replacement finder) ===== -->
     <section id="view-opps" class="view">
-      <div class="view-header"><h1>Opportunities — Replace Slow Movers</h1></div>
-      <p class="view-desc">For each tracked SKU, find stores where a competitor product in the same category is slow-moving (on_hand low) or being delisted. These are your highest-conversion pitch targets — same shelf, same category, our SKU bumps theirs.</p>
+      <div class="view-header"><h1>Opportunities - Replace Slow Movers</h1></div>
+      <p class="view-desc">For each tracked SKU, find stores where a competitor product in the same category is slow-moving (on_hand low) or being delisted. These are your highest-conversion pitch targets - same shelf, same category, our SKU bumps theirs.</p>
       <div class="row-controls">
         <label>Pitch our SKU:
           <select id="oppsFullSku" onchange="loadOpportunitiesFull()"></select>
@@ -639,7 +641,7 @@
       </div>
 
       <div class="card crm-card">
-        <h3>Active Goals — Live Progress</h3>
+        <h3>Active Goals - Live Progress</h3>
         <div id="goalsTable" class="scroll-x"></div>
       </div>
     </section>

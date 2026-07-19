@@ -1,4 +1,4 @@
-/* ===== Anu Spirits LCBO Tracker Pro — Frontend Engine ===== */
+/* ===== Anu Spirits LCBO Tracker Pro - Frontend Engine ===== */
 
 let currentPage = 1;
 let activeRepId = null;
@@ -74,7 +74,7 @@ async function loadTrackedProductOptions() {
     const res = await fetch('/api/products');
     const products = await res.json();
     const opts = ['<option value="">All Products</option>'].concat(
-      products.filter(p => p.lcbo_sku).map(p => `<option value="${esc(p.lcbo_sku)}">${esc(p.brand||'')} — ${esc(p.name)} (${esc(p.lcbo_sku)})</option>`)
+      products.filter(p => p.lcbo_sku).map(p => `<option value="${esc(p.lcbo_sku)}">${esc(p.brand||'')} - ${esc(p.name)} (${esc(p.lcbo_sku)})</option>`)
     ).join('');
     ['gapSkuFilter','reorderSkuFilter'].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = opts; });
   } catch(e) { console.warn('loadTrackedProductOptions', e); }
@@ -102,7 +102,7 @@ async function loadListingStatus() {
     const data = await res.json();
     const bar = document.getElementById('listingStatusBar');
     if (!bar) return;
-    const statusColor = code => ({1:'#00b894',2:'#00b894',3:'#fdcb6e',4:'#e17055',5:'#d63031'})[code] || '#636e72';
+    const statusColor = code => ({1:'#2dd4a8',2:'#2dd4a8',3:'#fdcb6e',4:'#ff8a80',5:'#e5484d'})[code] || '#6b7691';
     bar.innerHTML = (data.products||[]).map(p => `
       <div class="ls-card" style="border-left:4px solid ${statusColor(p.listing_status_code)}">
         <div class="ls-name">${esc(p.name)}</div>
@@ -134,7 +134,7 @@ async function loadGapReport() {
       <div class="card gap-card">
         <div class="gap-header">
           <div>
-            <h3>${esc(p.product.brand||'')} — ${esc(p.product.name)}</h3>
+            <h3>${esc(p.product.brand||'')} - ${esc(p.product.name)}</h3>
             <div class="muted">SKU ${esc(p.product.sku)} · ${esc(p.product.price||'')}</div>
           </div>
           <div class="gap-metrics">
@@ -231,8 +231,8 @@ async function loadDashboard() {
     <div class="stat-card green"><div class="label">Activities Logged</div><div class="value">${d.total_activities}</div></div>
     <div class="stat-card blue"><div class="label">Active Stores</div><div class="value">${d.active_stores || 0}</div></div>
     <div class="stat-card orange"><div class="label">This Week</div><div class="value">${d.week_activities || 0}</div></div>
-    <div class="stat-card" style="border-left:3px solid #e17055"><div class="label">NB Distillers</div><div class="value" style="color:#e17055">${prods['NB Distillers'] || 0}</div></div>
-    <div class="stat-card" style="border-left:3px solid #00cec9"><div class="label">Anu Portfolio</div><div class="value" style="color:#00cec9">${prods['Anu Portfolio'] || 0}</div></div>
+    <div class="stat-card" style="border-left:3px solid #d8ad58"><div class="label">NB Distillers</div><div class="value" style="color:#d8ad58">${prods['NB Distillers'] || 0}</div></div>
+    <div class="stat-card" style="border-left:3px solid #2dd4a8"><div class="label">Anu Portfolio</div><div class="value" style="color:#2dd4a8">${prods['Anu Portfolio'] || 0}</div></div>
     <div class="stat-card red"><div class="label">Overdue Follow-Ups</div><div class="value">${d.overdue_followups || 0}</div></div>
     <div class="stat-card" style="border-left:3px solid var(--accent)"><div class="label">Untouched Stores</div><div class="value" style="color:var(--accent-light)">${d.total_stores - (d.active_stores || 0)}</div></div>
   `;
@@ -301,8 +301,8 @@ async function loadStores() {
       <td><strong>${s.store_number}</strong></td>
       <td>${esc(truncate(s.account, 25))}</td>
       <td>${esc(s.city)}</td>
-      <td>${esc(s.manager_name || '—')}</td>
-      <td>${esc(s.manager_phone || s.phone || '—')}</td>
+      <td>${esc(s.manager_name || '-')}</td>
+      <td>${esc(s.manager_phone || s.phone || '-')}</td>
       <td>${statusBadge(s.status)}</td>
       <td>${producerTags(s.producer)}</td>
       <td><button class="btn-sm" onclick="event.stopPropagation();openStoreModal(${s.id})">View</button></td>
@@ -332,7 +332,7 @@ async function openStoreModal(storeId) {
   const res = await fetch(`/api/stores/${storeId}`);
   const s = await res.json();
 
-  document.getElementById('modalTitle').textContent = `${s.account} — Store #${s.store_number}`;
+  document.getElementById('modalTitle').textContent = `${s.account} - Store #${s.store_number}`;
   document.getElementById('editStoreId').value = s.id;
   document.getElementById('editStoreNum').value = s.store_number;
   document.getElementById('editAccount').value = s.account || '';
@@ -406,7 +406,7 @@ async function loadSnapshot(storeId) {
   if (snap.first_contact) {
     html += `<div class="snapshot-section">
       <h4>First Contact</h4>
-      <div class="muted">${formatDate(snap.first_contact.created_at)} by ${esc(snap.first_contact.rep_name)} — ${formatType(snap.first_contact.activity_type)}</div>
+      <div class="muted">${formatDate(snap.first_contact.created_at)} by ${esc(snap.first_contact.rep_name)} - ${formatType(snap.first_contact.activity_type)}</div>
     </div>`;
   }
 
@@ -535,10 +535,10 @@ async function searchLogStore() {
 
 function selectLogStore(id, num, account, address, city) {
   document.getElementById('logStoreId').value = id;
-  document.getElementById('logStoreSearch').value = `#${num} — ${account}`;
+  document.getElementById('logStoreSearch').value = `#${num} - ${account}`;
   document.getElementById('logStoreResults').classList.remove('show');
   const info = document.getElementById('selectedStoreInfo');
-  info.innerHTML = `<strong>Store #${num}</strong> — ${account}<br>${address}, ${city}`;
+  info.innerHTML = `<strong>Store #${num}</strong> - ${account}<br>${address}, ${city}`;
   info.classList.add('show');
   loadStoreHistoryPanel(id);
 }
@@ -646,13 +646,13 @@ async function loadInventory() {
         <div class="inv-cat">${esc(p.category)}</div>
       </div>
       <div class="inv-details">
-        <div class="inv-stat"><span class="inv-val">${p.lcbo_sku || '—'}</span><span class="inv-label">SKU</span></div>
-        <div class="inv-stat"><span class="inv-val">${p.price || '—'}</span><span class="inv-label">Price</span></div>
+        <div class="inv-stat"><span class="inv-val">${p.lcbo_sku || '-'}</span><span class="inv-label">SKU</span></div>
+        <div class="inv-stat"><span class="inv-val">${p.price || '-'}</span><span class="inv-label">Price</span></div>
         <div class="inv-stat"><span class="inv-val">${p.stores_stocked}</span><span class="inv-label">Stores</span></div>
         <div class="inv-stat"><span class="inv-val">${p.total_inventory}</span><span class="inv-label">Units</span></div>
       </div>
       <div class="inv-actions">
-        ${p.lcbo_sku ? `<button class="btn-sm" onclick="checkInventory('${p.lcbo_sku}', this)">Check Stock</button>` : '<span class="muted">No SKU — Not yet listed</span>'}
+        ${p.lcbo_sku ? `<button class="btn-sm" onclick="checkInventory('${p.lcbo_sku}', this)">Check Stock</button>` : '<span class="muted">No SKU - Not yet listed</span>'}
         ${p.lcbo_url ? `<a href="${p.lcbo_url}" target="_blank" class="btn-sm">View on LCBO.com</a>` : ''}
       </div>
       <div class="inv-stores" id="inv-stores-${p.lcbo_sku || p.id}" style="display:none"></div>
@@ -791,7 +791,7 @@ async function loadRoutes() {
       <div class="crc-name">${esc(c.city)}</div>
       <div class="crc-dist">${c.distance_km} km</div>
       <div class="crc-count">${c.store_count} stores</div>
-      <div class="coverage-bar"><div class="coverage-fill" style="width:${c.coverage}%;background:${c.coverage > 50 ? '#16a34a' : c.coverage > 20 ? '#f59e0b' : '#ef4444'}"></div></div>
+      <div class="coverage-bar"><div class="coverage-fill" style="width:${c.coverage}%;background:${c.coverage > 50 ? '#2dd4a8' : c.coverage > 20 ? '#fdcb6e' : '#e5484d'}"></div></div>
       <div class="crc-cov">${c.coverage}% covered</div>
     </div>`
   ).join('') + '</div>';
@@ -909,7 +909,7 @@ async function loadDailyPlan() {
         ${plan.stores.map((s, i) => `<div class="dp-store" onclick="openStoreModal(${s.id})" style="cursor:pointer">
           <span class="dp-num">${i + 1}</span>
           <div class="dp-info">
-            <strong>LCBO #${s.store_number}</strong> — ${esc(truncate(s.account, 20))}
+            <strong>LCBO #${s.store_number}</strong> - ${esc(truncate(s.account, 20))}
             <div class="muted" style="font-size:11px">${esc(s.address || '')}, ${esc(s.city || '')}</div>
           </div>
           <div class="dp-meta">
@@ -975,12 +975,12 @@ function followupCardHTML(f, overdue) {
   const fuId = f.id;
   return `<div class="followup-card ${overdue ? 'followup-overdue' : ''} ${isCompleted ? 'followup-completed' : ''}">
     <div class="fu-top">
-      <span class="fu-store" onclick="openStoreModal(${f.store_id})" style="cursor:pointer">LCBO #${f.store_number} — ${esc(f.account)}</span>
+      <span class="fu-store" onclick="openStoreModal(${f.store_id})" style="cursor:pointer">LCBO #${f.store_number} - ${esc(f.account)}</span>
       <span class="fu-date">${f.follow_up_date}${overdue ? ' (OVERDUE)' : ''}${isCompleted ? ' ✓ DONE' : ''}</span>
     </div>
     <div class="fu-meta">${esc(f.rep_name || '')} · <span class="type-badge ${f.activity_type || f.followup_type || ''}">${formatType(f.activity_type || f.followup_type || '')}</span> ${producerTags(f.producer)} ${f.venue_type ? `<span class="venue-tag">${esc(f.venue_type)}</span>` : ''}</div>
     ${f.notes ? `<div class="fu-notes">${esc(truncate(f.notes, 120))}</div>` : ''}
-    ${f.city ? `<div class="fu-city">${esc(f.city)}${f.address ? ' — ' + esc(f.address) : ''}</div>` : ''}
+    ${f.city ? `<div class="fu-city">${esc(f.city)}${f.address ? ' - ' + esc(f.address) : ''}</div>` : ''}
     ${!isCompleted ? `<div class="fu-actions">
       <button class="btn-sm btn-complete" onclick="event.stopPropagation();completeFollowup(${fuId})">✓ Complete</button>
       <button class="btn-sm btn-reschedule" onclick="event.stopPropagation();rescheduleFollowup(${fuId})">&#128197; Reschedule</button>
@@ -1012,7 +1012,7 @@ function formatType(t) {
 }
 
 function formatDate(d) {
-  if (!d) return '—';
+  if (!d) return '-';
   const dt = new Date(d + (d.includes('Z') || d.includes('+') ? '' : 'Z'));
   return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric', year: 'numeric' }) +
     ' ' + dt.toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit' });
@@ -1064,8 +1064,8 @@ async function loadSodStatus() {
     if (!grid) return;
     const a = (d.last_by_source && d.last_by_source.daily_a) || null;
     const b = (d.last_by_source && d.last_by_source.daily_b) || null;
-    const lastWhen = a ? a.run_at : (b ? b.run_at : '—');
-    const snap = (a && a.snapshot_date) || (b && b.snapshot_date) || '—';
+    const lastWhen = a ? a.run_at : (b ? b.run_at : '-');
+    const snap = (a && a.snapshot_date) || (b && b.snapshot_date) || '-';
     const inv = d.stats && d.stats.inv_rows || 0;
     const tracked = d.stats && d.stats.tracked_products || 0;
     const days = d.stats && d.stats.snapshot_days || 0;
@@ -1073,7 +1073,7 @@ async function loadSodStatus() {
       <div class="stat-card ${d.configured ? '' : 'stat-warn'}">
         <div class="stat-label">SOD Connection</div>
         <div class="stat-value">${d.configured ? '&#9989; Connected' : '&#9888; Not configured'}</div>
-        <div class="stat-sub">Agent ${d.agent_id || '—'} &middot; Scheduler ${d.scheduler_running ? 'ON' : 'OFF'}</div>
+        <div class="stat-sub">Agent ${d.agent_id || '-'} &middot; Scheduler ${d.scheduler_running ? 'ON' : 'OFF'}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Latest Snapshot</div>
@@ -1101,8 +1101,8 @@ async function loadSodStatus() {
           <tr>
             <td>${esc(r.run_at)}</td>
             <td>${esc(r.source)}</td>
-            <td>${esc(r.file_name || '—')}</td>
-            <td>${esc(r.snapshot_date || '—')}</td>
+            <td>${esc(r.file_name || '-')}</td>
+            <td>${esc(r.snapshot_date || '-')}</td>
             <td><span class="status-badge status-${esc(r.status)}">${esc(r.status)}</span></td>
             <td>${(r.total_rows||0).toLocaleString()}</td>
             <td>${(r.anu_rows||0).toLocaleString()}</td>
@@ -1123,11 +1123,11 @@ async function loadSodProducts() {
     const cnt = document.getElementById('sodProdCount');
     if (cnt) cnt.textContent = d.count;
     body.innerHTML = (d.rows || []).length === 0
-      ? '<tr><td colspan="7" class="muted">No SOD data yet — click Sync Now.</td></tr>'
+      ? '<tr><td colspan="7" class="muted">No SOD data yet - click Sync Now.</td></tr>'
       : d.rows.map(r => `
         <tr>
-          <td>${esc(r.brand || '—')}</td>
-          <td>${esc(r.product_name || '—')}</td>
+          <td>${esc(r.brand || '-')}</td>
+          <td>${esc(r.product_name || '-')}</td>
           <td><code>${esc(r.sku)}</code></td>
           <td><span class="status-badge ${_statusClass[r.current_status]||''}">${esc(_statusLabels[r.current_status]||r.current_status||'?')}</span></td>
           <td>${r.store_count||0}</td>
@@ -1156,10 +1156,10 @@ async function loadSodListingChanges() {
         <tr>
           <td>${esc(r.change_date)}</td>
           <td><span class="change-badge change-${esc(r.change_type)}">${esc(r.change_type)}</span></td>
-          <td>${esc(r.brand||'—')}</td>
-          <td>${esc(r.product_name||'—')}</td>
-          <td>${esc(r.old_status||'—')}</td>
-          <td>${esc(r.new_status||'—')}</td>
+          <td>${esc(r.brand||'-')}</td>
+          <td>${esc(r.product_name||'-')}</td>
+          <td>${esc(r.old_status||'-')}</td>
+          <td>${esc(r.new_status||'-')}</td>
         </tr>
       `).join('');
   } catch (e) { console.warn('loadSodListingChanges', e); }
@@ -1190,7 +1190,7 @@ async function triggerSodSync() {
           await loadSodProducts();
           await loadSodListingChanges();
           if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Sync Now (Daily A + B)'; }
-          if (failed) alert('Sync failed — check server logs / SOD credentials.');
+          if (failed) alert('Sync failed - check server logs / SOD credentials.');
         } else {
           setTimeout(poll, 3000);
         }
@@ -1216,13 +1216,13 @@ async function showSodTrend(sku) {
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
     const rows = d.rows || [];
     const content = rows.length === 0
-      ? '<p class="muted">No trend data yet — need at least 2 snapshots.</p>'
+      ? '<p class="muted">No trend data yet - need at least 2 snapshots.</p>'
       : `<table class="data-table"><thead><tr><th>Date</th><th>Stores</th><th>On-Hand</th><th>Listed</th><th>Delisting</th></tr></thead><tbody>`
         + rows.map(r => `<tr><td>${esc(r.snapshot_date)}</td><td>${r.store_count}</td><td>${(r.total_on_hand||0).toLocaleString()}</td><td>${r.listed_stores}</td><td>${r.delisting_stores}</td></tr>`).join('')
         + '</tbody></table>';
     modal.innerHTML = `
       <div class="sod-modal-content">
-        <h2>SKU ${esc(sku)} &mdash; 60-day Trend</h2>
+        <h2>SKU ${esc(sku)} - 60-day Trend</h2>
         <button class="btn-close" onclick="this.closest('.sod-modal').remove()">&times;</button>
         ${content}
       </div>`;
@@ -1247,7 +1247,7 @@ async function loadReport(kind, btn) {
     const t = d.totals || {};
     container.innerHTML = `
       <div class="stats-grid">
-        <div class="stat-card"><div class="stat-label">Window</div><div class="stat-value">${esc(w.start)} &rarr; ${esc(w.end)}</div><div class="stat-sub">Latest snapshot: ${esc(w.latest_snapshot || '—')}</div></div>
+        <div class="stat-card"><div class="stat-label">Window</div><div class="stat-value">${esc(w.start)} &rarr; ${esc(w.end)}</div><div class="stat-sub">Latest snapshot: ${esc(w.latest_snapshot || '-')}</div></div>
         <div class="stat-card"><div class="stat-label">Products Tracked</div><div class="stat-value">${t.products_tracked||0}</div></div>
         <div class="stat-card stat-good"><div class="stat-label">New Listings</div><div class="stat-value">${t.new_listings||0}</div></div>
         <div class="stat-card stat-bad"><div class="stat-label">Delistings</div><div class="stat-value">${t.delistings||0}</div></div>
@@ -1256,19 +1256,19 @@ async function loadReport(kind, btn) {
       </div>
       <div class="dashboard-grid" style="margin-top:16px">
         <div class="card">
-          <h3>${esc(title)} &mdash; Snapshot Metrics</h3>
+          <h3>${esc(title)} - Snapshot Metrics</h3>
           <table class="data-table">
             <thead><tr><th>Brand</th><th>Product</th><th>Stores</th><th>On-Hand</th><th>Listed</th><th>Delisting</th><th>Fully Delisted</th></tr></thead>
             <tbody>
               ${(d.snapshot_metrics||[]).map(m => `<tr>
-                <td>${esc(m.brand||'—')}</td>
-                <td>${esc(m.product_name||'—')}</td>
+                <td>${esc(m.brand||'-')}</td>
+                <td>${esc(m.product_name||'-')}</td>
                 <td>${m.store_count||0}</td>
                 <td>${(m.total_on_hand||0).toLocaleString()}</td>
                 <td>${m.listed_stores||0}</td>
                 <td>${m.delisting_stores||0}</td>
                 <td>${m.fully_delisted_stores||0}</td>
-              </tr>`).join('') || '<tr><td colspan="7" class="muted">No data — run /api/sod/sync.</td></tr>'}
+              </tr>`).join('') || '<tr><td colspan="7" class="muted">No data - run /api/sod/sync.</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -1280,8 +1280,8 @@ async function loadReport(kind, btn) {
               ${(d.listing_changes||[]).map(c => `<tr>
                 <td>${esc(c.change_date)}</td>
                 <td><span class="change-badge change-${esc(c.change_type)}">${esc(c.change_type)}</span></td>
-                <td>${esc(c.product_name||'—')}</td>
-                <td>${esc(c.old_status||'—')} &rarr; ${esc(c.new_status||'—')}</td>
+                <td>${esc(c.product_name||'-')}</td>
+                <td>${esc(c.old_status||'-')} &rarr; ${esc(c.new_status||'-')}</td>
               </tr>`).join('') || '<tr><td colspan="4" class="muted">No listing events in this window.</td></tr>'}
             </tbody>
           </table>
@@ -1310,7 +1310,7 @@ async function loadRepReport(btn) {
     const subHeaders = anuProducts.map(() => '<th>Carrying</th><th>Delisting</th>').join('');
     container.innerHTML = `
       <div class="card">
-        <h3>Per-Rep Performance &mdash; Snapshot ${esc(d.snapshot_date || '—')}</h3>
+        <h3>Per-Rep Performance - Snapshot ${esc(d.snapshot_date || '-')}</h3>
         <p class="view-desc">Stores carrying each tracked SKU, by rep. "Delisting" = stores where SOD flags the product for removal.</p>
         <div class="scroll-x">
           <table class="data-table">
@@ -1384,7 +1384,7 @@ async function loadCrmDashboard() {
     ]);
     const d = await dashRes.json();
     const dig = await digestRes.json();
-    document.getElementById('kpiSnapshot').textContent = d.latest_snapshot || '—';
+    document.getElementById('kpiSnapshot').textContent = d.latest_snapshot || '-';
     document.getElementById('kpiOos').textContent = d.oos_brink_count;
     document.getElementById('kpiNewListings').textContent =
       (d.digest_last_7_days?.NEW_LISTING || 0) + (d.digest_last_7_days?.RELISTED || 0);
@@ -1405,13 +1405,13 @@ async function loadCrmDashboard() {
           <td><span class="status-badge status-${(p.current_status||'L').toLowerCase()=='l'?'listed':((p.current_status||'').toLowerCase()=='d'?'delisting':'delisted')}">${esc(_statusLabel(p.current_status))}</span></td>
           <td>${p.store_count}</td>
           <td>${p.total_on_hand}</td>
-        </tr>`).join('') || '<tr><td colspan="6" class="muted">No SOD data yet — wait for first sync.</td></tr>'
+        </tr>`).join('') || '<tr><td colspan="6" class="muted">No SOD data yet - wait for first sync.</td></tr>'
       }</tbody></table>`;
 
     // Territory list
     const tl = document.getElementById('crmTerritoryList');
     tl.innerHTML = (d.territories||[]).map(t => `
-      <div class="terr-row" style="border-left:5px solid ${esc(t.color||'#888')}">
+      <div class="terr-row" style="border-left:5px solid ${esc(t.color||'#6b7691')}">
         <div class="terr-name">${esc(t.name)}</div>
         <div class="terr-count">${t.store_count} stores</div>
       </div>`).join('') || '<p class="muted">No territories yet.</p>';
@@ -1486,13 +1486,13 @@ function renderOppsTable(data) {
     <th>Store #</th><th>City</th><th>Territory</th>
     <th>Comp Status</th><th>Comp On-Hand</th>
   </tr></thead><tbody>${data.map(o => `<tr>
-    <td><strong style="color:${o.opportunity_score>=50?'#d63031':o.opportunity_score>=25?'#e17055':'#636e72'}">${o.opportunity_score}</strong></td>
+    <td><strong style="color:${o.opportunity_score>=50?'#e5484d':o.opportunity_score>=25?'#ff8a80':'#6b7691'}">${o.opportunity_score}</strong></td>
     <td><strong>${esc(o.our_brand)} ${esc(o.our_product)}</strong><br><code class="muted-small">${esc(o.our_sku)}</code></td>
     <td>${esc((o.competitor_name||'').slice(0,32))}<br><code class="muted-small">${esc(o.competitor_sku)}</code></td>
     <td>${esc(o.category)}</td>
     <td>#${o.store_number}</td>
     <td>${esc(o.city||'')}</td>
-    <td><span class="terr-pill" style="background:${esc(o.territory_color||'#888')}">${esc(o.territory_name||'')}</span></td>
+    <td><span class="terr-pill" style="background:${esc(o.territory_color||'#6b7691')}">${esc(o.territory_name||'')}</span></td>
     <td><span class="status-badge status-${o.competitor_status==='L'?'listed':o.competitor_status==='D'?'delisting':'delisted'}">${esc(o.competitor_status)}</span></td>
     <td>${o.competitor_on_hand}</td>
   </tr>`).join('')}</tbody></table>`;
@@ -1525,8 +1525,8 @@ async function loadOos() {
       <td>${esc(r.product_name||'').slice(0,32)}</td>
       <td>#${r.store_number}</td>
       <td>${esc(r.city||'')}</td>
-      <td><span class="terr-pill" style="background:${esc(r.territory_color||'#888')}">${esc(r.territory_name||'')}</span></td>
-      <td><strong style="color:${(r.on_hand||0)===0?'#d63031':(r.on_hand||0)<=1?'#e17055':'#fdcb6e'}">${r.on_hand}</strong></td>
+      <td><span class="terr-pill" style="background:${esc(r.territory_color||'#6b7691')}">${esc(r.territory_name||'')}</span></td>
+      <td><strong style="color:${(r.on_hand||0)===0?'#e5484d':(r.on_hand||0)<=1?'#ff8a80':'#fdcb6e'}">${r.on_hand}</strong></td>
       <td>${esc(r.snapshot_date)}</td>
     </tr>`).join('')}</tbody></table>`;
   } catch(e) { cont.innerHTML = '<p class="text-bad">Failed: ' + esc(e.message) + '</p>'; }
@@ -1579,14 +1579,14 @@ async function reloadMap() {
   const grp = L.layerGroup();
   stores.forEach(s => {
     if (!s.lat || !s.lng) return;
-    let color = s.territory_color || '#888';
-    let popup = `<strong>#${s.store_number} — ${esc(s.account||'')}</strong><br>
+    let color = s.territory_color || '#6b7691';
+    let popup = `<strong>#${s.store_number} - ${esc(s.account||'')}</strong><br>
       ${esc(s.address||'')}<br>${esc(s.city||'')} ${esc(s.postal||'')}<br>
       Territory: <span style="color:${color}">${esc(s.territory_name||'Unassigned')}</span><br>
-      Rep: ${esc(s.rep||'—')} · ${esc(s.priority||'')}`;
+      Rep: ${esc(s.rep||'-')} · ${esc(s.priority||'')}`;
     if (colorBy === 'status' && sku) {
       const st = listingMap[s.store_number];
-      color = st === 'L' ? '#00b894' : st === 'D' ? '#fdcb6e' : st === 'F' ? '#d63031' : '#bdc3c7';
+      color = st === 'L' ? '#2dd4a8' : st === 'D' ? '#fdcb6e' : st === 'F' ? '#e5484d' : '#9fa8bb';
       popup += `<br><br>Status for SKU ${sku}: <strong>${st || 'Not Listed'}</strong>`;
     }
     const m = L.circleMarker([s.lat, s.lng], {
@@ -1610,10 +1610,10 @@ async function reloadMap() {
     ).join('');
   } else {
     lg.innerHTML = `
-      <span class="legend-item"><span class="dot" style="background:#00b894"></span> Listed</span>
+      <span class="legend-item"><span class="dot" style="background:#2dd4a8"></span> Listed</span>
       <span class="legend-item"><span class="dot" style="background:#fdcb6e"></span> Delisting</span>
-      <span class="legend-item"><span class="dot" style="background:#d63031"></span> Delisted</span>
-      <span class="legend-item"><span class="dot" style="background:#bdc3c7"></span> Not Listed</span>
+      <span class="legend-item"><span class="dot" style="background:#e5484d"></span> Delisted</span>
+      <span class="legend-item"><span class="dot" style="background:#9fa8bb"></span> Not Listed</span>
     `;
   }
 }
@@ -1628,7 +1628,7 @@ async function loadGoals() {
     const progMap = {};
     prog.forEach(p => { progMap[p.id] = p; });
     const cont = document.getElementById('goalsTable');
-    if (!list.length) { cont.innerHTML = '<p class="muted">No goals yet — add one above.</p>'; return; }
+    if (!list.length) { cont.innerHTML = '<p class="muted">No goals yet - add one above.</p>'; return; }
     cont.innerHTML = `<table class="data-table"><thead><tr>
       <th>Scope</th><th>Key</th><th>Period</th>
       <th>Listings (achieved/target)</th><th>%</th>
@@ -1640,9 +1640,9 @@ async function loadGoals() {
         <td>${esc(g.scope)}</td>
         <td><code>${esc(g.scope_key)}</code></td>
         <td>${esc(g.period_start)} → ${esc(g.period_end)}</td>
-        <td>${p.achieved_listings ?? '—'} / ${g.target_listings}</td>
+        <td>${p.achieved_listings ?? '-'} / ${g.target_listings}</td>
         <td>${renderProgressBar(p.pct_listings)}</td>
-        <td>${p.achieved_units ?? '—'} / ${g.target_units}</td>
+        <td>${p.achieved_units ?? '-'} / ${g.target_units}</td>
         <td>${renderProgressBar(p.pct_units)}</td>
         <td>${esc(g.notes||'')}</td>
         <td><button class="btn-link" onclick="deleteGoal(${g.id})">Delete</button></td>
@@ -1652,9 +1652,9 @@ async function loadGoals() {
 }
 
 function renderProgressBar(pct) {
-  if (pct == null) return '—';
+  if (pct == null) return '-';
   const clamped = Math.max(0, Math.min(100, pct));
-  const color = pct >= 100 ? '#00b894' : pct >= 75 ? '#a3d977' : pct >= 50 ? '#fdcb6e' : pct >= 25 ? '#e17055' : '#d63031';
+  const color = pct >= 100 ? '#2dd4a8' : pct >= 75 ? '#4be0bb' : pct >= 50 ? '#fdcb6e' : pct >= 25 ? '#ff8a80' : '#e5484d';
   return `<div class="progress-bar"><div class="progress-fill" style="width:${clamped}%;background:${color}"></div><span class="progress-label">${pct}%</span></div>`;
 }
 
@@ -1697,7 +1697,7 @@ async function loadHoreca() {
     const r = await fetch('/api/crm/horeca?' + qs.toString());
     const data = await r.json();
     const cont = document.getElementById('horecaTable');
-    if (!data.length) { cont.innerHTML = '<p class="muted">No HORECA accounts yet — add one above.</p>'; return; }
+    if (!data.length) { cont.innerHTML = '<p class="muted">No HORECA accounts yet - add one above.</p>'; return; }
     cont.innerHTML = `<table class="data-table"><thead><tr>
       <th>Name</th><th>Type</th><th>City</th><th>Territory</th>
       <th>Contact</th><th>Phone</th><th>Status</th><th>Priority</th>
@@ -1706,7 +1706,7 @@ async function loadHoreca() {
       <td><strong>${esc(h.name)}</strong></td>
       <td>${esc(h.account_type)}</td>
       <td>${esc(h.city||'')}</td>
-      <td><span class="terr-pill" style="background:${esc(h.territory_color||'#888')}">${esc(h.territory_name||'')}</span></td>
+      <td><span class="terr-pill" style="background:${esc(h.territory_color||'#6b7691')}">${esc(h.territory_name||'')}</span></td>
       <td>${esc(h.contact_name||'')} <span class="muted-small">${esc(h.contact_title||'')}</span></td>
       <td>${esc(h.phone||'')}</td>
       <td><span class="status-pill status-${esc(h.status)}">${esc(h.status)}</span></td>
