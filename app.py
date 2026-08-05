@@ -4927,12 +4927,22 @@ def _sod_last_successful_sync_age_hours():
     return (datetime.utcnow() - val).total_seconds() / 3600.0
 
 
-def _max_snapshot_date():
+_SNAP_DATE_CACHE = {'val': None, 'at': 0.0}
+_SNAP_DATE_TTL = 1800  # 30 min: probes must not wake the database
+
+
+def _max_snapshot_date(force=False):
     """Get MAX(snapshot_date) from sod_inventory using a dedicated connection.
 
-    Safe to call outside Flask request context (e.g. from startup/scheduler).
-    Returns a date or None.
+    Cached 30 min: uptime pings and report headers were hitting Neon on every
+    call, which is both the slow path and the compute burn that took two
+    sibling trackers dark on 2026-07-26. force=True bypasses (strict
+    monitors and post-ingest refresh).
     """
+    now_ts = time.time()
+    if not force and _SNAP_DATE_CACHE['val'] is not None and \
+            (now_ts - _SNAP_DATE_CACHE['at']) < _SNAP_DATE_TTL:
+        return _SNAP_DATE_CACHE['val']
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
@@ -4940,21 +4950,24 @@ def _max_snapshot_date():
         r = cur.fetchone()
         cur.close()
         conn.close()
-        if not r:
-            return None
-        snap = r[0]
-        if snap is None:
-            return None
-        if isinstance(snap, str):
-            try:
-                return datetime.strptime(snap, '%Y-%m-%d').date()
-            except Exception:
-                return None
-        if hasattr(snap, 'date'):
-            return snap.date()
-        return snap
+        snap = r[0] if r else None
+        val = None
+        if snap is not None:
+            if isinstance(snap, str):
+                try:
+                    val = datetime.strptime(snap, '%Y-%m-%d').date()
+                except Exception:
+                    val = None
+            elif hasattr(snap, 'date'):
+                val = snap.date()
+            else:
+                val = snap
+        _SNAP_DATE_CACHE['val'] = val
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return val
     except Exception:
-        return None
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return _SNAP_DATE_CACHE['val']
 
 
 def _sod_data_age_days():
