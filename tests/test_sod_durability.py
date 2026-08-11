@@ -12,6 +12,7 @@ import datetime
 import os
 import sqlite3
 import sys
+import zlib
 
 import pytest
 
@@ -25,8 +26,12 @@ TODAY = datetime.date(2026, 8, 10)   # a Monday
 @pytest.fixture
 def conn():
     c = sqlite3.connect(':memory:')
+    # Mirrors the production columns replay_archive writes, so a schema
+    # mismatch shows up here instead of silently restoring nothing.
     c.execute("CREATE TABLE sod_inventory (sku TEXT, store_number INT, "
-              "snapshot_date TEXT, status TEXT, on_hand INT)")
+              "snapshot_date TEXT, status TEXT, on_hand INT, "
+              "product_name TEXT, source TEXT, "
+              "UNIQUE (sku, store_number, snapshot_date))")
     c.commit()
     sd.ensure_tables(c, use_postgres=False)
     return c
@@ -256,6 +261,95 @@ class TestRetentionPromise:
         day = sd.daily_series(conn, False, ['0000163'],
                               '2026-08-09', '2026-08-09')['days'][0]
         assert list(day['per_sku']) == ['0000163']
+
+
+class TestTheBackupActuallyRestores:
+    """A backup that cannot be restored is not a backup. The emailed payload
+    carries the compressed archive rather than the raw inventory table, so the
+    whole round trip has to work: blob out, base64 through JSON, blob back in,
+    rows replayed."""
+
+    def test_a_day_survives_the_full_backup_round_trip(self, conn):
+        rows = [{'sku': '0000163', 'store_number': 217, 'snapshot_date': '2026-08-09',
+                 'status': 'L', 'on_hand': 11, 'product_name': 'RED ADMIRAL VODKA'}]
+        sd.record_day(conn, False, 'daily_a', '2026-08-09',
+                      file_name='alldlyinventoryMON.zip', tracked_rows_data=rows)
+
+        # what the backup writes out
+        blob = conn.execute("SELECT rows_gz FROM sod_day_archive").fetchone()[0]
+        import base64
+        import json as _json
+        wire = {'__b64__': base64.b64encode(bytes(blob)).decode('ascii')}
+        shipped = _json.loads(_json.dumps(wire))       # survives JSON transport
+        restored_blob = base64.b64decode(shipped['__b64__'])
+        assert _json.loads(zlib.decompress(restored_blob).decode()) == rows
+
+    def test_replay_puts_the_rows_back(self, conn):
+        rows = [{'sku': '0000163', 'store_number': 217, 'snapshot_date': '2026-08-09',
+                 'status': 'L', 'on_hand': 11, 'product_name': 'RED ADMIRAL'},
+                {'sku': '0000163', 'store_number': 218, 'snapshot_date': '2026-08-09',
+                 'status': 'D', 'on_hand': 0, 'product_name': 'RED ADMIRAL'}]
+        sd.record_day(conn, False, 'daily_a', '2026-08-09', tracked_rows_data=rows)
+        # simulate the day being absent from a freshly restored database
+        conn.execute("DELETE FROM sod_inventory WHERE snapshot_date='2026-08-09'")
+        conn.commit()
+
+        out = sd.replay_archive(conn, False)
+        assert out['rows_restored'] == 2
+        assert out['days_restored'] == ['2026-08-09']
+        got = conn.execute("SELECT store_number, status, on_hand FROM sod_inventory "
+                           "WHERE snapshot_date='2026-08-09' ORDER BY store_number"
+                           ).fetchall()
+        assert got == [(217, 'L', 11), (218, 'D', 0)]
+
+    def test_replay_never_overwrites_a_day_we_still_hold(self, conn):
+        """Replaying must be safe to run at any time. A day already in the
+        database is the live record and must win over the archive copy."""
+        sd.record_day(conn, False, 'daily_a', '2026-08-09', tracked_rows_data=[
+            {'sku': '0000163', 'store_number': 217, 'snapshot_date': '2026-08-09',
+             'status': 'L', 'on_hand': 11, 'product_name': 'X'}])
+        conn.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
+                     "status, on_hand) VALUES ('0000163', 217, '2026-08-09', 'L', 99)")
+        conn.commit()
+        sd.replay_archive(conn, False)
+        rows = conn.execute("SELECT on_hand FROM sod_inventory WHERE store_number=217 "
+                            "AND snapshot_date='2026-08-09'").fetchall()
+        assert rows == [(99,)], 'the live row must not be duplicated or overwritten'
+
+    def test_replay_is_idempotent(self, conn):
+        sd.record_day(conn, False, 'daily_a', '2026-08-09', tracked_rows_data=[
+            {'sku': '0000163', 'store_number': 217, 'snapshot_date': '2026-08-09',
+             'status': 'L', 'on_hand': 5, 'product_name': 'X'}])
+        conn.execute("DELETE FROM sod_inventory WHERE snapshot_date='2026-08-09'")
+        conn.commit()
+        first = sd.replay_archive(conn, False)['rows_restored']
+        second = sd.replay_archive(conn, False)['rows_restored']
+        assert first == 1 and second == 0
+        n = conn.execute("SELECT COUNT(*) FROM sod_inventory "
+                         "WHERE snapshot_date='2026-08-09'").fetchone()[0]
+        assert n == 1
+
+    def test_replay_can_target_one_day(self, conn):
+        for d in ('2026-08-08', '2026-08-09'):
+            sd.record_day(conn, False, 'daily_a', d, tracked_rows_data=[
+                {'sku': '0000163', 'store_number': 1, 'snapshot_date': d,
+                 'status': 'L', 'on_hand': 1, 'product_name': 'X'}])
+        conn.execute("DELETE FROM sod_inventory")
+        conn.commit()
+        out = sd.replay_archive(conn, False, snapshot_dates=['2026-08-08'])
+        assert out['days_restored'] == ['2026-08-08']
+
+    def test_a_corrupt_blob_does_not_abort_the_whole_replay(self, conn):
+        sd.record_day(conn, False, 'daily_a', '2026-08-08', tracked_rows_data=[
+            {'sku': '0000163', 'store_number': 1, 'snapshot_date': '2026-08-08',
+             'status': 'L', 'on_hand': 1, 'product_name': 'X'}])
+        conn.execute("INSERT INTO sod_day_archive (source, snapshot_date, rows_gz) "
+                     "VALUES ('daily_a', '2026-08-07', ?)", (b'not-compressed',))
+        conn.execute("DELETE FROM sod_inventory")
+        conn.commit()
+        out = sd.replay_archive(conn, False)
+        assert out['days_restored'] == ['2026-08-08'], \
+            'one unreadable day must not cost us the readable ones'
 
 
 class TestChecksum:

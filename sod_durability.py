@@ -268,6 +268,79 @@ def analyze_gaps(conn, use_postgres, today, source='daily_a', earliest=None):
     }
 
 
+def replay_archive(conn, use_postgres, snapshot_dates=None, source='daily_a'):
+    """Rebuild sod_inventory rows for archived days.
+
+    This is what makes the archive a real backup rather than a souvenir. The
+    emailed backup carries sod_day_archive (small, compressed, write-once) and
+    NOT the raw inventory table, so restoring onto a fresh database has to be
+    able to expand the archive back into rows.
+
+    Idempotent: existing rows are left alone, never overwritten, so replaying
+    can add a lost day back without touching a day we still hold.
+    """
+    ph = '%s' if use_postgres else '?'
+    cur = conn.cursor()
+    if snapshot_dates:
+        phs = ','.join([ph] * len(snapshot_dates))
+        cur.execute(f"SELECT snapshot_date, rows_gz FROM sod_day_archive "
+                    f"WHERE source={ph} AND snapshot_date IN ({phs})",
+                    tuple([source] + list(snapshot_dates)))
+    else:
+        cur.execute(f"SELECT snapshot_date, rows_gz FROM sod_day_archive "
+                    f"WHERE source={ph}", (source,))
+    archived = cur.fetchall()
+
+    restored, days, failed, unreadable = 0, [], 0, []
+    first_error = None
+    for snap, blob in archived:
+        if not blob:
+            unreadable.append(str(snap)[:10])
+            continue
+        try:
+            raw = bytes(blob) if not isinstance(blob, bytes) else blob
+            rows = json.loads(zlib.decompress(raw).decode('utf-8'))
+        except Exception:
+            unreadable.append(str(snap)[:10])
+            continue
+        n = 0
+        for r in rows:
+            try:
+                cur.execute(
+                    f"INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
+                    f"status, on_hand, product_name, source) "
+                    f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph}) "
+                    + ("ON CONFLICT (sku, store_number, snapshot_date) DO NOTHING"
+                       if use_postgres else ""),
+                    (r.get('sku'), r.get('store_number'), str(snap)[:10],
+                     r.get('status'), r.get('on_hand'),
+                     r.get('product_name'), 'archive_replay'),
+                ) if use_postgres else cur.execute(
+                    f"INSERT OR IGNORE INTO sod_inventory (sku, store_number, "
+                    f"snapshot_date, status, on_hand, product_name, source) "
+                    f"VALUES (?,?,?,?,?,?,?)",
+                    (r.get('sku'), r.get('store_number'), str(snap)[:10],
+                     r.get('status'), r.get('on_hand'),
+                     r.get('product_name'), 'archive_replay'),
+                )
+                n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            except Exception as e:
+                # Counted, never swallowed. A restore that quietly drops rows
+                # is worse than one that fails loudly.
+                failed += 1
+                if first_error is None:
+                    first_error = f'{type(e).__name__}: {str(e)[:200]}'
+                continue
+        if n:
+            days.append(str(snap)[:10])
+            restored += n
+    conn.commit()
+    cur.close()
+    return {'days_restored': sorted(days), 'rows_restored': restored,
+            'days_in_archive': len(archived), 'rows_failed': failed,
+            'unreadable_days': sorted(unreadable), 'first_error': first_error}
+
+
 def daily_series(conn, use_postgres, tracked_skus, start, end):
     """Per-day, per-SKU rollup for the tracked SKUs between two dates.
 

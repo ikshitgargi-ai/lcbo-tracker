@@ -4464,6 +4464,42 @@ def api_sod_coverage():
             pass
 
 
+@app.route('/api/admin/sod/replay-archive', methods=['POST'])
+@require_app_origin
+def api_admin_sod_replay_archive():
+    """Expand sod_day_archive back into sod_inventory rows.
+
+    This is the other half of the backup. The emailed backup carries the
+    compressed per-day archive, not the raw inventory table, so a restore onto
+    a fresh database needs this to put the rows back. Idempotent: days we
+    already hold are left untouched.
+
+    Body: { dates: ["YYYY-MM-DD", ...] }  (optional; omit to replay everything)
+    """
+    body = request.get_json(silent=True) or {}
+    dates = body.get('dates') or None
+    if dates is not None:
+        if not isinstance(dates, list):
+            return jsonify({'error': 'dates must be a list of YYYY-MM-DD'}), 400
+        try:
+            from datetime import date as _d
+            for x in dates:
+                _d.fromisoformat(str(x)[:10])
+        except ValueError:
+            return jsonify({'error': 'dates must be YYYY-MM-DD strings'}), 400
+    conn = _sod_get_conn()
+    try:
+        sod_durability.ensure_tables(conn, USE_POSTGRES)
+        out = sod_durability.replay_archive(conn, USE_POSTGRES, snapshot_dates=dates)
+        _invalidate_snapshot_cache()
+        return jsonify(out), 200
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.route('/api/sod/history', methods=['GET'])
 def api_sod_history():
     """Day-by-day history for the tracked SKUs, any range up to a full year.
@@ -7511,7 +7547,7 @@ def api_admin_import():
                 else:
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders})"
                 for r in rows:
-                    vals = tuple(r.get(c) for c in cols)
+                    vals = tuple(_json_unsafe(r.get(c)) for c in cols)
                     try:
                         cur.execute(sql, vals)
                         if cur.rowcount == 1:
@@ -7536,7 +7572,7 @@ def api_admin_import():
                 verb = 'INSERT OR REPLACE' if mode == 'merge' else ('INSERT OR IGNORE' if mode == 'append' else 'INSERT')
                 sql = f"{verb} INTO {tname} ({col_list}) VALUES ({placeholders})"
                 for r in rows:
-                    vals = tuple(r.get(c) for c in cols)
+                    vals = tuple(_json_unsafe(r.get(c)) for c in cols)
                     try:
                         c = db.execute(sql, vals)
                         if c.rowcount > 0:
@@ -12294,9 +12330,17 @@ def _send_backup_email(payload: dict):
                       '  2. Download this attachment',
                       '  3. POST it to /api/admin/import?mode=merge with X-Admin-Token header',
                       '',
-                      'Note: SOD inventory rows (1M+) are NOT in this backup — those rebuild',
-                      'automatically on the next SOD sync. CRM data, audit log, and pipeline',
-                      'state ARE in this backup.']
+                      'What is and is not in here:',
+                      '  • CRM data, audit log, pipeline state, and the listing ledger: YES',
+                      '  • sod_day_archive (every ingested day, tracked SKUs, compressed): YES',
+                      '  • The raw sod_inventory table (1M+ rows): NO, by size',
+                      '',
+                      'The raw table does NOT rebuild itself on the next sync. A sync only',
+                      'fetches the newest file, and LCBO overwrites each weekday file every',
+                      '7 days, so a past day cannot be re-downloaded. What restores it is',
+                      'the archive above: after importing, POST /api/admin/sod/replay-archive',
+                      'to expand it back into sod_inventory. Days never ingested at all are',
+                      'gone for good — see /api/sod/coverage for which those are.']
     try:
         r = http_requests.post(
             'https://api.resend.com/emails',
@@ -12790,16 +12834,33 @@ def start_tasting_digest_scheduler():
 
 
 def _json_safe(v):
-    """Make a DB value JSON-friendly."""
+    """Make a DB value JSON-friendly.
+
+    Binary columns are base64-wrapped rather than stringified. sod_day_archive
+    stores each day's tracked rows as a compressed blob, and str(blob) turns
+    that into an unrestorable Python repr — a backup that looks complete and
+    restores nothing. _json_unsafe() reverses this on import.
+    """
     if v is None:
         return None
     if isinstance(v, (int, float, bool, str)):
         return v
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        import base64 as _b64
+        return {'__b64__': _b64.b64encode(bytes(v)).decode('ascii')}
     try:
         # datetime/date
         return v.isoformat()
     except Exception:
         return str(v)
+
+
+def _json_unsafe(v):
+    """Reverse _json_safe's base64 wrapper on the way back into the database."""
+    if isinstance(v, dict) and set(v) == {'__b64__'}:
+        import base64 as _b64
+        return _b64.b64decode(v['__b64__'])
+    return v
 
 
 # ------- Territory rollup — distribution + per-SKU drilldown per rep -------
