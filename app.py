@@ -304,6 +304,34 @@ ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed']
 # Bakshi is NB Distillers' own Sales Director). Preserved rather than dropped —
 # nothing is ever deleted — but kept separate from the Anu roster.
 NB_PARTNER_CONTACTS = ['Virat', 'Neeraj']
+_REP_MATCH_NAMES = ANU_REP_ROSTER + NB_PARTNER_CONTACTS
+
+
+def _canonical_rep(name):
+    """Map any inbound rep name to the roster short name the app matches on.
+
+    The store directory LCBO ships carries its own staff names ("Kimberly
+    Doran", "Ikshit Sharma"), while the rep dropdown offers roster short names
+    ("Ikshit"). Every store query matches rep exactly, so seeding the directory
+    value verbatim meant a rep picked their own name and got ZERO stores, and
+    35 Mandakini stores sat assigned to an LCBO employee. A rep who cannot see
+    their stores logs no visits, and an unlogged visit is an unbilled listing.
+
+    First name decides, because that is what the two spellings share. Anyone
+    not on the roster returns blank, which reads honestly as unassigned rather
+    than pretending an LCBO employee works here. Nothing is destroyed: the
+    directory spreadsheet remains the source and is re-read on every seed.
+    """
+    if not name:
+        return ''
+    parts = str(name).strip().split()
+    if not parts:
+        return ''
+    first = parts[0].lower()
+    for canonical in _REP_MATCH_NAMES:
+        if canonical.lower() == first:
+            return canonical
+    return ''
 
 
 _ALLOWED_ORIGINS = {
@@ -1383,7 +1411,10 @@ def seed_data():
                         emails = ''
                     priority = str(row.get('Priority', 'Standard')) if pd.notna(row.get('Priority')) else 'Standard'
                     status = str(row.get('Status', '')) if pd.notna(row.get('Status')) else ''
-                    rep = str(row.get('Rep', '')) if pd.notna(row.get('Rep')) else ''
+                    # Directory names are normalised to the roster short name the
+                    # rep dropdown sends; anyone not on the roster is left unassigned.
+                    rep = _canonical_rep(
+                        str(row.get('Rep', '')) if pd.notna(row.get('Rep')) else '')
                     lat, lng = CITY_COORDS.get(city, (0, 0))
                     try:
                         cur.execute(
@@ -1435,7 +1466,10 @@ def seed_data():
                         emails = ''
                     priority = str(row.get('Priority', 'Standard')) if pd.notna(row.get('Priority')) else 'Standard'
                     status = str(row.get('Status', '')) if pd.notna(row.get('Status')) else ''
-                    rep = str(row.get('Rep', '')) if pd.notna(row.get('Rep')) else ''
+                    # Directory names are normalised to the roster short name the
+                    # rep dropdown sends; anyone not on the roster is left unassigned.
+                    rep = _canonical_rep(
+                        str(row.get('Rep', '')) if pd.notna(row.get('Rep')) else '')
                     lat, lng = CITY_COORDS.get(city, (0, 0))
                     try:
                         db.execute(
@@ -3554,6 +3588,9 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False, progress_
     per_sku_by_date = {}   # {date: {sku: {'name', 'status_counts', 'store_count', 'total_on_hand'}}}
     rows_to_persist = []   # only tracked rows (or all, for Daily B)
     dates_seen = set()
+    # Rows per day. One file can carry more than one day and each day gets its
+    # own archive record, so each day needs its own count, not the file total.
+    total_by_date = {}
     untracked_skus_seen = set()  # for stats only
     total = 0
     tracked_row_count = 0
@@ -3581,6 +3618,7 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False, progress_
                 total += 1
                 d = row['snapshot_date']
                 dates_seen.add(d)
+                total_by_date[d] = total_by_date.get(d, 0) + 1
                 is_tracked = row['sku'] in tracked_skus
 
                 if is_tracked or keep_all_rows:
@@ -3628,6 +3666,7 @@ def stream_parse_sod_zip(zip_bytes, tracked_skus, keep_all_rows=False, progress_
         'per_sku_by_date': per_sku_by_date,
         'rows_to_persist': rows_to_persist,
         'dates_seen': dates_seen,
+        'total_by_date': total_by_date,
         'tracked_row_count': tracked_row_count,
         'untracked_row_count': untracked_row_count,
         'untracked_sku_count': len(untracked_skus_seen),
@@ -3840,9 +3879,25 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
 
         # 3) per_sku aggregates for the newest snapshot (already computed during streaming)
         per_sku = parsed['per_sku_by_date'].get(snapshot_date, {})
-        # rows_to_persist holds tracked-SKU rows (Daily A) or all rows (Daily B) across
-        # every date in the file — filter to the newest snapshot only.
-        latest_rows = [r for r in parsed['rows_to_persist'] if r['snapshot_date'] == snapshot_date]
+        # rows_to_persist holds tracked-SKU rows (Daily A) or all rows (Daily B),
+        # and one file can carry more than one day: the annual and option
+        # archives always do. The portal keeps only a rolling 7-day window and
+        # overwrites the weekday file names, so a day thrown away here is lost
+        # for good. Bucket by date and keep every day we were handed.
+        # This only re-points row objects that already exist into per-date
+        # lists. No row is copied, so the streaming memory budget is unchanged.
+        rows_by_date = {}
+        for r in parsed['rows_to_persist']:
+            rows_by_date.setdefault(r['snapshot_date'], []).append(r)
+        latest_rows = rows_by_date.pop(snapshot_date, [])
+        # The older days from the same file. They get their own sod_inventory
+        # rows and their own archive record, but they never feed status-change
+        # detection: that diffs against CURRENT status, so an older day would
+        # invent listing and delisting events, and those events feed billing.
+        extra_rows_by_date = rows_by_date
+        # Per-day row totals, so each archived day records its own true count
+        # instead of the whole file's count.
+        total_by_date = parsed.get('total_by_date', {})
         anu_count = sum(1 for r in latest_rows if r['sku'] in SOD_TRACKED_SKUS)
         # Release the parsed buffers we no longer need
         parsed = None
@@ -3982,7 +4037,15 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
         print(f"[SOD-{source}] step 5/8: upserting {len(latest_rows)} sod_inventory rows…")
         rows_to_persist = latest_rows
 
-        if rows_to_persist:
+        def _upsert_sod_inventory(rows):
+            """One batched UPSERT of parsed rows into sod_inventory.
+
+            Every row carries its own snapshot_date and the natural key is
+            (sku, store_number, snapshot_date), so this is safe to call once
+            per day found in the file, and safe to re-run on the same day.
+            """
+            if not rows:
+                return
             if USE_POSTGRES:
                 psycopg2.extras.execute_values(
                     cur,
@@ -3998,7 +4061,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                         ingested_at = NOW()
                     """,
                     [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
-                      r['on_hand'], r['product_name'], source) for r in rows_to_persist],
+                      r['on_hand'], r['product_name'], source) for r in rows],
                     page_size=1000,
                 )
             else:
@@ -4011,8 +4074,19 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                          product_name=excluded.product_name, source=excluded.source,
                          ingested_at=CURRENT_TIMESTAMP""",
                     [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
-                      r['on_hand'], r['product_name'], source) for r in rows_to_persist],
+                      r['on_hand'], r['product_name'], source) for r in rows],
                 )
+
+        _upsert_sod_inventory(rows_to_persist)
+
+        # 5b) Every other day the same file carried, written one day at a time
+        # in date order. A day we already hold in memory must never be dropped:
+        # the portal cannot give it back.
+        for extra_date in sorted(extra_rows_by_date):
+            extra_rows = extra_rows_by_date[extra_date]
+            print(f"[SOD-{source}] step 5b/8: same file also carries {extra_date}, "
+                  f"upserting {len(extra_rows)} rows for it…")
+            _upsert_sod_inventory(extra_rows)
 
         print(f"[SOD-{source}] step 5/8 done")
         # 6) Upsert sod_products rollup
@@ -4241,6 +4315,18 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                 total_rows=total, tracked_rows_data=latest_rows,
                 ingest_mode='backfill' if filename else 'live',
             )
+            # Archive the older days from the same file under their own dates.
+            # record_day is write-once per (source, snapshot_date), so an
+            # earlier capture of one of these days is never overwritten.
+            for extra_date in sorted(extra_rows_by_date):
+                extra_rows = extra_rows_by_date[extra_date]
+                sod_durability.record_day(
+                    conn, USE_POSTGRES, source, extra_date,
+                    file_name=zip_name, file_sha256=zip_sha, file_bytes=zip_len,
+                    total_rows=total_by_date.get(extra_date, len(extra_rows)),
+                    tracked_rows_data=extra_rows,
+                    ingest_mode='backfill' if filename else 'live',
+                )
         except Exception as _arch_err:
             # Archival must never fail an otherwise-good ingest.
             print(f"[SOD-{source}] WARNING: day archive failed: {_arch_err}")
@@ -4251,6 +4337,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
             'source': source,
             'file_name': zip_name,
             'snapshot_date': snapshot_date,
+            'extra_dates_persisted': sorted(extra_rows_by_date),
             'total_rows': total,
             'anu_rows': anu_count,
             'new_listings': new_listings,
@@ -20752,6 +20839,40 @@ try:
     _cur.close()
     _conn.close()
     print(f"[startup] Ensured {len(REP_ROSTER_DEFAULT)} official reps in DB: {REP_ROSTER_DEFAULT}")
+
+    # Converge stores.rep onto the roster short names the dropdown sends.
+    # The seed only normalises rows it INSERTS, and existing rows still carry
+    # the LCBO directory spelling ("Ikshit Sharma"), which every store query
+    # matches exactly and therefore misses. A rep who cannot see their stores
+    # logs no visits, and an unlogged visit is an unbilled listing.
+    # Idempotent, prefix-matched on first name, and it only ever rewrites a
+    # name INTO the roster form: names belonging to LCBO staff are left alone.
+    _renamed = 0
+    # Fresh connection: the roster seeding above closes its own.
+    _nconn = _sod_get_conn()
+    _ncur = _nconn.cursor()
+    for _canon in _REP_MATCH_NAMES:
+        try:
+            if USE_POSTGRES:
+                _ncur.execute(
+                    "UPDATE stores SET rep = %s "
+                    "WHERE rep IS NOT NULL AND rep <> %s "
+                    "AND LOWER(TRIM(rep)) LIKE LOWER(%s)",
+                    (_canon, _canon, _canon + ' %'))
+            else:
+                _ncur.execute(
+                    "UPDATE stores SET rep = ? "
+                    "WHERE rep IS NOT NULL AND rep <> ? "
+                    "AND LOWER(TRIM(rep)) LIKE LOWER(?)",
+                    (_canon, _canon, _canon + ' %'))
+            _renamed += _ncur.rowcount if _ncur.rowcount and _ncur.rowcount > 0 else 0
+        except Exception as _re_err:
+            print(f"[startup] rep normalise skipped for {_canon}: {_re_err}")
+    _nconn.commit()
+    _ncur.close()
+    _nconn.close()
+    if _renamed:
+        print(f"[startup] Normalised {_renamed} store rep name(s) onto the roster")
 except Exception as _e:
     print(f"[startup] rep seeding skipped: {_e}")
 # Sprint 0: cleanup orphaned 'running' SOD runs from prior crashes (e.g. OOM kills).
