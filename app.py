@@ -4464,6 +4464,58 @@ def api_sod_coverage():
             pass
 
 
+@app.route('/api/sod/history', methods=['GET'])
+def api_sod_history():
+    """Day-by-day history for the tracked SKUs, any range up to a full year.
+
+    Query: from=YYYY-MM-DD, to=YYYY-MM-DD, or ytd=1 for Jan 1 to today.
+    Defaults to the last 365 days.
+
+    Every day in the window is returned, including days we do not hold
+    (present=false), so a hole shows up in the series instead of the chart
+    quietly closing over it.
+    """
+    today = _sod_toronto_today()
+    if request.args.get('ytd') in ('1', 'true', 'yes'):
+        start = today.replace(month=1, day=1)
+    else:
+        start = _parse_date_arg(request.args.get('from'),
+                                today - timedelta(days=365))
+    end = _parse_date_arg(request.args.get('to'), today)
+    if start > end:
+        return jsonify({'error': 'from must not be after to'}), 400
+
+    conn = _sod_get_conn()
+    try:
+        sod_durability.ensure_tables(conn, USE_POSTGRES)
+        series = sod_durability.daily_series(
+            conn, USE_POSTGRES, list(SOD_TRACKED_SKUS.keys()), start, end)
+        held = sum(1 for d in series['days'] if d['present'])
+        return jsonify({
+            'from': start.isoformat(),
+            'to': end.isoformat(),
+            'days_in_range': len(series['days']),
+            'days_held': held,
+            'days_missing': len(series['days']) - held,
+            'retention_min_days': sod_durability.RETENTION_MIN_DAYS,
+            'skus': {s: SOD_TRACKED_SKUS[s][1] for s in series['skus']
+                     if s in SOD_TRACKED_SKUS},
+            'series': series['days'],
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _parse_date_arg(raw, default):
+    try:
+        return datetime.strptime((raw or '').strip()[:10], '%Y-%m-%d').date()
+    except Exception:
+        return default
+
+
 @app.route('/api/sod/backfill', methods=['POST'])
 @require_app_origin
 def api_sod_backfill():

@@ -192,6 +192,72 @@ class TestGapsAreRemembered:
         assert [r[0] for r in rows] == ['ok', 'date_mismatch']
 
 
+class TestRetentionPromise:
+    """The client trackers must answer "day by day, any date to today" for at
+    least a year at any moment. These tests exist so that promise cannot be
+    quietly broken by a future retention or cleanup change."""
+
+    def test_retention_window_is_at_least_a_year(self):
+        assert sd.RETENTION_MIN_DAYS >= 365
+
+    def test_no_code_path_prunes_tracked_sod_rows(self):
+        """A DELETE against the SOD tables is how a year of history disappears.
+        The client apps must have none. If one is ever added deliberately, it
+        has to archive first and this test has to be updated on purpose."""
+        import glob
+        import os
+        here = os.path.dirname(__file__)
+        app_py = os.path.join(here, '..', 'app.py')
+        src = open(app_py).read().lower()
+        for table in ('sod_day_archive', 'sod_permanent_gaps', 'listing_ledger'):
+            assert f'delete from {table}' not in src, \
+                f'{table} must never be deleted from'
+        # sod_inventory may only be deleted by the audited manual rollback,
+        # which archives the day first. Anything else is a retention leak.
+        assert src.count('delete from sod_inventory') <= 2
+        if 'delete from sod_inventory' in src:
+            assert 'refusing to delete: could not archive' in src, \
+                'a sod_inventory delete exists with no archive-first guard'
+        assert glob.glob(os.path.join(here, '..', 'sod_durability.py'))
+
+    def test_a_year_of_days_is_reported_day_by_day(self, conn):
+        base = datetime.date(2026, 8, 10)
+        for i in range(0, 370):
+            _seed(conn, [(base - datetime.timedelta(days=i)).isoformat()])
+        out = sd.daily_series(conn, False, ['0000163'],
+                              base - datetime.timedelta(days=364), base)
+        assert len(out['days']) == 365
+        assert all(d['present'] for d in out['days'])
+        assert out['days'][0]['date'] == (base - datetime.timedelta(days=364)).isoformat()
+        assert out['days'][-1]['date'] == base.isoformat()
+
+    def test_a_hole_stays_visible_in_the_series(self, conn):
+        _seed(conn, ['2026-08-06', '2026-08-07', '2026-08-09'])
+        out = sd.daily_series(conn, False, ['0000163'], '2026-08-06', '2026-08-09')
+        got = {d['date']: d['present'] for d in out['days']}
+        assert got == {'2026-08-06': True, '2026-08-07': True,
+                       '2026-08-08': False, '2026-08-09': True}, \
+            'a missing day must not silently close up'
+
+    def test_series_rolls_up_stores_listed_and_units(self, conn):
+        conn.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date,"
+                     " status, on_hand) VALUES ('0000163', 10, '2026-08-09', 'L', 7)")
+        conn.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date,"
+                     " status, on_hand) VALUES ('0000163', 11, '2026-08-09', 'D', 2)")
+        conn.commit()
+        day = sd.daily_series(conn, False, ['0000163'],
+                              '2026-08-09', '2026-08-09')['days'][0]
+        assert day['per_sku']['0000163'] == {'stores': 2, 'listed_stores': 1, 'units': 9}
+        assert day['listed_stores'] == 1 and day['units'] == 9
+
+    def test_untracked_skus_never_enter_the_series(self, conn):
+        _seed(conn, ['2026-08-09'], sku='0000163')
+        _seed(conn, ['2026-08-09'], sku='9999999')
+        day = sd.daily_series(conn, False, ['0000163'],
+                              '2026-08-09', '2026-08-09')['days'][0]
+        assert list(day['per_sku']) == ['0000163']
+
+
 class TestChecksum:
     def test_sha256_detects_a_changed_file(self):
         assert sd.sha256_of(b'PK\x03\x04aaa') != sd.sha256_of(b'PK\x03\x04aab')

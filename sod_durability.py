@@ -41,6 +41,12 @@ import zlib
 # D+1, so D is reachable until D+8. Six days is the safe working margin.
 RECOVERABLE_DAYS = 6
 
+# Client trackers must be able to answer "what did this SKU do, day by day,
+# from any date to today" for at least a full year at any moment. Nothing in
+# this codebase may prune tracked-SKU SOD rows inside this window. 400 days
+# rather than 365 so a year-ago comparison still has a day either side.
+RETENTION_MIN_DAYS = 400
+
 _WEEKDAYS = ('MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN')
 
 
@@ -260,3 +266,52 @@ def analyze_gaps(conn, use_postgres, today, source='daily_a', earliest=None):
         'first_day': first.isoformat(),
         'last_day': last.isoformat(),
     }
+
+
+def daily_series(conn, use_postgres, tracked_skus, start, end):
+    """Per-day, per-SKU rollup for the tracked SKUs between two dates.
+
+    This is the "day to YTD" view a client asks for: for every day in the
+    window, how many stores carried the SKU, how many were actively listed,
+    and how many units sat on shelves. Days with no row are returned with
+    present=False rather than skipped, so a hole in the history is visible in
+    the series instead of silently closing up.
+    """
+    start, end = _as_date(start), _as_date(end)
+    if not tracked_skus:
+        return {'days': [], 'skus': []}
+    ph = '%s' if use_postgres else '?'
+    skus = list(tracked_skus)
+    phs = ','.join([ph] * len(skus))
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT snapshot_date, sku, COUNT(*), "
+        f"       SUM(CASE WHEN status='L' THEN 1 ELSE 0 END), "
+        f"       SUM(COALESCE(on_hand,0)) "
+        f"FROM sod_inventory "
+        f"WHERE sku IN ({phs}) AND snapshot_date >= {ph} AND snapshot_date <= {ph} "
+        f"GROUP BY snapshot_date, sku ORDER BY snapshot_date ASC",
+        tuple(skus) + (start.isoformat(), end.isoformat()),
+    )
+    by_day = {}
+    for d, sku, stores, listed, units in cur.fetchall():
+        by_day.setdefault(str(d)[:10], {})[sku] = {
+            'stores': int(stores or 0),
+            'listed_stores': int(listed or 0),
+            'units': int(units or 0),
+        }
+    cur.close()
+
+    days, d = [], start
+    while d <= end:
+        key = d.isoformat()
+        per_sku = by_day.get(key)
+        days.append({
+            'date': key,
+            'present': per_sku is not None,
+            'per_sku': per_sku or {},
+            'listed_stores': sum(v['listed_stores'] for v in (per_sku or {}).values()),
+            'units': sum(v['units'] for v in (per_sku or {}).values()),
+        })
+        d += datetime.timedelta(days=1)
+    return {'days': days, 'skus': skus}
