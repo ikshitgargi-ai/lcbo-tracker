@@ -251,28 +251,28 @@ class TestOrphanedRunningCleanup:
             "INSERT INTO sod_sync_runs (source, status, run_at) VALUES (?,?, datetime('now', '-7 hours'))",
             ('daily_a', 'running'),
         )
+        stuck_id = cur.lastrowid
         # And a fresh one that should NOT be touched
         cur.execute(
             "INSERT INTO sod_sync_runs (source, status, run_at) VALUES (?,?, datetime('now', '-1 hour'))",
             ('daily_a', 'running'),
         )
+        fresh_id = cur.lastrowid
         conn.commit()
         conn.close()
 
         n = m._cleanup_orphaned_sod_runs(max_age_hours=6)
         assert n >= 1, f"BUG: orphan cleanup should mark at least 1 row, marked {n}"
 
-        # Verify status
+        # Assert on the two rows THIS test created. Selecting by time window
+        # also picked up rows other tests had left behind, which made the
+        # result depend on execution order.
         conn = m._sod_get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT status FROM sod_sync_runs WHERE run_at < datetime('now', '-6 hours') AND source='daily_a'")
-        rows = cur.fetchall()
-        for row in rows:
-            assert row[0] == 'failed', f"Old running row should be failed, got {row[0]}"
-        cur.execute("SELECT status FROM sod_sync_runs WHERE run_at > datetime('now', '-3 hours') AND source='daily_a'")
-        rows = cur.fetchall()
-        for row in rows:
-            assert row[0] == 'running', f"Recent running row should still be running, got {row[0]}"
+        cur.execute("SELECT status FROM sod_sync_runs WHERE id=?", (stuck_id,))
+        assert cur.fetchone()[0] == 'failed', 'a 7h-old running row is a crash'
+        cur.execute("SELECT status FROM sod_sync_runs WHERE id=?", (fresh_id,))
+        assert cur.fetchone()[0] == 'running', 'a 1h-old run may still be working'
         conn.close()
 
 
@@ -297,11 +297,15 @@ class TestFreshnessFromSnapshotDate:
         )
         conn.commit()
         conn.close()
+        # This test writes straight to the database, bypassing the ingest path.
+        # A real ingest invalidates the freshness cache itself; do the same
+        # here so we measure the freshness logic, not a stale cached value.
+        m._invalidate_snapshot_cache()
 
         age = m._sod_data_age_days()
         assert age == 5, f"BUG: data age should be 5 days, got {age}"
 
-        fresh = m._sod_freshness()
+        fresh = m._sod_freshness(force=True)
         assert fresh['snapshot_age_days'] == 5
         assert fresh['is_stale'] is True, "BUG: is_stale should be True when age > 2 days"
 
@@ -314,10 +318,42 @@ class TestFreshnessFromSnapshotDate:
         assert r.json['snapshot_age_days'] == 5
 
     def test_healthz_endpoint_consistent(self, app_module, client):
-        """/healthz uses the same freshness logic as /api/sod/health."""
-        r = client.get('/healthz')
+        """/healthz?deep=1 uses the same freshness logic as /api/sod/health.
+
+        The plain ping deliberately answers from the 30-minute cache: uptime
+        services hit it constantly and reading Neon every time is what
+        exhausted the compute quota on 2026-07-26. Monitors that must be
+        certain ask for deep=1.
+        """
+        r = client.get('/healthz?deep=1')
         assert r.status_code == 503
         assert r.json['snapshot_age_days'] == 5
+
+    def test_a_fresh_ingest_is_visible_immediately(self, app_module, client):
+        """Regression: freshness read through a cache that nothing invalidated.
+
+        Production symptom on the NB tracker — /api/sod/status reported
+        latest_snapshot 2026-08-07 and is_stale true while the database already
+        held 2026-08-09. The same staleness signal is what should have raised
+        the alarm during NB's three-day blackout, so it has to tell the truth
+        the instant data lands.
+        """
+        m = app_module
+        today = m._toronto_today()
+        conn = m._sod_get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
+                    "status, on_hand, source) VALUES (?,?,?,?,?,?)",
+                    (list(m.SOD_TRACKED_SKUS)[0], 8001, today.isoformat(),
+                     'L', 3, 'daily_a'))
+        conn.commit()
+        conn.close()
+
+        m._invalidate_snapshot_cache(today.isoformat())   # what an ingest does
+        fresh = m._sod_freshness()
+        assert fresh['latest_snapshot'] == today.isoformat()
+        assert fresh['snapshot_age_days'] == 0
+        assert fresh['is_stale'] is False
 
 
 # ========================================================================

@@ -1,6 +1,11 @@
+# Keeps `str | None` hints legal below Python 3.11. The three sibling trackers
+# already carry this; NB only ever worked because Render pins 3.11.11.
+from __future__ import annotations
+
 import os
 import time
 import io
+import sod_durability
 import csv
 import gc
 import json
@@ -287,6 +292,18 @@ def require_admin_token(fn):
             }), 403
         return fn(*args, **kwargs)
     return wrapped
+
+
+# ── Rep roster: ONE source of truth ──────────────────────────────────────────
+# These five people walk the stores. The roster used to be written out in three
+# separate places per app and they had drifted apart: /api/reps was missing
+# Surya, and NB was missing Vaneet and Ed entirely. Everything below derives
+# from this list so they cannot disagree again.
+ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed']
+# Names already seeded on the NB tracker that are not Anu field reps (Neeraj
+# Bakshi is NB Distillers' own Sales Director). Preserved rather than dropped —
+# nothing is ever deleted — but kept separate from the Anu roster.
+NB_PARTNER_CONTACTS = ['Virat', 'Neeraj']
 
 
 _ALLOWED_ORIGINS = {
@@ -3711,8 +3728,21 @@ def _sod_ph():
     return '%s' if USE_POSTGRES else '?'
 
 
-def run_sod_sync(source='daily_a', filename=None, client=None):
+def run_sod_sync(source='daily_a', filename=None, client=None,
+                 expect_snapshot_date=None, historical=False):
     """Download + parse + ingest one SOD file. Idempotent per (sku, store, date).
+
+    expect_snapshot_date — refuse the file unless it carries exactly this date.
+        Weekday filenames repeat every seven days, so alldlyinventorySUN.zip
+        means "last Sunday" and nothing more. When backfilling a named file we
+        must confirm what is actually inside before trusting it.
+
+    historical — this file is older than data we already hold. Inventory rows
+        and the day archive are written as normal, but the forward-only
+        SKU status-change detection is skipped: it compares against CURRENT
+        status, so running it on an old file invents listing and delisting
+        events that never happened. Per-store history is rebuilt in date order
+        afterwards by _backfill_store_sku_changes(), which is order-safe.
 
     Returns a dict summary of the run.
     """
@@ -3748,6 +3778,10 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
             zip_bytes, zip_name = download_result
             peeked_snapshot = ''
         print(f"[SOD-{source}] step 1/8 done: {zip_name} ({len(zip_bytes):,}B)")
+        # Fingerprint the file before the bytes are freed. Lets us prove later
+        # exactly which file a day came from, and spot a silently reissued one.
+        zip_sha = sod_durability.sha256_of(zip_bytes)
+        zip_len = len(zip_bytes)
 
         # 2) Stream-parse directly from the zip. NEVER materializes the 75MB .dat text
         #    or the 1.5M-row list. Only keeps small aggregates + tracked rows.
@@ -3765,6 +3799,28 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         if not parsed['dates_seen']:
             raise RuntimeError("No rows parsed from .dat file")
         snapshot_date = max(parsed['dates_seen'])  # use the most recent date in the feed
+
+        # A named file is only trustworthy if it carries the date we asked for.
+        # alldlyinventorySUN.zip is whatever last Sunday happened to be, so a
+        # backfill request for an out-of-window date would otherwise re-ingest
+        # recent data and burn a full 1.6M-row parse for nothing.
+        if expect_snapshot_date and snapshot_date != str(expect_snapshot_date)[:10]:
+            duration = (datetime.utcnow() - start).total_seconds()
+            msg = (f'file {zip_name} carries {snapshot_date}, '
+                   f'expected {expect_snapshot_date} — refused')
+            print(f'[SOD-{source}] {msg}')
+            cur.execute(
+                "UPDATE sod_sync_runs SET status='skipped', file_name=%s, "
+                "snapshot_date=%s, error=%s, duration_seconds=%s WHERE id=%s"
+                if USE_POSTGRES else
+                "UPDATE sod_sync_runs SET status='skipped', file_name=?, "
+                "snapshot_date=?, error=?, duration_seconds=? WHERE id=?",
+                (zip_name, snapshot_date, msg, duration, run_id),
+            )
+            conn.commit()
+            cur.close()
+            return {'status': 'skipped', 'source': source, 'reason': msg,
+                    'file_name': zip_name, 'snapshot_date': snapshot_date}
 
         # 3) per_sku aggregates for the newest snapshot (already computed during streaming)
         per_sku = parsed['per_sku_by_date'].get(snapshot_date, {})
@@ -3800,7 +3856,10 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         new_delistings = 0
         change_inserts = []
         is_cold_start = len(prior) == 0
-        for sku, agg in per_sku.items():
+        # On a historical file this loop is skipped entirely: it diffs against
+        # CURRENT status, so an old file would manufacture listing and
+        # delisting events that never occurred, and those events feed billing.
+        for sku, agg in ({} if historical else per_sku).items():
             # Majority status wins for product-level status
             status = max(agg['status_counts'].items(), key=lambda x: x[1])[0]
             old = prior.get(sku)
@@ -4151,6 +4210,25 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
             )
         conn.commit()
         cur.close()
+
+        # Archive the day write-once, AFTER the ingest has committed. The
+        # weekday file this came from is overwritten in seven days; this keeps
+        # the day replayable long after LCBO has recycled the name.
+        # New data landed: freshness must stop reporting the pre-ingest date.
+        _invalidate_snapshot_cache(snapshot_date)
+
+        try:
+            sod_durability.ensure_tables(conn, USE_POSTGRES)
+            sod_durability.record_day(
+                conn, USE_POSTGRES, source, snapshot_date,
+                file_name=zip_name, file_sha256=zip_sha, file_bytes=zip_len,
+                total_rows=total, tracked_rows_data=latest_rows,
+                ingest_mode='backfill' if filename else 'live',
+            )
+        except Exception as _arch_err:
+            # Archival must never fail an otherwise-good ingest.
+            print(f"[SOD-{source}] WARNING: day archive failed: {_arch_err}")
+
         return {
             'status': 'success',
             'run_id': run_id,
@@ -4247,6 +4325,141 @@ def _sod_run_if_stale(sources, max_age_hours=6):
         print(f'[SOD] catch-up skipped (run {run_age:.1f}h ago, data {data_age}d old — fresh enough)')
 
 
+# ───────── Gap backfill: catch a missed day before LCBO recycles the file ─────────
+
+def _sod_toronto_today():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/Toronto')).date()
+    except Exception:
+        return (datetime.utcnow() - timedelta(hours=5)).date()
+
+
+def sod_backfill_gaps(sources=('daily_a',), client=None, max_days=6):
+    """Ingest any missing snapshot day still inside LCBO's rolling window.
+
+    LCBO keeps seven weekday-named files and overwrites each one weekly, so a
+    day we miss is retrievable for about six days and then lost for good. This
+    runs after every sync. Days already past the window are recorded as
+    permanent gaps: we would rather carry a documented hole than quietly
+    present an incomplete history as complete.
+    """
+    today = _sod_toronto_today()
+    conn = _sod_get_conn()
+    result = {'recovered': [], 'failed': [], 'permanent': [], 'checked': today.isoformat()}
+    try:
+        sod_durability.ensure_tables(conn, USE_POSTGRES)
+        gaps = sod_durability.analyze_gaps(conn, USE_POSTGRES, today)
+
+        for d in gaps['permanent']:
+            sod_durability.record_permanent_gap(
+                conn, USE_POSTGRES, 'daily_a', d,
+                note='aged out of the 7-day LCBO window before it was ingested')
+        result['permanent'] = gaps['permanent']
+
+        targets = gaps['recoverable'][:max_days]
+        if not targets:
+            return result
+
+        client = client or SODClient()
+        try:
+            client.login()
+        except Exception as e:
+            result['failed'] = [{'date': d, 'reason': f'login failed: {e}'} for d in targets]
+            return result
+
+        for d in targets:
+            for src in sources:
+                fn = sod_durability.filename_for(src, d, agent_id=SOD_AGENT_ID)
+                try:
+                    r = run_sod_sync(src, filename=fn, client=client,
+                                     expect_snapshot_date=d, historical=True)
+                    ok = r.get('status') == 'success'
+                    sod_durability.record_backfill_attempt(
+                        conn, USE_POSTGRES, src, d, fn,
+                        'ok' if ok else r.get('status', 'failed'),
+                        r.get('reason') or r.get('error') or '')
+                    (result['recovered'] if ok else result['failed']).append(
+                        {'date': d, 'source': src, 'file': fn,
+                         'reason': r.get('reason', '')} if not ok else
+                        {'date': d, 'source': src, 'file': fn,
+                         'rows': r.get('anu_rows', 0)})
+                except Exception as e:
+                    sod_durability.record_backfill_attempt(
+                        conn, USE_POSTGRES, src, d, fn, 'error', str(e))
+                    result['failed'].append({'date': d, 'source': src, 'reason': str(e)})
+
+        # Recovered days land out of order, so rebuild per-store history in
+        # date order. This pass is idempotent and order-safe.
+        if result['recovered']:
+            try:
+                _backfill_store_sku_changes()
+            except Exception as e:
+                print(f'[SOD] post-backfill refold failed: {e}')
+        return result
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/sod/coverage', methods=['GET'])
+def api_sod_coverage():
+    """Which days we hold, which are still recoverable, which are lost.
+
+    The honest answer to "are we missing anything". Freshness alone cannot
+    answer it: a tracker can have yesterday's file and still be missing a week
+    from last month.
+    """
+    conn = _sod_get_conn()
+    try:
+        sod_durability.ensure_tables(conn, USE_POSTGRES)
+        today = _sod_toronto_today()
+        g = sod_durability.analyze_gaps(conn, USE_POSTGRES, today)
+        cur = conn.cursor()
+        cur.execute("SELECT source, snapshot_date, file_name, total_rows, "
+                    "tracked_rows, ingest_mode FROM sod_day_archive "
+                    "ORDER BY snapshot_date DESC LIMIT 30")
+        archive = [{'source': r[0], 'snapshot_date': str(r[1])[:10], 'file_name': r[2],
+                    'total_rows': r[3], 'tracked_rows': r[4], 'ingest_mode': r[5]}
+                   for r in cur.fetchall()]
+        cur.close()
+        return jsonify({
+            'today': today.isoformat(),
+            'days_held': len(g['held']),
+            'first_day': g['first_day'],
+            'last_day': g['last_day'],
+            'recoverable_gaps': g['recoverable'],
+            'permanent_gaps': g['permanent'],
+            'complete': not g['recoverable'] and not g['permanent'],
+            'recent_archive': archive,
+            'how_to_read': (
+                'RECOVERABLE = a day we are missing whose file is still on the '
+                'LCBO server; the nightly job will fetch it. PERMANENT = the '
+                'file was overwritten before we ingested it, so that day cannot '
+                'be recovered from LCBO and any listing that opened and closed '
+                'inside it is not in our history.'),
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/sod/backfill', methods=['POST'])
+@require_app_origin
+def api_sod_backfill():
+    """Force a gap sweep now instead of waiting for the nightly run."""
+    if not SOD_USER or not SOD_PASSWORD:
+        return jsonify({'error': 'SOD_USER / SOD_PASSWORD not configured'}), 400
+    body = request.get_json(silent=True) or {}
+    sources = [s for s in (body.get('sources') or ['daily_a'])
+               if s in ('daily_a', 'daily_b')] or ['daily_a']
+    return jsonify(sod_backfill_gaps(sources=tuple(sources))), 200
+
+
 def _sod_sync_worker(sources):
     """Run the sync in a background thread (used for manual trigger)."""
     if not _sod_sync_lock.acquire(blocking=False):
@@ -4269,6 +4482,18 @@ def _sod_sync_worker(sources):
                   f'anu={result.get("anu_rows",0)} '
                   f'new_listings={result.get("new_listings",0)} '
                   f'new_delistings={result.get("new_delistings",0)}')
+        # Sweep for holes while their files are still on the server. Without
+        # this a day missed during an outage is gone in a week, and every
+        # listing that opened and closed inside it is invisible forever.
+        try:
+            gap = sod_backfill_gaps(sources=('daily_a',), client=client)
+            if gap['recovered']:
+                print(f'[SOD] backfilled {len(gap["recovered"])} missing day(s): '
+                      f'{[g["date"] for g in gap["recovered"]]}')
+            if gap['permanent']:
+                print(f'[SOD] PERMANENT GAPS (unrecoverable): {gap["permanent"]}')
+        except Exception as e:
+            print(f'[SOD] gap sweep failed: {e}')
     finally:
         _sod_sync_lock.release()
 
@@ -5016,8 +5241,36 @@ def _last_successful_run_age_hours_safe():
         return None
 
 
-def _sod_freshness():
+def _invalidate_snapshot_cache(new_snapshot=None):
+    """Drop (or advance) the cached MAX(snapshot_date) after an ingest.
+
+    Without this the cache can report a snapshot up to 30 minutes out of date.
+    That is not cosmetic: freshness IS the alarm that is supposed to notice
+    when SOD stops arriving, and an alarm reading a stale cache can say
+    "healthy" while the feed is dead, or "stale" seconds after a good ingest.
+    Both were observed on the NB tracker.
+    """
+    try:
+        if isinstance(new_snapshot, str):
+            new_snapshot = datetime.strptime(new_snapshot[:10], '%Y-%m-%d').date()
+    except Exception:
+        new_snapshot = None
+    if new_snapshot is not None:
+        prev = _SNAP_DATE_CACHE.get('val')
+        _SNAP_DATE_CACHE['val'] = max(prev, new_snapshot) if prev else new_snapshot
+        _SNAP_DATE_CACHE['at'] = time.time()
+    else:
+        _SNAP_DATE_CACHE['val'] = None
+        _SNAP_DATE_CACHE['at'] = 0.0
+
+
+def _sod_freshness(force=False):
     """Return a freshness summary dict used by every report response.
+
+    force=True re-reads the database instead of trusting the 30-minute cache.
+    Anything that raises an alarm or gates a 503 must pass force=True; report
+    headers and uptime pings may use the cache, which is what keeps idle
+    probes off Neon.
 
     Keys:
       latest_snapshot: 'YYYY-MM-DD' or None
@@ -5025,7 +5278,7 @@ def _sod_freshness():
       is_stale: bool (True if age > 1 day — emails an alert at the next health check)
       last_run_age_hours: float or None
     """
-    snap = _max_snapshot_date()
+    snap = _max_snapshot_date(force=force)
     age_days = None
     if snap is not None:
         try:
@@ -5231,7 +5484,7 @@ def api_sod_health():
       503 + status='stale' if snapshot is > 1 day old.
       503 + status='never_synced' if no data ingested yet.
     """
-    fresh_info = _sod_freshness()
+    fresh_info = _sod_freshness(force=True)   # an alarm must never read a cache
     age_days = fresh_info['snapshot_age_days']
     age_hours = _sod_last_successful_sync_age_hours()
     if age_days is None:
@@ -5265,7 +5518,7 @@ def api_healthz():
     cron) but NOT from public uptime services like UptimeRobot.
     """
     deep = request.args.get('deep') in ('1', 'true', 'yes')
-    fresh = _sod_freshness()
+    fresh = _sod_freshness(force=deep)
     age_days = fresh.get('snapshot_age_days')
     # Strict (deep) freshness threshold relaxed to 2 days — accounts for
     # weekends where LCBO may not publish a fresh file Sat/Sun. The hourly
@@ -5313,7 +5566,7 @@ def _daily_health_check(auto_recover=True):
         checks.append({'name': name, 'ok': bool(ok), 'detail': detail})
 
     # 1. SOD freshness
-    fresh = _sod_freshness()
+    fresh = _sod_freshness(force=True)
     age = fresh.get('snapshot_age_days')
     sod_fresh = age is not None and age <= 2
     check('sod_snapshot_fresh', sod_fresh,
@@ -5534,7 +5787,7 @@ def start_health_scheduler():
         def _stale_watch():
             try:
                 from datetime import datetime as _dt
-                fresh = _sod_freshness()
+                fresh = _sod_freshness(force=True)
                 age_days = fresh.get('snapshot_age_days')
                 last_hours = fresh.get('last_run_age_hours')
                 stale_by_snapshot = age_days is not None and age_days > 1
@@ -7068,6 +7321,10 @@ _EXPORT_TABLES = [
     ('sod_listing_changes',        'id'),
     ('sod_store_sku_changes',      'id'),
     ('sod_sync_runs',              'id'),
+    # Durability: coverage, the replay archive, and the record of what was lost
+    ('sod_day_archive',            'id'),
+    ('sod_permanent_gaps',         'id'),
+    ('sod_backfill_attempts',      'id'),
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
@@ -9867,9 +10124,38 @@ def api_admin_sod_rollback_snapshot():
         }), 400
 
     deleted = 0
+    archived = False
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
+
+        # Nothing is ever deleted without a way back. If this day was ingested
+        # before the archive existed, capture its tracked rows now — once the
+        # weekday file has rolled over, a delete here is irreversible.
+        try:
+            sod_durability.ensure_tables(conn, USE_POSTGRES)
+            ph = '%s' if USE_POSTGRES else '?'
+            cur.execute(f"SELECT COUNT(*) FROM sod_day_archive WHERE snapshot_date={ph}",
+                        (snapshot_date,))
+            if not (cur.fetchone() or [0])[0]:
+                tracked = list(SOD_TRACKED_SKUS.keys())
+                phs = ','.join([ph] * len(tracked))
+                cur.execute(
+                    f"SELECT sku, store_number, snapshot_date, status, on_hand "
+                    f"FROM sod_inventory WHERE snapshot_date={ph} AND sku IN ({phs})",
+                    tuple([snapshot_date] + tracked))
+                rows = [{'sku': r[0], 'store_number': r[1],
+                         'snapshot_date': str(r[2])[:10], 'status': r[3],
+                         'on_hand': r[4]} for r in cur.fetchall()]
+                sod_durability.record_day(
+                    conn, USE_POSTGRES, 'daily_a', snapshot_date,
+                    file_name='(archived at rollback)', tracked_rows_data=rows,
+                    ingest_mode='pre_rollback')
+                archived = True
+        except Exception as _e:
+            return jsonify({'error': f'refusing to delete: could not archive '
+                                     f'the day first ({_e})'}), 500
+
         if USE_POSTGRES:
             cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=%s", (snapshot_date,))
             deleted = cur.rowcount
@@ -9899,7 +10185,9 @@ def api_admin_sod_rollback_snapshot():
         'status': 'ok',
         'snapshot_date': snapshot_date,
         'deleted_rows': deleted,
-        'note': 'Snapshot removed from sod_inventory. /new-listings will no longer compare against this date.',
+        'archived_before_delete': archived,
+        'note': 'Snapshot removed from sod_inventory. Tracked rows for this day '
+                'are preserved in sod_day_archive and can be replayed.',
     })
 
 
@@ -18388,7 +18676,7 @@ def api_crm_rep_performance():
     since = (today - timedelta(days=days)).isoformat()
 
     # Always include the official roster, even with 0 activity
-    OFFICIAL_REPS = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
+    OFFICIAL_REPS = ANU_REP_ROSTER + NB_PARTNER_CONTACTS
 
     out = {rep: {
         'rep': rep,
@@ -18937,7 +19225,7 @@ def api_crm_manager_dashboard():
     })
 
 
-REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
+REP_ROSTER_DEFAULT = ANU_REP_ROSTER + NB_PARTNER_CONTACTS
 
 # Module-level TERRITORY map — single source of truth for postal-prefix
 # routing assignments. Reps can STILL log activities anywhere; this just
