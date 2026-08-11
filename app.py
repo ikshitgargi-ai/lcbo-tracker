@@ -3260,15 +3260,25 @@ class SODClient:
         from urllib.parse import urljoin
         self._ensure_logged_in()
 
-        # ANCHOR_RE captures: full href + visible label text
+        # The portal writes some hrefs quoted and others bare (the nav uses
+        # href=/samples with no quotes), and the "Available documents" links
+        # that lead to every category page are among the bare ones. Matching
+        # only quoted hrefs found zero categories and made the annual archives
+        # look like they did not exist.
+        _HREF = r'href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))'
         ANCHOR_RE = _re.compile(
-            r'<a[^>]+href="([^"]+)"[^>]*>([^<]{0,200})</a>',
+            r'<a[^>]+' + _HREF + r'[^>]*>(.*?)</a>',
             _re.IGNORECASE | _re.DOTALL,
         )
         FILE_RE = _re.compile(
-            r'href="([^"]*?/downloads/[^"]*?\.zip)"',
+            r'href\s*=\s*(?:"([^"]*?\.zip)"|\'([^\']*?\.zip)\'|([^\s>]+?\.zip))',
             _re.IGNORECASE,
         )
+        _TAGS_RE = _re.compile(r'<[^>]+>')
+
+        def _pick(groups, n):
+            """First non-empty of the quoted/single/bare href alternatives."""
+            return next((g for g in groups[:n] if g), '')
         TITLE_RE = _re.compile(
             r'<(?:h1|h2)[^>]*>([^<]{3,200})</(?:h1|h2)>',
             _re.IGNORECASE,
@@ -3303,7 +3313,11 @@ class SODClient:
                 index_url_used = url
             anchors = []
             for m in ANCHOR_RE.finditer(html):
-                href, label = m.groups()
+                g = m.groups()
+                href = _pick(g, 3)
+                if not href:
+                    continue
+                label = _TAGS_RE.sub(' ', g[3] or '')
                 href_abs = urljoin(url, href)
                 anchors.append((href_abs, ' '.join(label.split())[:200]))
             page_anchors[url] = anchors
@@ -3353,7 +3367,9 @@ class SODClient:
             label = page_title or meta.get('anchor_label') or cat_url
             # Use cat_url as the category key
             for m in FILE_RE.finditer(html):
-                rel = m.group(1)
+                rel = _pick(m.groups(), 3)
+                if not rel or '/downloads/' not in rel:
+                    continue
                 full = urljoin(cat_url, rel)
                 fname = full.rsplit('/', 1)[-1]
                 # Derive a stable category_id from the URL path
