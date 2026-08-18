@@ -334,6 +334,21 @@ def _canonical_rep(name):
     return ''
 
 
+# Render gives a web service an EPHEMERAL disk. With no DATABASE_URL the app
+# falls back to SQLite on that disk, so every deploy and every restart silently
+# destroys everything: rep visits, the immutable listing ledger, anu_accounts,
+# the billing snapshots and the SOD archive. It looks perfectly healthy in
+# between. This is exactly how the Mandakini tracker lost its 27-store baseline
+# and a week of Ottawa and Brampton visits, twice, without a single error.
+_STORAGE_IS_DURABLE = bool(USE_POSTGRES)
+_STORAGE_LABEL = 'postgres' if USE_POSTGRES else 'EPHEMERAL_DISK'
+_STORAGE_WARNING = ('' if USE_POSTGRES else
+                    'DATABASE_URL is not set, so this app is writing to a disk '
+                    'that Render wipes on every deploy and restart. Nothing '
+                    'logged here survives. Do not invoice from it and do not '
+                    'ask reps to use it until the database is connected.')
+
+
 _ALLOWED_ORIGINS = {
     'https://lcbo-tracker-web.vercel.app',
     'https://lcbo.anu-spirits.com',
@@ -5729,6 +5744,7 @@ def api_healthz():
         'status': 'healthy' if (not deep or fresh_ok) else 'unhealthy',
         'build': 'finder-stale-1d-v3',
         'mode': 'deep' if deep else 'liveness',
+        'storage': _STORAGE_LABEL,
         **fresh,
     }
     code = 200 if (not deep or fresh_ok) else 503
